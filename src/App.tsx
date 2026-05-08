@@ -32,7 +32,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.1.1";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const MOTION_WINDOW_SECONDS = 5;
@@ -156,6 +156,9 @@ export default function App() {
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const motionBucketRef = useRef<MotionBucket | null>(null);
   const startWeatherFetchStartedRef = useRef(Boolean(initialRun?.weather.start_weather.fetched_at_utc));
+  const targetReachedNotifiedRef = useRef(
+    Boolean(initialRun?.checkpoints.some((checkpoint) => checkpoint.label === "target_distance_reached")),
+  );
 
   const liveStats = useMemo(
     () => computeLiveStats(activeRun?.gps_points ?? [], elapsedSeconds),
@@ -174,6 +177,12 @@ export default function App() {
     () => (activeRun ? buildExportFilename(activeRun.run_metadata.start_time_utc) : "greenlake_run_user_001.json"),
     [activeRun],
   );
+  const targetCheckpointRecorded = Boolean(
+    activeRun?.checkpoints.some((checkpoint) => checkpoint.label === "target_distance_reached"),
+  );
+  const targetReached =
+    targetCheckpointRecorded ||
+    liveStats.distanceMeters >= (activeRun?.pre_run.intended_distance_meters ?? Infinity);
 
   elapsedSecondsRef.current = elapsedSeconds;
 
@@ -382,6 +391,7 @@ export default function App() {
     runStartPerfRef.current = performance.now();
     motionBucketRef.current = null;
     startWeatherFetchStartedRef.current = false;
+    targetReachedNotifiedRef.current = false;
     setScreen("live");
     startGpsWatch();
     if (permissions.wake_lock_used || permissions.wake_lock_status === "active") {
@@ -455,6 +465,7 @@ export default function App() {
     runStartPerfRef.current = null;
     motionBucketRef.current = null;
     startWeatherFetchStartedRef.current = false;
+    targetReachedNotifiedRef.current = false;
     setScreen("setup");
   };
 
@@ -468,6 +479,7 @@ export default function App() {
         t_elapsed_seconds: round(elapsed, 2),
         timestamp_utc: new Date().toISOString(),
         label: `checkpoint_${run.checkpoints.length + 1}`,
+        distance_meters: round(liveStats.distanceMeters, 2),
       };
       return { ...run, checkpoints: [...run.checkpoints, checkpoint] };
     });
@@ -585,6 +597,39 @@ export default function App() {
   }, [activeRun, getElapsedSeconds, screen, startGpsWatch]);
 
   useEffect(() => {
+    if (
+      !activeRun ||
+      screen !== "live" ||
+      targetCheckpointRecorded ||
+      targetReachedNotifiedRef.current ||
+      liveStats.distanceMeters < activeRun.pre_run.intended_distance_meters
+    ) {
+      return;
+    }
+
+    targetReachedNotifiedRef.current = true;
+    const checkpoint: Checkpoint = {
+      t_elapsed_seconds: round(getElapsedSeconds(), 2),
+      timestamp_utc: new Date().toISOString(),
+      label: "target_distance_reached",
+      distance_meters: round(liveStats.distanceMeters, 2),
+    };
+
+    setActiveRun((run) => {
+      if (!run || run.checkpoints.some((checkpoint) => checkpoint.label === "target_distance_reached")) {
+        return run;
+      }
+
+      return { ...run, checkpoints: [...run.checkpoints, checkpoint] };
+    });
+
+    if ("vibrate" in navigator) {
+      navigator.vibrate([200]);
+    }
+    setActionMessage("Target reached. You can stop now.");
+  }, [activeRun, getElapsedSeconds, liveStats.distanceMeters, screen, targetCheckpointRecorded]);
+
+  useEffect(() => {
     if (screen !== "live" || permissions.device_motion_permission !== "ready") {
       return undefined;
     }
@@ -667,6 +712,7 @@ export default function App() {
           run={activeRun}
           elapsedSeconds={elapsedSeconds}
           liveStats={liveStats}
+          targetReached={targetReached}
           onCheckpoint={addCheckpoint}
           onStop={() => void stopRun()}
           onDiscard={discardRun}
@@ -898,6 +944,7 @@ function LiveScreen({
   run,
   elapsedSeconds,
   liveStats,
+  targetReached,
   onCheckpoint,
   onStop,
   onDiscard,
@@ -905,6 +952,7 @@ function LiveScreen({
   run: ActiveRun;
   elapsedSeconds: number;
   liveStats: ReturnType<typeof computeLiveStats>;
+  targetReached: boolean;
   onCheckpoint: () => void;
   onStop: () => void;
   onDiscard: () => void;
@@ -913,6 +961,13 @@ function LiveScreen({
 
   return (
     <section className="screen-stack live-screen">
+      {targetReached ? (
+        <section className="target-banner">
+          <strong>Target reached</strong>
+          <span>You can stop now.</span>
+        </section>
+      ) : null}
+
       <section className="metric-hero">
         <div>
           <span>Elapsed</span>

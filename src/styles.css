@@ -296,6 +296,33 @@ button {
   padding-top: 4px;
 }
 
+.target-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid #0f5d38;
+  border-radius: 8px;
+  background: #12683f;
+  color: #ffffff;
+}
+
+.target-banner strong,
+.target-banner span {
+  display: block;
+  line-height: 1.1;
+}
+
+.target-banner strong {
+  font-size: 1rem;
+}
+
+.target-banner span {
+  color: #d7eee3;
+  font-weight: 800;
+}
+
 .metric-hero {
   display: grid;
   grid-template-columns: 1fr 1fr;

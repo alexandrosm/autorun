@@ -2,6 +2,15 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
+Current version: `0.1.1`
+
+## v0.1.1 focus
+
+- Detects the intended target-distance crossing, defaulting to 5000 meters.
+- Exports `target_distance_result` and `target_distance_splits` alongside the original actual-distance splits.
+- Shows a live target-reached banner and stores an automatic `target_distance_reached` checkpoint.
+- Uses monotonic elapsed time for stopped runs so resume does not include time spent on the stop screen.
+
 ## Local run
 
 ```bash

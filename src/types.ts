@@ -138,6 +138,17 @@ export interface Checkpoint {
   t_elapsed_seconds: number;
   timestamp_utc: string;
   label: string;
+  distance_meters?: number;
+}
+
+export interface TargetDistanceResult {
+  intended_distance_meters: number;
+  target_reached: boolean;
+  elapsed_at_target_distance_seconds: number | null;
+  pace_to_target_seconds_per_mile: number | null;
+  pace_to_target_seconds_per_km: number | null;
+  overshoot_meters: number | null;
+  distance_recorded_meters: number | null;
 }
 
 export interface ActiveRun {
@@ -166,10 +177,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.0";
+  schema_version: "0.1.1";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.0";
+    version: "0.1.1";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -197,6 +208,12 @@ export interface ExportPayload {
   summary: Record<string, unknown>;
   gps_quality: Record<string, unknown>;
   splits: {
+    miles: SplitFeature[];
+    kilometers: SplitFeature[];
+    thirds: SplitFeature[];
+  };
+  target_distance_result: TargetDistanceResult;
+  target_distance_splits: {
     miles: SplitFeature[];
     kilometers: SplitFeature[];
     thirds: SplitFeature[];

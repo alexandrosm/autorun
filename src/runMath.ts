@@ -7,6 +7,7 @@ import type {
   PostRunState,
   PreRunState,
   SplitFeature,
+  TargetDistanceResult,
 } from "./types";
 
 const METERS_PER_MILE = 1609.344;
@@ -82,10 +83,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
 
   return {
-    schema_version: "0.1.0",
+    schema_version: "0.1.1",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.0",
+      version: "0.1.1",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -121,6 +122,8 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     summary: features.summary,
     gps_quality: features.gpsQuality,
     splits: features.splits,
+    target_distance_result: features.targetDistanceResult,
+    target_distance_splits: features.targetDistanceSplits,
     pacing_features: features.pacing,
     elevation_features: features.elevation,
     motion_features: features.motion,
@@ -168,10 +171,18 @@ function computeFeatures(run: ActiveRun) {
     kilometers: buildRepeatingSplits(track, METERS_PER_KM, "kilometer"),
     thirds: buildThirdSplits(track),
   };
+  const targetDistanceResult = computeTargetDistanceResult(track, run.pre_run.intended_distance_meters);
+  const targetDistanceSplits = buildTargetDistanceSplits(track, run.pre_run.intended_distance_meters);
   const pacing = computePacingFeatures(track, splits.thirds);
   const route = computeRouteFeatures(points, run.pre_run.route_direction, run.pre_run.route_name);
   const motion = computeMotionFeatures(run.motion_windows, durationSeconds, run.permissions, run.pre_run.phone_position);
-  const notes = buildQualityNotes(points, gpsQuality, run.motion_windows, run.weather.start_weather.fetched_at_utc);
+  const notes = buildQualityNotes(
+    points,
+    gpsQuality,
+    run.motion_windows,
+    run.weather.start_weather.fetched_at_utc,
+    targetDistanceResult,
+  );
 
   return {
     summary: {
@@ -188,6 +199,8 @@ function computeFeatures(run: ActiveRun) {
     },
     gpsQuality,
     splits,
+    targetDistanceResult,
+    targetDistanceSplits,
     pacing,
     elevation,
     route,
@@ -216,16 +229,20 @@ function buildTrack(points: GpsPoint[]): TrackPoint[] {
 }
 
 function computeDurationSeconds(run: ActiveRun, points: GpsPoint[]): number {
+  if (run.run_metadata.end_time_utc && Number.isFinite(run.elapsed_offset_seconds) && run.elapsed_offset_seconds > 0) {
+    return Math.max(0, run.elapsed_offset_seconds);
+  }
+
+  if (points.length > 0) {
+    return Math.max(0, points[points.length - 1].t_elapsed_seconds);
+  }
+
   if (run.run_metadata.end_time_utc && run.run_metadata.start_time_utc) {
     const start = Date.parse(run.run_metadata.start_time_utc);
     const end = Date.parse(run.run_metadata.end_time_utc);
     if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
       return (end - start) / 1000;
     }
-  }
-
-  if (points.length > 0) {
-    return Math.max(0, points[points.length - 1].t_elapsed_seconds);
   }
 
   return Math.max(0, run.elapsed_offset_seconds);
@@ -368,6 +385,90 @@ function buildThirdSplits(track: TrackPoint[]): SplitFeature[] {
 
   const third = total / 3;
   return fallbackNames.map((name, index) => buildSplit(track, index * third, (index + 1) * third, name));
+}
+
+function buildTargetDistanceSplits(track: TrackPoint[], intendedDistanceMeters: number) {
+  const thirdNames = ["first_third", "middle_third", "final_third"];
+  if (track.length < 2 || intendedDistanceMeters <= 0) {
+    return {
+      miles: [],
+      kilometers: [],
+      thirds: thirdNames.map((name) => emptySplit(name)),
+    };
+  }
+
+  const recordedDistance = track[track.length - 1].cumulative_meters;
+  const cappedDistance = Math.min(recordedDistance, intendedDistanceMeters);
+
+  return {
+    miles: buildRepeatingSplitsToDistance(track, METERS_PER_MILE, "mile", cappedDistance),
+    kilometers: buildRepeatingSplitsToDistance(track, METERS_PER_KM, "kilometer", cappedDistance),
+    thirds: buildThirdSplitsForDistance(track, intendedDistanceMeters, cappedDistance),
+  };
+}
+
+function buildRepeatingSplitsToDistance(
+  track: TrackPoint[],
+  splitMeters: number,
+  prefix: "mile" | "kilometer",
+  maxDistanceMeters: number,
+): SplitFeature[] {
+  if (track.length < 2 || maxDistanceMeters <= 0) {
+    return [];
+  }
+
+  const splits: SplitFeature[] = [];
+  let start = 0;
+  let index = 1;
+
+  while (start < maxDistanceMeters) {
+    const end = Math.min(maxDistanceMeters, start + splitMeters);
+    splits.push(buildSplit(track, start, end, `${prefix}_${index}`, index));
+    start = end;
+    index += 1;
+  }
+
+  return splits;
+}
+
+function buildThirdSplitsForDistance(
+  track: TrackPoint[],
+  intendedDistanceMeters: number,
+  availableDistanceMeters: number,
+): SplitFeature[] {
+  const thirdNames = ["first_third", "middle_third", "final_third"];
+  if (track.length < 2 || intendedDistanceMeters <= 0 || availableDistanceMeters <= 0) {
+    return thirdNames.map((name) => emptySplit(name));
+  }
+
+  const thirdDistance = intendedDistanceMeters / 3;
+  return thirdNames.map((name, index) => {
+    const start = index * thirdDistance;
+    const intendedEnd = (index + 1) * thirdDistance;
+    if (availableDistanceMeters <= start) {
+      return emptySplit(name);
+    }
+    return buildSplit(track, start, Math.min(intendedEnd, availableDistanceMeters), name);
+  });
+}
+
+function computeTargetDistanceResult(track: TrackPoint[], intendedDistanceMeters: number): TargetDistanceResult {
+  const recordedDistance = track.length > 0 ? track[track.length - 1].cumulative_meters : 0;
+  const targetReached = intendedDistanceMeters > 0 && recordedDistance >= intendedDistanceMeters;
+  const targetState = targetReached ? stateAtDistance(track, intendedDistanceMeters) : null;
+  const elapsed = targetState?.elapsed ?? null;
+
+  return {
+    intended_distance_meters: intendedDistanceMeters,
+    target_reached: targetReached,
+    elapsed_at_target_distance_seconds: elapsed === null ? null : round(elapsed, 2),
+    pace_to_target_seconds_per_mile:
+      elapsed === null ? null : round(elapsed / (intendedDistanceMeters / METERS_PER_MILE), 2),
+    pace_to_target_seconds_per_km:
+      elapsed === null ? null : round(elapsed / (intendedDistanceMeters / METERS_PER_KM), 2),
+    overshoot_meters: targetReached ? round(recordedDistance - intendedDistanceMeters, 2) : null,
+    distance_recorded_meters: track.length > 0 ? round(recordedDistance, 2) : null,
+  };
 }
 
 function buildSplit(track: TrackPoint[], startMeters: number, endMeters: number, name: string, index?: number): SplitFeature {
@@ -591,6 +692,7 @@ function buildQualityNotes(
   gpsQuality: Record<string, unknown>,
   windows: MotionWindow[],
   startWeatherFetchedAt: string | null,
+  targetDistanceResult: TargetDistanceResult,
 ): string[] {
   const notes: string[] = [];
   if (points.length === 0) {
@@ -611,6 +713,14 @@ function buildQualityNotes(
   }
   if (!startWeatherFetchedAt) {
     notes.push("Start weather was not fetched.");
+  }
+  const recordedDistance = targetDistanceResult.distance_recorded_meters;
+  const intendedDistance = targetDistanceResult.intended_distance_meters;
+  if (recordedDistance !== null && recordedDistance - intendedDistance > 100) {
+    notes.push("Run overshot intended distance by more than 100 meters; use target_distance_result for 5K analysis.");
+  }
+  if (recordedDistance !== null && intendedDistance - recordedDistance > 100) {
+    notes.push("Run ended more than 100 meters short of intended distance; 5K analysis is incomplete.");
   }
   return notes;
 }
