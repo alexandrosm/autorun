@@ -2,10 +2,13 @@ import type {
   ActiveRun,
   ExportPayload,
   GpsPoint,
+  GpsGapInterpolation,
+  InterpolationFeatures,
   MotionWindow,
   PermissionState,
   PostRunState,
   PreRunState,
+  RecordingLifecycle,
   SplitFeature,
   TargetDistanceResult,
 } from "./types";
@@ -14,6 +17,10 @@ const METERS_PER_MILE = 1609.344;
 const METERS_PER_KM = 1000;
 const POOR_ACCURACY_THRESHOLD_METERS = 25;
 const STOPPED_SPEED_THRESHOLD_MPS = 0.5;
+const SUSPICIOUS_SPEED_MPS = 7;
+const IMPOSSIBLE_SPEED_MPS = 8;
+const SUSPICIOUS_ACCELERATION_MPS2 = 4;
+const SUSPICIOUS_GRADE_PERCENT = 20;
 
 interface TrackPoint extends GpsPoint {
   cumulative_meters: number;
@@ -59,11 +66,25 @@ export function createGpsPointFromPosition(
   };
 
   let possibleGpsJump = false;
+  let segmentSpeed: number | null = null;
+  let segmentAcceleration: number | null = null;
+  let segmentGrade: number | null = null;
   if (previousPoint) {
     const dt = elapsedSeconds - previousPoint.t_elapsed_seconds;
     if (dt > 0) {
       const segmentMeters = haversineMeters(previousPoint, pointBase);
-      const segmentSpeed = segmentMeters / dt;
+      segmentSpeed = segmentMeters / dt;
+      const previousSpeed = previousPoint.segment_speed_mps ?? previousPoint.speed_mps;
+      if (previousSpeed !== null && previousSpeed !== undefined && Number.isFinite(previousSpeed)) {
+        segmentAcceleration = (segmentSpeed - previousSpeed) / dt;
+      }
+      if (
+        previousPoint.altitude_meters !== null &&
+        pointBase.altitude_meters !== null &&
+        segmentMeters >= 5
+      ) {
+        segmentGrade = ((pointBase.altitude_meters - previousPoint.altitude_meters) / segmentMeters) * 100;
+      }
       possibleGpsJump =
         segmentMeters > 35 &&
         segmentSpeed > 8.5 &&
@@ -74,6 +95,14 @@ export function createGpsPointFromPosition(
   return {
     ...pointBase,
     possible_gps_jump: possibleGpsJump,
+    segment_speed_mps: segmentSpeed === null ? null : round(segmentSpeed, 3),
+    segment_acceleration_mps2: segmentAcceleration === null ? null : round(segmentAcceleration, 3),
+    segment_grade_percent: segmentGrade === null ? null : round(segmentGrade, 2),
+    impossible_speed: segmentSpeed !== null && segmentSpeed > IMPOSSIBLE_SPEED_MPS,
+    suspicious_speed: segmentSpeed !== null && segmentSpeed > SUSPICIOUS_SPEED_MPS,
+    suspicious_acceleration:
+      segmentAcceleration !== null && Math.abs(segmentAcceleration) > SUSPICIOUS_ACCELERATION_MPS2,
+    suspicious_grade: segmentGrade !== null && Math.abs(segmentGrade) > SUSPICIOUS_GRADE_PERCENT,
   };
 }
 
@@ -83,10 +112,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
 
   return {
-    schema_version: "0.1.1",
+    schema_version: "0.1.2",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.1",
+      version: "0.1.2",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -117,10 +146,18 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
       end_time_utc: run.run_metadata.end_time_utc,
       timezone: run.run_metadata.timezone,
     },
-    permissions_and_capabilities: exportPermissions(run.permissions, weatherFetchSuccess),
+    permissions_and_capabilities: exportPermissions(run.permissions, weatherFetchSuccess, run.pwa_state),
+    recording_lifecycle: {
+      ...run.recording_lifecycle,
+      missing_gps_time_seconds: features.interpolation.missing_gps_time_seconds,
+      gps_stale_event_count: run.recording_lifecycle.gps_stale_events.length,
+      recording_reliability: features.recordingReliability,
+    },
+    pre_run_gps_warmup: run.pre_run_gps_warmup,
     weather: run.weather,
     summary: features.summary,
     gps_quality: features.gpsQuality,
+    interpolation_features: features.interpolation,
     splits: features.splits,
     target_distance_result: features.targetDistanceResult,
     target_distance_splits: features.targetDistanceSplits,
@@ -165,6 +202,13 @@ function computeFeatures(run: ActiveRun) {
   const distanceKm = distanceMeters / METERS_PER_KM;
   const movement = computeMovement(points, durationSeconds);
   const gpsQuality = computeGpsQuality(points);
+  const interpolation = computeInterpolationFeatures(points, distanceMeters);
+  const recordingReliability = computeRecordingReliability(
+    interpolation.missing_gps_time_seconds,
+    run.recording_lifecycle,
+    gpsQuality.gps_gap_count_over_10_seconds,
+    durationSeconds,
+  );
   const elevation = computeElevation(points, distanceMeters, gpsQuality.p90_horizontal_accuracy_meters as number | null);
   const splits = {
     miles: buildRepeatingSplits(track, METERS_PER_MILE, "mile"),
@@ -175,19 +219,30 @@ function computeFeatures(run: ActiveRun) {
   const targetDistanceSplits = buildTargetDistanceSplits(track, run.pre_run.intended_distance_meters);
   const pacing = computePacingFeatures(track, splits.thirds);
   const route = computeRouteFeatures(points, run.pre_run.route_direction, run.pre_run.route_name);
-  const motion = computeMotionFeatures(run.motion_windows, durationSeconds, run.permissions, run.pre_run.phone_position);
+  const motion = computeMotionFeatures(
+    run.motion_windows,
+    durationSeconds,
+    run.permissions,
+    run.pre_run.phone_position,
+    run.motion_debug,
+  );
   const notes = buildQualityNotes(
     points,
     gpsQuality,
     run.motion_windows,
     run.weather.start_weather.fetched_at_utc,
     targetDistanceResult,
+    interpolation,
+    recordingReliability,
   );
 
   return {
     summary: {
       duration_seconds: finiteOrNull(round(durationSeconds, 2)),
       distance_meters: finiteOrNull(round(distanceMeters, 2)),
+      raw_recorded_distance_meters: interpolation.raw_recorded_distance_meters,
+      interpolated_distance_estimate_meters: interpolation.interpolated_distance_estimate_meters,
+      distance_confidence: recordingReliability === "high" && interpolation.interpolation_confidence === "high" ? "high" : recordingReliability,
       distance_miles: finiteOrNull(round(distanceMiles, 4)),
       average_pace_seconds_per_mile:
         distanceMiles > 0 ? finiteOrNull(round(durationSeconds / distanceMiles, 2)) : null,
@@ -198,6 +253,8 @@ function computeFeatures(run: ActiveRun) {
       max_speed_mps: movement.maxSpeedMps,
     },
     gpsQuality,
+    interpolation,
+    recordingReliability,
     splits,
     targetDistanceResult,
     targetDistanceSplits,
@@ -220,7 +277,7 @@ function buildTrack(points: GpsPoint[]): TrackPoint[] {
   for (let i = 1; i < points.length; i += 1) {
     const previous = points[i - 1];
     const current = points[i];
-    const segmentMeters = current.possible_gps_jump ? 0 : haversineMeters(previous, current);
+    const segmentMeters = isExcludedSegment(current) ? 0 : haversineMeters(previous, current);
     cumulative += segmentMeters;
     track.push({ ...current, cumulative_meters: cumulative });
   }
@@ -260,9 +317,11 @@ function computeMovement(points: GpsPoint[], durationSeconds: number) {
       continue;
     }
 
-    const segmentMeters = current.possible_gps_jump ? 0 : haversineMeters(previous, current);
+    const excluded = isExcludedSegment(current);
+    const segmentMeters = excluded ? 0 : haversineMeters(previous, current);
     const segmentSpeed = segmentMeters / dt;
-    const bestSpeed = Math.max(segmentSpeed, current.speed_mps ?? 0);
+    const deviceSpeed = excluded ? 0 : current.speed_mps ?? 0;
+    const bestSpeed = Math.max(segmentSpeed, deviceSpeed);
     if (bestSpeed >= STOPPED_SPEED_THRESHOLD_MPS) {
       movingSeconds += dt;
     }
@@ -308,6 +367,100 @@ function computeGpsQuality(points: GpsPoint[]) {
     gps_gap_count_over_5_seconds: gapsOver5,
     gps_gap_count_over_10_seconds: gapsOver10,
     possible_gps_jump_count: points.filter((point) => point.possible_gps_jump).length,
+    impossible_speed_segment_count: points.filter((point) => point.impossible_speed).length,
+    suspicious_speed_segment_count: points.filter((point) => point.suspicious_speed).length,
+    suspicious_acceleration_segment_count: points.filter((point) => point.suspicious_acceleration).length,
+    suspicious_grade_segment_count: points.filter((point) => point.suspicious_grade).length,
+  };
+}
+
+function computeInterpolationFeatures(points: GpsPoint[], rawRecordedDistanceMeters: number): InterpolationFeatures {
+  const gaps: GpsGapInterpolation[] = [];
+  let estimatedMissingDistance = 0;
+  let missingGpsTime = 0;
+
+  for (let i = 1; i < points.length; i += 1) {
+    const previous = points[i - 1];
+    const current = points[i];
+    const dt = current.t_elapsed_seconds - previous.t_elapsed_seconds;
+    if (dt <= 5) {
+      continue;
+    }
+
+    const straightLineDistance = haversineMeters(previous, current);
+    const surroundingSpeed = surroundingPlausibleSpeed(points, i);
+    const speedBasedDistance =
+      surroundingSpeed !== null && surroundingSpeed <= SUSPICIOUS_SPEED_MPS ? surroundingSpeed * dt : null;
+    const useSpeedBased =
+      speedBasedDistance !== null &&
+      speedBasedDistance > straightLineDistance &&
+      speedBasedDistance <= SUSPICIOUS_SPEED_MPS * dt;
+    const chosenDistance = useSpeedBased ? speedBasedDistance : straightLineDistance;
+    const rawContribution = isExcludedSegment(current) ? 0 : straightLineDistance;
+
+    estimatedMissingDistance += Math.max(0, chosenDistance - rawContribution);
+    missingGpsTime += dt;
+    gaps.push({
+      start_elapsed_seconds: round(previous.t_elapsed_seconds, 2),
+      end_elapsed_seconds: round(current.t_elapsed_seconds, 2),
+      duration_seconds: round(dt, 2),
+      last_point: pickGapPoint(previous),
+      next_point: pickGapPoint(current),
+      straight_line_distance_meters: round(straightLineDistance, 2),
+      surrounding_speed_mps: surroundingSpeed === null ? null : round(surroundingSpeed, 3),
+      speed_based_distance_estimate_meters: speedBasedDistance === null ? null : round(speedBasedDistance, 2),
+      chosen_distance_estimate_meters: round(chosenDistance, 2),
+      method: useSpeedBased ? "speed_based" : "straight_line",
+      confidence: "low",
+    });
+  }
+
+  return {
+    raw_recorded_distance_meters: points.length > 0 ? round(rawRecordedDistanceMeters, 2) : null,
+    interpolated_distance_estimate_meters:
+      points.length > 0 ? round(rawRecordedDistanceMeters + estimatedMissingDistance, 2) : null,
+    estimated_missing_distance_meters: points.length > 0 ? round(estimatedMissingDistance, 2) : null,
+    missing_gps_time_seconds: round(missingGpsTime, 2),
+    interpolation_confidence: gaps.length === 0 ? "high" : "low",
+    gaps,
+  };
+}
+
+function computeRecordingReliability(
+  missingGpsTimeSeconds: number,
+  lifecycle: RecordingLifecycle,
+  gpsGapCountOver10: number,
+  durationSeconds: number,
+): "high" | "medium" | "low" {
+  const missingRatio = durationSeconds > 0 ? missingGpsTimeSeconds / durationSeconds : 0;
+  const hiddenEvents = lifecycle.visibility_events.filter((event) => event.visibility_state === "hidden").length;
+  if (gpsGapCountOver10 > 1 || missingGpsTimeSeconds > 30 || missingRatio > 0.08 || hiddenEvents > 0) {
+    return "low";
+  }
+  if (gpsGapCountOver10 > 0 || missingGpsTimeSeconds > 5 || lifecycle.gps_stale_events.length > 0) {
+    return "medium";
+  }
+  return "high";
+}
+
+function surroundingPlausibleSpeed(points: GpsPoint[], gapEndIndex: number): number | null {
+  const candidates = [
+    points[gapEndIndex - 1]?.segment_speed_mps,
+    points[gapEndIndex + 1]?.segment_speed_mps,
+    points[gapEndIndex - 2]?.segment_speed_mps,
+    points[gapEndIndex + 2]?.segment_speed_mps,
+  ].filter((value): value is number => value !== null && value !== undefined && value > 0 && value <= SUSPICIOUS_SPEED_MPS);
+
+  return mean(candidates);
+}
+
+function pickGapPoint(point: GpsPoint) {
+  return {
+    t_elapsed_seconds: point.t_elapsed_seconds,
+    timestamp_utc: point.timestamp_utc,
+    lat: point.lat,
+    lon: point.lon,
+    horizontal_accuracy_meters: point.horizontal_accuracy_meters,
   };
 }
 
@@ -320,7 +473,12 @@ function computeElevation(points: GpsPoint[], totalDistanceMeters: number, p90Ac
   for (let i = 1; i < points.length; i += 1) {
     const previous = points[i - 1];
     const current = points[i];
-    if (previous.altitude_meters === null || current.altitude_meters === null || current.possible_gps_jump) {
+    if (
+      previous.altitude_meters === null ||
+      current.altitude_meters === null ||
+      isExcludedSegment(current) ||
+      current.suspicious_grade
+    ) {
       continue;
     }
     altitudePairCount += 1;
@@ -333,7 +491,9 @@ function computeElevation(points: GpsPoint[], totalDistanceMeters: number, p90Ac
     }
     if (segmentMeters >= 5) {
       const grade = (delta / segmentMeters) * 100;
-      maxGrade = maxGrade === null ? Math.abs(grade) : Math.max(maxGrade, Math.abs(grade));
+      if (Math.abs(grade) <= SUSPICIOUS_GRADE_PERCENT) {
+        maxGrade = maxGrade === null ? Math.abs(grade) : Math.max(maxGrade, Math.abs(grade));
+      }
     }
   }
 
@@ -566,7 +726,8 @@ function elevationInRange(track: TrackPoint[], startMeters: number, endMeters: n
       segmentStart >= endMeters ||
       previous.altitude_meters === null ||
       current.altitude_meters === null ||
-      current.possible_gps_jump
+      isExcludedSegment(current) ||
+      current.suspicious_grade
     ) {
       continue;
     }
@@ -656,6 +817,7 @@ function computeMotionFeatures(
   durationSeconds: number,
   permissions: PermissionState,
   phonePosition: string,
+  motionDebug: ActiveRun["motion_debug"],
 ) {
   const early = selectMotionWindows(windows, durationSeconds, 0);
   const late = selectMotionWindows(windows, durationSeconds, 2);
@@ -671,6 +833,7 @@ function computeMotionFeatures(
       earlyMean !== null && lateMean !== null ? round(lateMean - earlyMean, 4) : null,
     cadence_estimate_spm: null,
     cadence_confidence: "not_computed",
+    motion_permission_debug: motionDebug,
     windows,
   };
 }
@@ -693,6 +856,8 @@ function buildQualityNotes(
   windows: MotionWindow[],
   startWeatherFetchedAt: string | null,
   targetDistanceResult: TargetDistanceResult,
+  interpolation: InterpolationFeatures,
+  recordingReliability: "high" | "medium" | "low",
 ): string[] {
   const notes: string[] = [];
   if (points.length === 0) {
@@ -707,6 +872,24 @@ function buildQualityNotes(
   }
   if (Number(gpsQuality.possible_gps_jump_count ?? 0) > 0) {
     notes.push("Possible GPS jumps were flagged and excluded from distance/split calculations.");
+  }
+  if (Number(gpsQuality.impossible_speed_segment_count ?? 0) > 0) {
+    notes.push("Impossible-speed GPS segments were excluded from distance, pace, and max-speed calculations.");
+  }
+  if (Number(gpsQuality.suspicious_speed_segment_count ?? 0) > 0) {
+    notes.push("Suspicious-speed GPS segments were detected and retained unless they exceeded the impossible-speed threshold.");
+  }
+  if (Number(gpsQuality.suspicious_acceleration_segment_count ?? 0) > 0) {
+    notes.push("Suspicious acceleration changes were detected in GPS-derived segment speeds.");
+  }
+  if (Number(gpsQuality.suspicious_grade_segment_count ?? 0) > 0) {
+    notes.push("Suspicious grade changes were detected; elevation and grade confidence should remain low.");
+  }
+  if (recordingReliability === "low") {
+    notes.push("Recording reliability was low; use interpolated distance only as a rough estimate.");
+  }
+  if (interpolation.gaps.length > 0) {
+    notes.push("GPS gaps were detected and interpolation estimates were added without overwriting raw distance.");
   }
   if (windows.length === 0) {
     notes.push("No motion windows were recorded.");
@@ -755,7 +938,7 @@ function exportPostRun(postRun: PostRunState) {
   };
 }
 
-function exportPermissions(permissions: PermissionState, weatherFetchSuccess: boolean) {
+function exportPermissions(permissions: PermissionState, weatherFetchSuccess: boolean, pwaState: ActiveRun["pwa_state"]) {
   return {
     geolocation_available: permissions.geolocation_available,
     geolocation_permission: permissions.geolocation_permission,
@@ -763,7 +946,11 @@ function exportPermissions(permissions: PermissionState, weatherFetchSuccess: bo
     device_motion_permission: permissions.device_motion_permission,
     wake_lock_available: permissions.wake_lock_available,
     wake_lock_used: permissions.wake_lock_used,
+    wake_lock_error_message: permissions.wake_lock_error_message,
     weather_fetch_success: weatherFetchSuccess,
+    pwa_display_mode_standalone: pwaState.display_mode_standalone,
+    service_worker_controller: pwaState.service_worker_controller,
+    storage_persisted: pwaState.storage_persisted,
   };
 }
 
@@ -787,7 +974,7 @@ function computeCurrentPace(points: GpsPoint[]): number | null {
 
   let distance = 0;
   for (let i = 1; i < windowPoints.length; i += 1) {
-    if (!windowPoints[i].possible_gps_jump) {
+    if (!isExcludedSegment(windowPoints[i])) {
       distance += haversineMeters(windowPoints[i - 1], windowPoints[i]);
     }
   }
@@ -821,6 +1008,10 @@ function toRadians(degrees: number): number {
 
 function nullableNumber(value: number | null): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function isExcludedSegment(point: GpsPoint): boolean {
+  return Boolean(point.possible_gps_jump || point.impossible_speed);
 }
 
 function finiteOrNull(value: number): number | null {

@@ -2,6 +2,7 @@ import {
   Activity,
   Clipboard,
   Download,
+  Map as MapIcon,
   Lock,
   MapPin,
   Play,
@@ -10,19 +11,26 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
+import L from "leaflet";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import "leaflet/dist/leaflet.css";
 import { buildExportPayload, computeLiveStats, createGpsPointFromPosition } from "./runMath";
 import type {
   ActiveRun,
   BreathingRecoveredAfter,
   Checkpoint,
   GpsPoint,
+  LifecycleEvent,
   MotionWindow,
+  MotionDebug,
   PermissionState,
   PhonePosition,
+  PreRunGpsWarmup,
   PostRunState,
   PreRunState,
   PrimaryLimiter,
+  PwaState,
+  RecordingLifecycle,
   RouteDirection,
   Screen,
   SorenessLevel,
@@ -32,10 +40,11 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.1";
+const APP_VERSION = "0.1.2";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const MOTION_WINDOW_SECONDS = 5;
+const ACCEPTABLE_GPS_ACCURACY_METERS = 25;
 
 interface MotionBucket {
   start: number;
@@ -103,11 +112,59 @@ function defaultPermissions(): PermissionState {
     wake_lock_available: wakeLockAvailable,
     wake_lock_used: false,
     wake_lock_status: wakeLockAvailable ? "inactive" : "unavailable",
+    wake_lock_error_message: null,
     weather_status: "will_fetch_after_gps",
   };
 }
 
-function createBlankRun(preRun: PreRunState, permissions: PermissionState): ActiveRun {
+function defaultRecordingLifecycle(): RecordingLifecycle {
+  return {
+    wake_lock_events: [],
+    visibility_events: [],
+    pagehide_events: [],
+    pageshow_events: [],
+    gps_stale_events: [],
+  };
+}
+
+function defaultWarmup(): PreRunGpsWarmup {
+  return {
+    armed_at_utc: null,
+    started_at_utc: null,
+    warmup_duration_seconds: null,
+    best_accuracy_meters: null,
+    last_accuracy_before_start_meters: null,
+  };
+}
+
+function defaultMotionDebug(): MotionDebug {
+  return {
+    request_status: "not_requested",
+    requested_at_utc: null,
+    result_at_utc: null,
+    first_event_at_utc: null,
+    first_event_elapsed_seconds: null,
+    sample_events_seen: 0,
+    no_samples_note_added: false,
+  };
+}
+
+function detectPwaState(storagePersisted: boolean | null = null): PwaState {
+  return {
+    display_mode_standalone:
+      window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone === true,
+    service_worker_controller: Boolean(navigator.serviceWorker?.controller),
+    storage_persisted: storagePersisted,
+  };
+}
+
+function createBlankRun(
+  preRun: PreRunState,
+  permissions: PermissionState,
+  warmup: PreRunGpsWarmup,
+  pwaState: PwaState,
+  motionDebug: MotionDebug,
+): ActiveRun {
   const now = new Date();
   return {
     run_metadata: {
@@ -129,6 +186,10 @@ function createBlankRun(preRun: PreRunState, permissions: PermissionState): Acti
     motion_windows: [],
     checkpoints: [],
     data_quality_notes: [],
+    recording_lifecycle: defaultRecordingLifecycle(),
+    pre_run_gps_warmup: warmup,
+    motion_debug: motionDebug,
+    pwa_state: pwaState,
     elapsed_offset_seconds: 0,
     last_saved_at_utc: now.toISOString(),
   };
@@ -145,8 +206,20 @@ export default function App() {
   const [elapsedSeconds, setElapsedSeconds] = useState(initialRun?.elapsed_offset_seconds ?? 0);
   const [exportCreatedAt, setExportCreatedAt] = useState(new Date().toISOString());
   const [actionMessage, setActionMessage] = useState("");
+  const [warmup, setWarmup] = useState<PreRunGpsWarmup>(initialRun?.pre_run_gps_warmup ?? defaultWarmup());
+  const [motionDebugDraft, setMotionDebugDraft] = useState<MotionDebug>(initialRun?.motion_debug ?? defaultMotionDebug());
+  const [warmupStatus, setWarmupStatus] = useState<{
+    active: boolean;
+    latestPoint: GpsPoint | null;
+    latestAccuracy: number | null;
+  }>({ active: false, latestPoint: null, latestAccuracy: null });
+  const [gpsStaleSeconds, setGpsStaleSeconds] = useState(0);
+  const [serviceWorkerUpdateReady, setServiceWorkerUpdateReady] = useState(false);
+  const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
+  const [pwaState, setPwaState] = useState<PwaState>(initialRun?.pwa_state ?? detectPwaState());
 
   const gpsWatchIdRef = useRef<number | null>(null);
+  const warmupWatchIdRef = useRef<number | null>(null);
   const elapsedSecondsRef = useRef(initialRun?.elapsed_offset_seconds ?? 0);
   const runStartPerfRef = useRef<number | null>(
     initialRun && !initialRun.run_metadata.end_time_utc
@@ -159,6 +232,11 @@ export default function App() {
   const targetReachedNotifiedRef = useRef(
     Boolean(initialRun?.checkpoints.some((checkpoint) => checkpoint.label === "target_distance_reached")),
   );
+  const stale5LoggedRef = useRef(false);
+  const stale10LoggedRef = useRef(false);
+  const motionEventsSeenRef = useRef(initialRun?.motion_debug.sample_events_seen ?? 0);
+  const activeRunRef = useRef<ActiveRun | null>(initialRun);
+  const serviceWorkerRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
 
   const liveStats = useMemo(
     () => computeLiveStats(activeRun?.gps_points ?? [], elapsedSeconds),
@@ -185,6 +263,7 @@ export default function App() {
     liveStats.distanceMeters >= (activeRun?.pre_run.intended_distance_meters ?? Infinity);
 
   elapsedSecondsRef.current = elapsedSeconds;
+  activeRunRef.current = activeRun;
 
   const getElapsedSeconds = useCallback(() => {
     if (runStartPerfRef.current === null) {
@@ -210,12 +289,99 @@ export default function App() {
     });
   }, []);
 
+  const appendLifecycleEvent = useCallback(
+    <K extends keyof RecordingLifecycle>(key: K, event: RecordingLifecycle[K][number]) => {
+      setActiveRun((run) => {
+        if (!run) {
+          return run;
+        }
+        return {
+          ...run,
+          recording_lifecycle: {
+            ...run.recording_lifecycle,
+            [key]: [...run.recording_lifecycle[key], event],
+          },
+        };
+      });
+    },
+    [],
+  );
+
+  const updateMotionDebug = useCallback((patch: Partial<MotionDebug>) => {
+    setMotionDebugDraft((current) => ({ ...current, ...patch }));
+    setActiveRun((run) =>
+      run ? { ...run, motion_debug: { ...run.motion_debug, ...patch } } : run,
+    );
+  }, []);
+
   const stopGpsWatch = useCallback(() => {
     if (gpsWatchIdRef.current !== null && "geolocation" in navigator) {
       navigator.geolocation.clearWatch(gpsWatchIdRef.current);
       gpsWatchIdRef.current = null;
     }
   }, []);
+
+  const stopWarmupWatch = useCallback(() => {
+    if (warmupWatchIdRef.current !== null && "geolocation" in navigator) {
+      navigator.geolocation.clearWatch(warmupWatchIdRef.current);
+      warmupWatchIdRef.current = null;
+    }
+    setWarmupStatus((current) => ({ ...current, active: false }));
+  }, []);
+
+  const armGps = useCallback(() => {
+    if (!("geolocation" in navigator)) {
+      updatePermissions({ geolocation_available: false, geolocation_permission: "unavailable" });
+      setActionMessage("GPS unavailable.");
+      return;
+    }
+    if (warmupWatchIdRef.current !== null) {
+      setActionMessage("GPS warmup already armed.");
+      return;
+    }
+
+    const armedAt = new Date().toISOString();
+    setWarmup({
+      armed_at_utc: armedAt,
+      started_at_utc: null,
+      warmup_duration_seconds: null,
+      best_accuracy_meters: null,
+      last_accuracy_before_start_meters: null,
+    });
+    setWarmupStatus({ active: true, latestPoint: null, latestAccuracy: null });
+    setActionMessage("GPS warmup armed.");
+
+    warmupWatchIdRef.current = navigator.geolocation.watchPosition(
+      (position) => {
+        const point = createGpsPointFromPosition(position, 0, null);
+        const accuracy = point.horizontal_accuracy_meters;
+        updatePermissions({ geolocation_permission: "ready" });
+        setWarmupStatus({ active: true, latestPoint: point, latestAccuracy: accuracy });
+        setWarmup((current) => ({
+          ...current,
+          best_accuracy_meters:
+            accuracy === null
+              ? current.best_accuracy_meters
+              : current.best_accuracy_meters === null
+                ? accuracy
+                : Math.min(current.best_accuracy_meters, accuracy),
+          last_accuracy_before_start_meters: accuracy,
+        }));
+      },
+      (error) => {
+        updatePermissions({
+          geolocation_permission: error.code === error.PERMISSION_DENIED ? "denied" : "unavailable",
+        });
+        setWarmupStatus((current) => ({ ...current, active: false }));
+        setActionMessage(error.code === error.PERMISSION_DENIED ? "GPS denied." : "GPS warmup unavailable.");
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 1000,
+        timeout: 10000,
+      },
+    );
+  }, [updatePermissions]);
 
   const fetchWeatherForRun = useCallback(
     async (kind: "start" | "finish", lat: number, lon: number) => {
@@ -257,6 +423,10 @@ export default function App() {
       (position) => {
         const elapsed = getElapsedSeconds();
         const pointForWeather: { current: GpsPoint | null } = { current: null };
+        const pointCountForWeather: { current: number } = { current: 0 };
+        stale5LoggedRef.current = false;
+        stale10LoggedRef.current = false;
+        setGpsStaleSeconds(0);
 
         setActiveRun((run) => {
           if (!run) {
@@ -265,6 +435,7 @@ export default function App() {
           const previousPoint = run.gps_points[run.gps_points.length - 1] ?? null;
           const point = createGpsPointFromPosition(position, elapsed, previousPoint);
           pointForWeather.current = point;
+          pointCountForWeather.current = run.gps_points.length + 1;
           return {
             ...run,
             gps_points: [...run.gps_points, point],
@@ -274,7 +445,11 @@ export default function App() {
 
         updatePermissions({ geolocation_permission: "ready" });
 
-        if (!startWeatherFetchStartedRef.current && pointForWeather.current) {
+        if (
+          !startWeatherFetchStartedRef.current &&
+          pointForWeather.current &&
+          (pointForWeather.current.accuracy_ok || pointCountForWeather.current >= 5)
+        ) {
           startWeatherFetchStartedRef.current = true;
           void fetchWeatherForRun("start", pointForWeather.current.lat, pointForWeather.current.lon);
         }
@@ -312,30 +487,72 @@ export default function App() {
   const requestWakeLock = useCallback(
     async (silent = false) => {
       if (!navigator.wakeLock) {
-        updatePermissions({ wake_lock_available: false, wake_lock_status: "unavailable" });
+        updatePermissions({
+          wake_lock_available: false,
+          wake_lock_status: "unavailable",
+          wake_lock_error_message: "Wake Lock API unavailable",
+        });
+        appendLifecycleEvent("wake_lock_events", {
+          event: "wake_lock_unavailable",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: runStartPerfRef.current === null ? null : round(getElapsedSeconds(), 2),
+          status: "unavailable",
+          error_message: "Wake Lock API unavailable",
+        });
         if (!silent) {
           setActionMessage("Wake lock unavailable.");
         }
         return;
       }
       try {
+        appendLifecycleEvent("wake_lock_events", {
+          event: "wake_lock_requested",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: runStartPerfRef.current === null ? null : round(getElapsedSeconds(), 2),
+          status: "requested",
+        });
         const lock = await navigator.wakeLock.request("screen");
         wakeLockRef.current = lock;
         lock.addEventListener("release", () => {
+          appendLifecycleEvent("wake_lock_events", {
+            event: "wake_lock_released",
+            timestamp_utc: new Date().toISOString(),
+            t_elapsed_seconds: runStartPerfRef.current === null ? null : round(getElapsedSeconds(), 2),
+            status: "released",
+          });
           updatePermissions({ wake_lock_status: "inactive" });
         });
-        updatePermissions({ wake_lock_available: true, wake_lock_status: "active", wake_lock_used: true });
+        updatePermissions({
+          wake_lock_available: true,
+          wake_lock_status: "active",
+          wake_lock_used: true,
+          wake_lock_error_message: null,
+        });
+        appendLifecycleEvent("wake_lock_events", {
+          event: "wake_lock_active",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: runStartPerfRef.current === null ? null : round(getElapsedSeconds(), 2),
+          status: "active",
+        });
         if (!silent) {
           setActionMessage("Wake lock active.");
         }
-      } catch {
-        updatePermissions({ wake_lock_status: "inactive" });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Wake lock request failed";
+        updatePermissions({ wake_lock_status: "failed", wake_lock_error_message: errorMessage });
+        appendLifecycleEvent("wake_lock_events", {
+          event: "wake_lock_failed",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: runStartPerfRef.current === null ? null : round(getElapsedSeconds(), 2),
+          status: "failed",
+          error_message: errorMessage,
+        });
         if (!silent) {
-          setActionMessage("Wake lock could not be enabled.");
+          setActionMessage("Wake lock is not active. Keep the app visible and screen on or GPS may stop.");
         }
       }
     },
-    [updatePermissions],
+    [appendLifecycleEvent, getElapsedSeconds, updatePermissions],
   );
 
   const requestGpsPermission = () => {
@@ -360,43 +577,71 @@ export default function App() {
   const requestMotionPermission = async () => {
     if (!permissions.device_motion_available) {
       updatePermissions({ device_motion_permission: "unavailable" });
+      updateMotionDebug({
+        request_status: "unavailable",
+        requested_at_utc: new Date().toISOString(),
+        result_at_utc: new Date().toISOString(),
+      });
       setActionMessage("Motion unavailable.");
       return;
     }
 
     try {
+      updateMotionDebug({ request_status: "requested", requested_at_utc: new Date().toISOString() });
       const requestPermission = (
         DeviceMotionEvent as unknown as { requestPermission?: () => Promise<"granted" | "denied"> }
       ).requestPermission;
       if (typeof requestPermission === "function") {
         const result = await requestPermission();
         updatePermissions({ device_motion_permission: result === "granted" ? "ready" : "denied" });
+        updateMotionDebug({
+          request_status: result === "granted" ? "granted" : "denied",
+          result_at_utc: new Date().toISOString(),
+        });
         setActionMessage(result === "granted" ? "Motion ready." : "Motion denied.");
       } else {
         updatePermissions({ device_motion_permission: "ready" });
+        updateMotionDebug({ request_status: "granted", result_at_utc: new Date().toISOString() });
         setActionMessage("Motion ready.");
       }
     } catch {
       updatePermissions({ device_motion_permission: "denied" });
+      updateMotionDebug({ request_status: "failed", result_at_utc: new Date().toISOString() });
       setActionMessage("Motion permission failed.");
     }
   };
 
   const startRun = () => {
-    const run = createBlankRun(preRun, permissions);
+    const startedAt = new Date();
+    const warmupStartedAt = warmup.armed_at_utc ? Date.parse(warmup.armed_at_utc) : null;
+    const finalWarmup: PreRunGpsWarmup = {
+      ...warmup,
+      started_at_utc: startedAt.toISOString(),
+      warmup_duration_seconds:
+        warmupStartedAt !== null && Number.isFinite(warmupStartedAt)
+          ? round((startedAt.getTime() - warmupStartedAt) / 1000, 2)
+          : null,
+      last_accuracy_before_start_meters: warmupStatus.latestAccuracy ?? warmup.last_accuracy_before_start_meters,
+    };
+    stopWarmupWatch();
+    setWarmup(finalWarmup);
+
+    const run = createBlankRun(preRun, permissions, finalWarmup, pwaState, motionDebugDraft);
     setActiveRun(run);
     setElapsedSeconds(0);
     setExportCreatedAt(new Date().toISOString());
     setActionMessage("");
     runStartPerfRef.current = performance.now();
     motionBucketRef.current = null;
+    motionEventsSeenRef.current = 0;
     startWeatherFetchStartedRef.current = false;
     targetReachedNotifiedRef.current = false;
+    stale5LoggedRef.current = false;
+    stale10LoggedRef.current = false;
+    setGpsStaleSeconds(0);
     setScreen("live");
     startGpsWatch();
-    if (permissions.wake_lock_used || permissions.wake_lock_status === "active") {
-      void requestWakeLock(true);
-    }
+    void requestWakeLock(true);
   };
 
   const stopRun = async () => {
@@ -455,15 +700,20 @@ export default function App() {
       return;
     }
     stopGpsWatch();
+    stopWarmupWatch();
     void releaseWakeLock();
     localStorage.removeItem(STORAGE_KEY);
     setActiveRun(null);
     setPreRun(defaultPreRun);
     setPermissions(defaultPermissions());
+    setWarmup(defaultWarmup());
+    setWarmupStatus({ active: false, latestPoint: null, latestAccuracy: null });
+    setMotionDebugDraft(defaultMotionDebug());
     setElapsedSeconds(0);
     setActionMessage("");
     runStartPerfRef.current = null;
     motionBucketRef.current = null;
+    motionEventsSeenRef.current = 0;
     startWeatherFetchStartedRef.current = false;
     targetReachedNotifiedRef.current = false;
     setScreen("setup");
@@ -560,6 +810,24 @@ export default function App() {
     }
   };
 
+  const installPwa = async () => {
+    const promptEvent = installPrompt as Event & { prompt?: () => Promise<void> };
+    if (!promptEvent.prompt) {
+      setActionMessage("Install prompt is not available in this browser.");
+      return;
+    }
+    await promptEvent.prompt();
+    setInstallPrompt(null);
+  };
+
+  const applyServiceWorkerUpdate = () => {
+    const waiting = serviceWorkerRegistrationRef.current?.waiting;
+    if (waiting) {
+      waiting.postMessage({ type: "SKIP_WAITING" });
+    }
+    window.location.reload();
+  };
+
   const appendMotionWindow = useCallback((windowSummary: MotionWindow) => {
     setActiveRun((run) =>
       run ? { ...run, motion_windows: [...run.motion_windows, windowSummary] } : run,
@@ -590,11 +858,82 @@ export default function App() {
     }
 
     const intervalId = window.setInterval(() => {
-      setElapsedSeconds(getElapsedSeconds());
+      const elapsed = getElapsedSeconds();
+      setElapsedSeconds(elapsed);
+      const currentRun = activeRunRef.current;
+      const latestPoint = currentRun?.gps_points[currentRun.gps_points.length - 1] ?? null;
+      if (!latestPoint) {
+        return;
+      }
+      const staleSeconds = Math.max(0, elapsed - latestPoint.t_elapsed_seconds);
+      setGpsStaleSeconds(staleSeconds);
+      if (staleSeconds > 5 && !stale5LoggedRef.current) {
+        stale5LoggedRef.current = true;
+        appendLifecycleEvent("gps_stale_events", {
+          event: "gps_stale_over_5_seconds",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: round(elapsed, 2),
+          stale_seconds: round(staleSeconds, 2),
+          last_gps_elapsed_seconds: latestPoint.t_elapsed_seconds,
+          threshold_seconds: 5,
+        });
+      }
+      if (staleSeconds > 10 && !stale10LoggedRef.current) {
+        stale10LoggedRef.current = true;
+        appendLifecycleEvent("gps_stale_events", {
+          event: "gps_stale_over_10_seconds",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: round(elapsed, 2),
+          stale_seconds: round(staleSeconds, 2),
+          last_gps_elapsed_seconds: latestPoint.t_elapsed_seconds,
+          threshold_seconds: 10,
+        });
+      }
     }, 500);
 
     return () => window.clearInterval(intervalId);
-  }, [activeRun, getElapsedSeconds, screen, startGpsWatch]);
+  }, [activeRun, appendLifecycleEvent, getElapsedSeconds, screen, startGpsWatch]);
+
+  useEffect(() => {
+    const handleBeforeInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event);
+    };
+
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+
+    if ("storage" in navigator && navigator.storage?.persisted) {
+      void navigator.storage.persisted().then(async (alreadyPersisted) => {
+        const persisted = alreadyPersisted || (navigator.storage.persist ? await navigator.storage.persist() : false);
+        setPwaState(detectPwaState(persisted));
+      });
+    }
+
+    if ("serviceWorker" in navigator) {
+      void navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`, {
+        scope: import.meta.env.BASE_URL,
+      }).then((registration) => {
+        serviceWorkerRegistrationRef.current = registration;
+        setPwaState(detectPwaState(pwaState.storage_persisted));
+        registration.addEventListener("updatefound", () => {
+          const installing = registration.installing;
+          if (!installing) {
+            return;
+          }
+          installing.addEventListener("statechange", () => {
+            if (installing.state === "installed" && navigator.serviceWorker.controller) {
+              setServiceWorkerUpdateReady(true);
+            }
+          });
+        });
+      });
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        setPwaState(detectPwaState(pwaState.storage_persisted));
+      });
+    }
+
+    return () => window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+  }, []);
 
   useEffect(() => {
     if (
@@ -638,6 +977,17 @@ export default function App() {
       const elapsed = getElapsedSeconds();
       const bucketStart = Math.floor(elapsed / MOTION_WINDOW_SECONDS) * MOTION_WINDOW_SECONDS;
       const currentBucket = motionBucketRef.current;
+      motionEventsSeenRef.current += 1;
+
+      if (motionEventsSeenRef.current === 1) {
+        updateMotionDebug({
+          first_event_at_utc: new Date().toISOString(),
+          first_event_elapsed_seconds: round(elapsed, 2),
+          sample_events_seen: motionEventsSeenRef.current,
+        });
+      } else if (motionEventsSeenRef.current % 25 === 0) {
+        updateMotionDebug({ sample_events_seen: motionEventsSeenRef.current });
+      }
 
       if (!currentBucket || bucketStart > currentBucket.start) {
         if (currentBucket?.sampleCount) {
@@ -651,18 +1001,87 @@ export default function App() {
 
     window.addEventListener("devicemotion", handleMotion);
     return () => window.removeEventListener("devicemotion", handleMotion);
-  }, [appendMotionWindow, getElapsedSeconds, permissions.device_motion_permission, screen]);
+  }, [appendMotionWindow, getElapsedSeconds, permissions.device_motion_permission, screen, updateMotionDebug]);
+
+  useEffect(() => {
+    if (screen !== "live" || permissions.device_motion_permission !== "ready" || activeRun?.motion_debug.no_samples_note_added) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      if (motionEventsSeenRef.current === 0) {
+        appendQualityNote("Device motion permission was ready, but no motion samples arrived after 10 seconds.");
+        updateMotionDebug({ no_samples_note_added: true, sample_events_seen: 0 });
+      }
+    }, 10000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [activeRun?.motion_debug.no_samples_note_added, appendQualityNote, permissions.device_motion_permission, screen, updateMotionDebug]);
 
   useEffect(() => {
     const handleVisibility = () => {
-      if (document.visibilityState === "visible" && screen === "live" && permissions.wake_lock_used) {
+      if (activeRunRef.current && screen === "live") {
+        appendLifecycleEvent("visibility_events", {
+          event: "visibilitychange",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: round(getElapsedSeconds(), 2),
+          visibility_state: document.visibilityState,
+        });
+      }
+      if (document.visibilityState === "visible" && screen === "live" && permissions.wake_lock_available) {
+        appendLifecycleEvent("wake_lock_events", {
+          event: "wake_lock_reacquire_attempt",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: round(getElapsedSeconds(), 2),
+          status: "reacquire_attempt",
+        });
         void requestWakeLock(true);
+      }
+    };
+    const handlePageHide = () => {
+      if (activeRunRef.current && screen === "live") {
+        appendLifecycleEvent("pagehide_events", lifecycleEvent("pagehide", getElapsedSeconds()));
+      }
+    };
+    const handlePageShow = () => {
+      if (activeRunRef.current && screen === "live") {
+        appendLifecycleEvent("pageshow_events", lifecycleEvent("pageshow", getElapsedSeconds()));
+      }
+    };
+    const handleFreeze = () => {
+      if (activeRunRef.current && screen === "live") {
+        appendLifecycleEvent("visibility_events", {
+          event: "freeze",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: round(getElapsedSeconds(), 2),
+          visibility_state: document.visibilityState,
+        });
+      }
+    };
+    const handleResume = () => {
+      if (activeRunRef.current && screen === "live") {
+        appendLifecycleEvent("visibility_events", {
+          event: "resume",
+          timestamp_utc: new Date().toISOString(),
+          t_elapsed_seconds: round(getElapsedSeconds(), 2),
+          visibility_state: document.visibilityState,
+        });
       }
     };
 
     document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [permissions.wake_lock_used, requestWakeLock, screen]);
+    window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("pageshow", handlePageShow);
+    document.addEventListener("freeze", handleFreeze);
+    document.addEventListener("resume", handleResume);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("pageshow", handlePageShow);
+      document.removeEventListener("freeze", handleFreeze);
+      document.removeEventListener("resume", handleResume);
+    };
+  }, [appendLifecycleEvent, getElapsedSeconds, permissions.wake_lock_used, requestWakeLock, screen]);
 
   useEffect(() => {
     if (!activeRun) {
@@ -675,6 +1094,10 @@ export default function App() {
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(savedRun));
   }, [activeRun, elapsedSeconds, screen]);
+
+  useEffect(() => {
+    setActiveRun((run) => (run ? { ...run, pwa_state: pwaState } : run));
+  }, [pwaState]);
 
   useEffect(() => {
     return () => {
@@ -694,13 +1117,27 @@ export default function App() {
       </header>
 
       {actionMessage ? <div className="notice">{actionMessage}</div> : null}
+      {serviceWorkerUpdateReady ? (
+        <button type="button" className="update-banner" onClick={applyServiceWorkerUpdate}>
+          New version ready. Tap to update.
+        </button>
+      ) : null}
+      {installPrompt ? (
+        <button type="button" className="install-banner" onClick={() => void installPwa()}>
+          Install app
+        </button>
+      ) : null}
 
       {screen === "setup" ? (
         <SetupScreen
           preRun={preRun}
           permissions={permissions}
+          warmup={warmup}
+          warmupStatus={warmupStatus}
           setPreRun={setPreRun}
           onGps={requestGpsPermission}
+          onArmGps={armGps}
+          onStopWarmup={stopWarmupWatch}
           onMotion={requestMotionPermission}
           onWakeLock={() => void requestWakeLock(false)}
           onStart={startRun}
@@ -713,6 +1150,7 @@ export default function App() {
           elapsedSeconds={elapsedSeconds}
           liveStats={liveStats}
           targetReached={targetReached}
+          gpsStaleSeconds={gpsStaleSeconds}
           onCheckpoint={addCheckpoint}
           onStop={() => void stopRun()}
           onDiscard={discardRun}
@@ -757,16 +1195,24 @@ export default function App() {
 function SetupScreen({
   preRun,
   permissions,
+  warmup,
+  warmupStatus,
   setPreRun,
   onGps,
+  onArmGps,
+  onStopWarmup,
   onMotion,
   onWakeLock,
   onStart,
 }: {
   preRun: PreRunState;
   permissions: PermissionState;
+  warmup: PreRunGpsWarmup;
+  warmupStatus: { active: boolean; latestPoint: GpsPoint | null; latestAccuracy: number | null };
   setPreRun: (next: PreRunState) => void;
   onGps: () => void;
+  onArmGps: () => void;
+  onStopWarmup: () => void;
   onMotion: () => void;
   onWakeLock: () => void;
   onStart: () => void;
@@ -792,15 +1238,53 @@ function SetupScreen({
           <MapPin size={18} />
           Request GPS
         </button>
+        <button type="button" className="secondary-button" onClick={warmupStatus.active ? onStopWarmup : onArmGps}>
+          <MapPin size={18} />
+          {warmupStatus.active ? "Stop warmup" : "Arm GPS"}
+        </button>
         <button type="button" className="secondary-button" onClick={onMotion}>
           <Activity size={18} />
           Request motion
         </button>
+      </section>
+
+      <section className="button-grid">
         <button type="button" className="secondary-button" onClick={onWakeLock}>
           <Lock size={18} />
           Enable wake lock
         </button>
       </section>
+
+      {warmupStatus.active || warmup.armed_at_utc ? (
+        <section className="warmup-panel">
+          <div>
+            <span>GPS warmup</span>
+            <strong>{warmupReadyLabel(warmupStatus.latestAccuracy)}</strong>
+          </div>
+          <div>
+            <span>Current accuracy</span>
+            <strong>{formatAccuracy(warmupStatus.latestAccuracy)}</strong>
+          </div>
+          <div>
+            <span>Best accuracy</span>
+            <strong>{formatAccuracy(warmup.best_accuracy_meters)}</strong>
+          </div>
+        </section>
+      ) : null}
+
+      <button
+        type="button"
+        className="secondary-button full-width-button"
+        onClick={() =>
+          setPreRun({
+            ...preRun,
+            route_name: "instrumentation validation",
+            intended_distance_meters: 300,
+          })
+        }
+      >
+        Use validation mode
+      </button>
 
       <section className="form-panel">
         <ReadonlyField label="Runner ID" value={preRun.runner_id} />
@@ -934,7 +1418,7 @@ function SetupScreen({
 
       <button type="button" className="primary-button sticky-action" onClick={onStart}>
         <Play size={20} />
-        Start run
+        {warmup.armed_at_utc ? "Start actual run" : "Start run"}
       </button>
     </section>
   );
@@ -945,6 +1429,7 @@ function LiveScreen({
   elapsedSeconds,
   liveStats,
   targetReached,
+  gpsStaleSeconds,
   onCheckpoint,
   onStop,
   onDiscard,
@@ -953,11 +1438,13 @@ function LiveScreen({
   elapsedSeconds: number;
   liveStats: ReturnType<typeof computeLiveStats>;
   targetReached: boolean;
+  gpsStaleSeconds: number;
   onCheckpoint: () => void;
   onStop: () => void;
   onDiscard: () => void;
 }) {
   const remainingMeters = Math.max(0, run.pre_run.intended_distance_meters - liveStats.distanceMeters);
+  const gpsStale = gpsStaleSeconds > 10;
 
   return (
     <section className="screen-stack live-screen">
@@ -965,6 +1452,20 @@ function LiveScreen({
         <section className="target-banner">
           <strong>Target reached</strong>
           <span>You can stop now.</span>
+        </section>
+      ) : null}
+
+      {gpsStale ? (
+        <section className="warning-banner">
+          <strong>GPS stale</strong>
+          <span>Keep app visible.</span>
+        </section>
+      ) : null}
+
+      {run.permissions.wake_lock_available && run.permissions.wake_lock_status !== "active" ? (
+        <section className="warning-banner">
+          <strong>Wake lock inactive</strong>
+          <span>Keep screen on.</span>
         </section>
       ) : null}
 
@@ -986,10 +1487,13 @@ function LiveScreen({
         <Metric label="Remaining" value={formatMeters(remainingMeters)} />
       </section>
 
+      <LiveMap run={run} liveStats={liveStats} />
+
       <section className="status-grid compact">
         <StatusItem label="GPS points" value={String(run.gps_points.length)} />
         <StatusItem label="Motion windows" value={String(run.motion_windows.length)} />
         <StatusItem label="Wake lock" value={wakeLabel(run.permissions.wake_lock_status)} />
+        <StatusItem label="Recording" value={gpsStale ? "GPS stale" : "healthy"} />
         <StatusItem label="Weather" value={weatherLabel(run.permissions.weather_status)} />
       </section>
 
@@ -1007,6 +1511,133 @@ function LiveScreen({
       <button type="button" className="link-button" onClick={onDiscard}>
         Emergency discard
       </button>
+    </section>
+  );
+}
+
+function LiveMap({
+  run,
+  liveStats,
+}: {
+  run: ActiveRun;
+  liveStats: ReturnType<typeof computeLiveStats>;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<L.Map | null>(null);
+  const layerGroupRef = useRef<L.LayerGroup | null>(null);
+
+  useEffect(() => {
+    if (!containerRef.current || mapRef.current) {
+      return undefined;
+    }
+
+    const map = L.map(containerRef.current, {
+      attributionControl: false,
+      zoomControl: false,
+      dragging: true,
+    }).setView([47.679, -122.328], 14);
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      crossOrigin: true,
+    }).addTo(map);
+
+    layerGroupRef.current = L.layerGroup().addTo(map);
+    mapRef.current = map;
+
+    return () => {
+      map.remove();
+      mapRef.current = null;
+      layerGroupRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const layers = layerGroupRef.current;
+    if (!map || !layers) {
+      return;
+    }
+
+    layers.clearLayers();
+    const points = run.gps_points;
+    if (points.length === 0) {
+      return;
+    }
+
+    const latLngs = points.map((point) => L.latLng(point.lat, point.lon));
+    const first = points[0];
+    const latest = points[points.length - 1];
+
+    L.polyline(latLngs, { color: "#12683f", weight: 4, opacity: 0.85 }).addTo(layers);
+    L.circleMarker([first.lat, first.lon], {
+      radius: 6,
+      color: "#0f5d38",
+      fillColor: "#ffffff",
+      fillOpacity: 1,
+      weight: 3,
+    }).addTo(layers);
+    L.circleMarker([latest.lat, latest.lon], {
+      radius: 7,
+      color: "#10231b",
+      fillColor: "#2dd078",
+      fillOpacity: 1,
+      weight: 3,
+    }).addTo(layers);
+
+    if (latest.horizontal_accuracy_meters !== null) {
+      L.circle([latest.lat, latest.lon], {
+        radius: latest.horizontal_accuracy_meters,
+        color: "#2b7a58",
+        fillColor: "#2b7a58",
+        fillOpacity: 0.1,
+        weight: 1,
+      }).addTo(layers);
+    }
+
+    for (let i = 1; i < points.length; i += 1) {
+      const gap = points[i].t_elapsed_seconds - points[i - 1].t_elapsed_seconds;
+      if (gap > 5) {
+        L.circleMarker([(points[i].lat + points[i - 1].lat) / 2, (points[i].lon + points[i - 1].lon) / 2], {
+          radius: gap > 10 ? 7 : 5,
+          color: "#b15b00",
+          fillColor: "#ffb35b",
+          fillOpacity: 0.9,
+          weight: 2,
+        }).addTo(layers);
+      }
+    }
+
+    const targetCheckpoint = run.checkpoints.find((checkpoint) => checkpoint.label === "target_distance_reached");
+    if (targetCheckpoint) {
+      const targetPoint = nearestPointByElapsed(points, targetCheckpoint.t_elapsed_seconds);
+      if (targetPoint) {
+        L.circleMarker([targetPoint.lat, targetPoint.lon], {
+          radius: 8,
+          color: "#12683f",
+          fillColor: "#f7d154",
+          fillOpacity: 1,
+          weight: 3,
+        }).addTo(layers);
+      }
+    }
+
+    const bounds = L.latLngBounds(latLngs);
+    if (bounds.isValid()) {
+      map.fitBounds(bounds.pad(0.25), { animate: false, maxZoom: 17 });
+    }
+  }, [run.checkpoints, run.gps_points]);
+
+  return (
+    <section className="map-panel">
+      <div className="map-toolbar">
+        <span>
+          <MapIcon size={15} />
+          Track
+        </span>
+        <strong>{formatMeters(liveStats.distanceMeters)}</strong>
+      </div>
+      <div ref={containerRef} className="live-map" />
     </section>
   );
 }
@@ -1373,10 +2004,36 @@ function loadStoredRun(): ActiveRun | null {
     if (!raw) {
       return null;
     }
-    return JSON.parse(raw) as ActiveRun;
+    return normalizeStoredRun(JSON.parse(raw) as Partial<ActiveRun>);
   } catch {
     return null;
   }
+}
+
+function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
+  return {
+    run_metadata: run.run_metadata!,
+    pre_run: run.pre_run ?? defaultPreRun,
+    post_run: run.post_run ?? defaultPostRun,
+    permissions: { ...defaultPermissions(), ...run.permissions },
+    weather: run.weather ?? {
+      start_weather: emptyWeatherSnapshot(true),
+      finish_weather: emptyWeatherSnapshot(false),
+    },
+    gps_points: run.gps_points ?? [],
+    motion_windows: run.motion_windows ?? [],
+    checkpoints: run.checkpoints ?? [],
+    data_quality_notes: run.data_quality_notes ?? [],
+    recording_lifecycle: {
+      ...defaultRecordingLifecycle(),
+      ...run.recording_lifecycle,
+    },
+    pre_run_gps_warmup: { ...defaultWarmup(), ...run.pre_run_gps_warmup },
+    motion_debug: { ...defaultMotionDebug(), ...run.motion_debug },
+    pwa_state: { ...detectPwaState(), ...run.pwa_state },
+    elapsed_offset_seconds: run.elapsed_offset_seconds ?? 0,
+    last_saved_at_utc: run.last_saved_at_utc ?? new Date().toISOString(),
+  };
 }
 
 function createMotionBucket(start: number): MotionBucket {
@@ -1491,6 +2148,14 @@ function roundOrNull(value: number | null, digits: number): number | null {
   return value === null ? null : round(value, digits);
 }
 
+function lifecycleEvent(event: string, elapsedSeconds: number): LifecycleEvent {
+  return {
+    event,
+    timestamp_utc: new Date().toISOString(),
+    t_elapsed_seconds: round(elapsedSeconds, 2),
+  };
+}
+
 function numberFromInput(value: string): number | null {
   if (value.trim() === "") {
     return null;
@@ -1530,12 +2195,30 @@ function formatAccuracy(meters: number | null): string {
   return meters === null ? "unknown" : `${Math.round(meters)} m`;
 }
 
+function warmupReadyLabel(accuracy: number | null): string {
+  if (accuracy === null) {
+    return "warming";
+  }
+  return accuracy <= ACCEPTABLE_GPS_ACCURACY_METERS ? "GPS ready" : "improving";
+}
+
+function nearestPointByElapsed(points: GpsPoint[], elapsedSeconds: number): GpsPoint | null {
+  if (points.length === 0) {
+    return null;
+  }
+  return points.reduce((nearest, point) =>
+    Math.abs(point.t_elapsed_seconds - elapsedSeconds) < Math.abs(nearest.t_elapsed_seconds - elapsedSeconds)
+      ? point
+      : nearest,
+  );
+}
+
 function permissionLabel(value: string): string {
   return value === "ready" || value === "denied" || value === "unavailable" ? value : "unknown";
 }
 
 function wakeLabel(value: string): string {
-  return value === "active" || value === "unavailable" ? value : "inactive";
+  return value === "active" || value === "unavailable" || value === "failed" ? value : "inactive";
 }
 
 function weatherLabel(value: WeatherStatusText): string {

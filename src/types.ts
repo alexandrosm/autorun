@@ -1,7 +1,7 @@
 export type Screen = "setup" | "live" | "stop" | "post" | "export";
 
 export type PermissionStatusText = "unknown" | "ready" | "denied" | "unavailable";
-export type WakeLockStatusText = "active" | "inactive" | "unavailable";
+export type WakeLockStatusText = "active" | "inactive" | "failed" | "unavailable";
 export type WeatherStatusText = "will_fetch_after_gps" | "fetched" | "unavailable" | "fetching";
 
 export type RouteDirection = "clockwise" | "counterclockwise" | "unknown";
@@ -65,6 +65,7 @@ export interface PermissionState {
   wake_lock_available: boolean;
   wake_lock_used: boolean;
   wake_lock_status: WakeLockStatusText;
+  wake_lock_error_message: string | null;
   weather_status: WeatherStatusText;
 }
 
@@ -81,6 +82,13 @@ export interface GpsPoint {
   accuracy_ok: boolean;
   speed_available: boolean;
   possible_gps_jump: boolean;
+  segment_speed_mps?: number | null;
+  segment_acceleration_mps2?: number | null;
+  segment_grade_percent?: number | null;
+  impossible_speed?: boolean;
+  suspicious_speed?: boolean;
+  suspicious_acceleration?: boolean;
+  suspicious_grade?: boolean;
 }
 
 export interface MotionWindow {
@@ -151,6 +159,83 @@ export interface TargetDistanceResult {
   distance_recorded_meters: number | null;
 }
 
+export interface LifecycleEvent {
+  event: string;
+  timestamp_utc: string;
+  t_elapsed_seconds: number | null;
+  message?: string;
+  error_message?: string | null;
+}
+
+export interface WakeLockLifecycleEvent extends LifecycleEvent {
+  status: WakeLockStatusText | "requested" | "released" | "reacquire_attempt";
+}
+
+export interface VisibilityLifecycleEvent extends LifecycleEvent {
+  visibility_state?: DocumentVisibilityState;
+}
+
+export interface GpsStaleEvent extends LifecycleEvent {
+  stale_seconds: number;
+  last_gps_elapsed_seconds: number | null;
+  threshold_seconds: number;
+}
+
+export interface RecordingLifecycle {
+  wake_lock_events: WakeLockLifecycleEvent[];
+  visibility_events: VisibilityLifecycleEvent[];
+  pagehide_events: LifecycleEvent[];
+  pageshow_events: LifecycleEvent[];
+  gps_stale_events: GpsStaleEvent[];
+}
+
+export interface PreRunGpsWarmup {
+  armed_at_utc: string | null;
+  started_at_utc: string | null;
+  warmup_duration_seconds: number | null;
+  best_accuracy_meters: number | null;
+  last_accuracy_before_start_meters: number | null;
+}
+
+export interface MotionDebug {
+  request_status: "not_requested" | "requested" | "granted" | "denied" | "unavailable" | "failed";
+  requested_at_utc: string | null;
+  result_at_utc: string | null;
+  first_event_at_utc: string | null;
+  first_event_elapsed_seconds: number | null;
+  sample_events_seen: number;
+  no_samples_note_added: boolean;
+}
+
+export interface PwaState {
+  display_mode_standalone: boolean;
+  service_worker_controller: boolean;
+  storage_persisted: boolean | null;
+}
+
+export interface GpsGapInterpolation {
+  start_elapsed_seconds: number;
+  end_elapsed_seconds: number;
+  duration_seconds: number;
+  last_point: Pick<GpsPoint, "t_elapsed_seconds" | "timestamp_utc" | "lat" | "lon" | "horizontal_accuracy_meters">;
+  next_point: Pick<GpsPoint, "t_elapsed_seconds" | "timestamp_utc" | "lat" | "lon" | "horizontal_accuracy_meters">;
+  straight_line_distance_meters: number;
+  surrounding_speed_mps: number | null;
+  speed_based_distance_estimate_meters: number | null;
+  chosen_distance_estimate_meters: number;
+  method: "straight_line" | "speed_based" | "route_based_placeholder";
+  confidence: "low" | "medium" | "high";
+}
+
+export interface InterpolationFeatures {
+  raw_recorded_distance_meters: number | null;
+  interpolated_distance_estimate_meters: number | null;
+  estimated_missing_distance_meters: number | null;
+  missing_gps_time_seconds: number;
+  interpolation_confidence: "low" | "medium" | "high";
+  gaps: GpsGapInterpolation[];
+}
+
 export interface ActiveRun {
   run_metadata: RunMetadata;
   pre_run: PreRunState;
@@ -161,6 +246,10 @@ export interface ActiveRun {
   motion_windows: MotionWindow[];
   checkpoints: Checkpoint[];
   data_quality_notes: string[];
+  recording_lifecycle: RecordingLifecycle;
+  pre_run_gps_warmup: PreRunGpsWarmup;
+  motion_debug: MotionDebug;
+  pwa_state: PwaState;
   elapsed_offset_seconds: number;
   last_saved_at_utc: string;
 }
@@ -177,10 +266,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.1";
+  schema_version: "0.1.2";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.1";
+    version: "0.1.2";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -204,9 +293,16 @@ export interface ExportPayload {
   pre_run: Record<string, unknown>;
   run_metadata: Record<string, unknown>;
   permissions_and_capabilities: Record<string, unknown>;
+  recording_lifecycle: RecordingLifecycle & {
+    missing_gps_time_seconds: number;
+    gps_stale_event_count: number;
+    recording_reliability: "high" | "medium" | "low";
+  };
+  pre_run_gps_warmup: PreRunGpsWarmup;
   weather: WeatherState;
   summary: Record<string, unknown>;
   gps_quality: Record<string, unknown>;
+  interpolation_features: InterpolationFeatures;
   splits: {
     miles: SplitFeature[];
     kilometers: SplitFeature[];

@@ -92,6 +92,58 @@ button {
   font-weight: 700;
 }
 
+.update-banner,
+.install-banner {
+  display: block;
+  width: 100%;
+  min-height: 42px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-weight: 900;
+}
+
+.update-banner {
+  border: 1px solid #12683f;
+  background: #12683f;
+  color: #ffffff;
+}
+
+.install-banner {
+  border: 1px solid #b9ccc2;
+  background: #ffffff;
+  color: #17372a;
+}
+
+.warmup-panel {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #cfddd5;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.warmup-panel span,
+.warmup-panel strong {
+  display: block;
+}
+
+.warmup-panel span {
+  margin-bottom: 7px;
+  color: #5d6e64;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.warmup-panel strong {
+  color: #10231b;
+  font-size: 1rem;
+  line-height: 1.1;
+}
+
 .screen-stack {
   display: flex;
   flex-direction: column;
@@ -151,6 +203,10 @@ button {
 
 .button-grid.vertical {
   grid-template-columns: 1fr;
+}
+
+.full-width-button {
+  width: 100%;
 }
 
 .primary-button,
@@ -323,6 +379,59 @@ button {
   font-weight: 800;
 }
 
+.warning-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid #985200;
+  border-radius: 8px;
+  background: #fff3df;
+  color: #623400;
+}
+
+.warning-banner strong,
+.warning-banner span {
+  display: block;
+  line-height: 1.1;
+}
+
+.warning-banner span {
+  font-weight: 800;
+}
+
+.map-panel {
+  overflow: hidden;
+  border: 1px solid #cfddd5;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.map-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid #cfddd5;
+  background: #ffffff;
+  color: #17372a;
+  font-weight: 900;
+}
+
+.map-toolbar span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.live-map {
+  width: 100%;
+  height: 220px;
+  background: #dfe8e2;
+}
+
 .metric-hero {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -405,6 +514,7 @@ button {
   }
 
   .paired-fields,
+  .warmup-panel,
   .metric-hero,
   .metrics-grid {
     grid-template-columns: 1fr;

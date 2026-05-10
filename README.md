@@ -2,14 +2,17 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.1`
+Current version: `0.1.2`
 
-## v0.1.1 focus
+## v0.1.2 focus
 
-- Detects the intended target-distance crossing, defaulting to 5000 meters.
-- Exports `target_distance_result` and `target_distance_splits` alongside the original actual-distance splits.
-- Shows a live target-reached banner and stores an automatic `target_distance_reached` checkpoint.
-- Uses monotonic elapsed time for stopped runs so resume does not include time spent on the stop screen.
+- Adds PWA installability with a manifest, icons, service worker app-shell cache, and update prompt.
+- Adds Arm GPS warmup before starting the actual run.
+- Automatically requests wake lock on run start and logs lifecycle/wake/visibility/GPS-stale events.
+- Adds GPS gap interpolation estimates without overwriting raw recorded distance.
+- Adds impossible-speed, suspicious-speed, acceleration, and grade artifact flags.
+- Adds a live map with track, current point, start marker, target marker, accuracy circle, and gap markers.
+- Adds motion permission/debug fields and validation mode.
 
 ## Local run
 
