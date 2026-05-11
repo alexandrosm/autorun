@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.2`
+Current version: `0.1.3`
+
+## v0.1.3 focus
+
+- Adds a preflight gate before Start with explicit GPS, wake-lock, motion, visibility, and target checks.
+- Adds a run-health summary on the export screen before download/share/copy.
+- Adds a map tile failure message so the app makes clear that recording continues when OSM tiles are unavailable.
 
 ## v0.1.2 focus
 

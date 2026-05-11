@@ -144,6 +144,101 @@ button {
   line-height: 1.1;
 }
 
+.preflight-panel,
+.health-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #cfddd5;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.preflight-header,
+.health-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #10231b;
+  font-weight: 900;
+}
+
+.preflight-header span,
+.health-header span {
+  color: #5d6e64;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.preflight-list,
+.health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.preflight-item,
+.health-item {
+  min-height: 68px;
+  padding: 9px;
+  border-radius: 8px;
+  border: 1px solid #cfddd5;
+  background: #f8fbf9;
+}
+
+.preflight-item span,
+.health-item span {
+  display: block;
+  margin-bottom: 6px;
+  color: #5d6e64;
+  font-size: 0.68rem;
+  font-weight: 900;
+}
+
+.preflight-item strong,
+.health-item strong {
+  display: block;
+  color: #10231b;
+  font-size: 0.95rem;
+  line-height: 1.1;
+}
+
+.preflight-item small {
+  display: block;
+  margin-top: 5px;
+  color: #5d6e64;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.preflight-item.warn,
+.health-item.warn {
+  border-color: #dfb66f;
+  background: #fff8ed;
+}
+
+.preflight-item.ok,
+.health-item.ok {
+  border-color: #bdd8ca;
+  background: #f2faf6;
+}
+
+.preflight-check {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: #17372a;
+  font-weight: 850;
+}
+
+.preflight-check input {
+  width: 20px;
+  height: 20px;
+  accent-color: #12683f;
+}
+
 .screen-stack {
   display: flex;
   flex-direction: column;
@@ -256,6 +351,13 @@ button {
 .danger-button:active,
 .link-button:active {
   transform: translateY(1px);
+}
+
+.primary-button:disabled {
+  background: #8fa39a;
+  color: #eef5f1;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .sticky-action {
@@ -432,6 +534,25 @@ button {
   background: #dfe8e2;
 }
 
+.map-frame {
+  position: relative;
+}
+
+.map-fallback-message {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  left: 10px;
+  z-index: 500;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 92%);
+  color: #623400;
+  font-size: 0.78rem;
+  font-weight: 900;
+  text-align: center;
+}
+
 .metric-hero {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -515,6 +636,8 @@ button {
 
   .paired-fields,
   .warmup-panel,
+  .preflight-list,
+  .health-grid,
   .metric-hero,
   .metrics-grid {
     grid-template-columns: 1fr;

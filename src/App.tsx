@@ -19,6 +19,7 @@ import type {
   ActiveRun,
   BreathingRecoveredAfter,
   Checkpoint,
+  ExportPayload,
   GpsPoint,
   LifecycleEvent,
   MotionWindow,
@@ -40,7 +41,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.2";
+const APP_VERSION = "0.1.3";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const MOTION_WINDOW_SECONDS = 5;
@@ -1134,6 +1135,7 @@ export default function App() {
           permissions={permissions}
           warmup={warmup}
           warmupStatus={warmupStatus}
+          appVisible={document.visibilityState === "visible"}
           setPreRun={setPreRun}
           onGps={requestGpsPermission}
           onArmGps={armGps}
@@ -1179,6 +1181,7 @@ export default function App() {
 
       {screen === "export" && activeRun ? (
         <ExportScreen
+          exportPayload={exportPayload}
           exportJson={exportJson}
           filename={exportFilename}
           onDownload={downloadJson}
@@ -1197,6 +1200,7 @@ function SetupScreen({
   permissions,
   warmup,
   warmupStatus,
+  appVisible,
   setPreRun,
   onGps,
   onArmGps,
@@ -1209,6 +1213,7 @@ function SetupScreen({
   permissions: PermissionState;
   warmup: PreRunGpsWarmup;
   warmupStatus: { active: boolean; latestPoint: GpsPoint | null; latestAccuracy: number | null };
+  appVisible: boolean;
   setPreRun: (next: PreRunState) => void;
   onGps: () => void;
   onArmGps: () => void;
@@ -1217,12 +1222,17 @@ function SetupScreen({
   onWakeLock: () => void;
   onStart: () => void;
 }) {
+  const [motionSkipped, setMotionSkipped] = useState(false);
+  const [preflightOverride, setPreflightOverride] = useState(false);
   const setPain = (patch: Partial<PreRunState["pain_before_run"]>) => {
     setPreRun({
       ...preRun,
       pain_before_run: { ...preRun.pain_before_run, ...patch },
     });
   };
+  const preflightItems = buildPreflightItems(preRun, permissions, warmupStatus, motionSkipped, appVisible);
+  const preflightReady = preflightItems.every((item) => item.ok);
+  const canStart = preflightReady || preflightOverride;
 
   return (
     <section className="screen-stack">
@@ -1271,6 +1281,40 @@ function SetupScreen({
           </div>
         </section>
       ) : null}
+
+      <section className="preflight-panel">
+        <div className="preflight-header">
+          <strong>Preflight</strong>
+          <span>{preflightReady ? "ready" : "needs attention"}</span>
+        </div>
+        <div className="preflight-list">
+          {preflightItems.map((item) => (
+            <div className={item.ok ? "preflight-item ok" : "preflight-item warn"} key={item.label}>
+              <span>{item.ok ? "OK" : "CHECK"}</span>
+              <strong>{item.label}</strong>
+              <small>{item.detail}</small>
+            </div>
+          ))}
+        </div>
+        <label className="preflight-check">
+          <input
+            type="checkbox"
+            checked={motionSkipped}
+            onChange={(event) => setMotionSkipped(event.target.checked)}
+          />
+          Skip motion for this run
+        </label>
+        {!preflightReady ? (
+          <label className="preflight-check">
+            <input
+              type="checkbox"
+              checked={preflightOverride}
+              onChange={(event) => setPreflightOverride(event.target.checked)}
+            />
+            Start anyway
+          </label>
+        ) : null}
+      </section>
 
       <button
         type="button"
@@ -1416,7 +1460,7 @@ function SetupScreen({
         </label>
       </section>
 
-      <button type="button" className="primary-button sticky-action" onClick={onStart}>
+      <button type="button" className="primary-button sticky-action" onClick={onStart} disabled={!canStart}>
         <Play size={20} />
         {warmup.armed_at_utc ? "Start actual run" : "Start run"}
       </button>
@@ -1525,6 +1569,7 @@ function LiveMap({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
+  const [tileFailure, setTileFailure] = useState(false);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) {
@@ -1537,10 +1582,12 @@ function LiveMap({
       dragging: true,
     }).setView([47.679, -122.328], 14);
 
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    const tileLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19,
       crossOrigin: true,
-    }).addTo(map);
+    });
+    tileLayer.on("tileerror", () => setTileFailure(true));
+    tileLayer.addTo(map);
 
     layerGroupRef.current = L.layerGroup().addTo(map);
     mapRef.current = map;
@@ -1637,7 +1684,14 @@ function LiveMap({
         </span>
         <strong>{formatMeters(liveStats.distanceMeters)}</strong>
       </div>
-      <div ref={containerRef} className="live-map" />
+      <div className="map-frame">
+        <div ref={containerRef} className="live-map" />
+        {tileFailure ? (
+          <div className="map-fallback-message">
+            Map tiles unavailable. Recording still active.
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -1896,6 +1950,7 @@ function PostRunScreen({
 }
 
 function ExportScreen({
+  exportPayload,
   exportJson,
   filename,
   onDownload,
@@ -1904,6 +1959,7 @@ function ExportScreen({
   onBackToPost,
   onDiscard,
 }: {
+  exportPayload: ExportPayload | null;
   exportJson: string;
   filename: string;
   onDownload: () => void;
@@ -1912,12 +1968,31 @@ function ExportScreen({
   onBackToPost: () => void;
   onDiscard: () => void;
 }) {
+  const health = exportPayload ? buildRunHealth(exportPayload) : [];
+
   return (
     <section className="screen-stack">
       <section className="result-panel">
         <h2>Export ready</h2>
         <p className="filename">{filename}</p>
       </section>
+
+      {health.length > 0 ? (
+        <section className="health-panel">
+          <div className="health-header">
+            <strong>Run health</strong>
+            <span>{health.some((item) => item.status === "warn") ? "review" : "ready"}</span>
+          </div>
+          <div className="health-grid">
+            {health.map((item) => (
+              <div className={`health-item ${item.status}`} key={item.label}>
+                <span>{item.label}</span>
+                <strong>{item.value}</strong>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section className="button-grid vertical">
         <button type="button" className="primary-button" onClick={onDownload}>
@@ -1955,6 +2030,121 @@ function StatusItem({ label, value }: { label: string; value: string }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function buildPreflightItems(
+  preRun: PreRunState,
+  permissions: PermissionState,
+  warmupStatus: { latestAccuracy: number | null },
+  motionSkipped: boolean,
+  appVisible: boolean,
+) {
+  const gpsOk =
+    warmupStatus.latestAccuracy !== null && warmupStatus.latestAccuracy <= ACCEPTABLE_GPS_ACCURACY_METERS;
+  const motionOk =
+    motionSkipped ||
+    permissions.device_motion_permission === "ready" ||
+    permissions.device_motion_permission === "denied" ||
+    permissions.device_motion_permission === "unavailable";
+  const targetOk = Number.isFinite(preRun.intended_distance_meters) && preRun.intended_distance_meters >= 100;
+
+  return [
+    {
+      label: "GPS warmed",
+      ok: gpsOk,
+      detail: gpsOk ? formatAccuracy(warmupStatus.latestAccuracy) : "arm GPS and wait for <=25 m",
+    },
+    {
+      label: "Wake lock active",
+      ok: permissions.wake_lock_status === "active",
+      detail: permissions.wake_lock_status === "active" ? "screen should stay on" : "enable wake lock or keep screen on",
+    },
+    {
+      label: "Motion decision",
+      ok: motionOk,
+      detail:
+        permissions.device_motion_permission === "ready"
+          ? "motion ready"
+          : motionSkipped
+            ? "motion skipped"
+            : "request motion or skip it",
+    },
+    {
+      label: "App visible",
+      ok: appVisible,
+      detail: appVisible ? "foreground tab" : "bring app to foreground",
+    },
+    {
+      label: "Target set",
+      ok: targetOk,
+      detail: targetOk ? `${Math.round(preRun.intended_distance_meters)} m` : "set at least 100 m",
+    },
+  ];
+}
+
+function buildRunHealth(exportPayload: ExportPayload) {
+  const lifecycle = exportPayload.recording_lifecycle;
+  const hiddenEvents =
+    lifecycle.visibility_events.filter((event) => event.visibility_state === "hidden").length +
+    lifecycle.pagehide_events.length;
+  const staleCount = lifecycle.gps_stale_event_count;
+  const wakeActive =
+    Boolean(exportPayload.permissions_and_capabilities.wake_lock_used) ||
+    lifecycle.wake_lock_events.some((event) => event.status === "active");
+  const rawDistance = exportPayload.interpolation_features.raw_recorded_distance_meters;
+  const interpolatedDistance = exportPayload.interpolation_features.interpolated_distance_estimate_meters;
+  const distanceConfidence = String(exportPayload.summary.distance_confidence ?? lifecycle.recording_reliability);
+  const motionWindows = Number(exportPayload.motion_features.window_count ?? 0);
+  const motionDebug = exportPayload.motion_features.motion_permission_debug as
+    | { sample_events_seen?: number; request_status?: string }
+    | undefined;
+  const motionSamples = motionWindows > 0 || Number(motionDebug?.sample_events_seen ?? 0) > 0;
+
+  return [
+    {
+      label: "Target",
+      value: exportPayload.target_distance_result.target_reached ? "reached" : "not reached",
+      status: exportPayload.target_distance_result.target_reached ? "ok" : "warn",
+    },
+    {
+      label: "Wake lock",
+      value: wakeActive ? "used" : "not used",
+      status: wakeActive ? "ok" : "warn",
+    },
+    {
+      label: "Background",
+      value: `${hiddenEvents}`,
+      status: hiddenEvents === 0 ? "ok" : "warn",
+    },
+    {
+      label: "GPS stale",
+      value: `${staleCount}`,
+      status: staleCount === 0 ? "ok" : "warn",
+    },
+    {
+      label: "Missing GPS",
+      value: `${Math.round(lifecycle.missing_gps_time_seconds)} s`,
+      status: lifecycle.missing_gps_time_seconds <= 5 ? "ok" : "warn",
+    },
+    {
+      label: "Distance",
+      value:
+        rawDistance === null || interpolatedDistance === null
+          ? "unknown"
+          : `${Math.round(rawDistance)} m raw / ${Math.round(interpolatedDistance)} m est`,
+      status: distanceConfidence === "high" ? "ok" : "warn",
+    },
+    {
+      label: "Confidence",
+      value: distanceConfidence,
+      status: distanceConfidence === "high" ? "ok" : "warn",
+    },
+    {
+      label: "Motion",
+      value: motionSamples ? "samples" : motionDebug?.request_status ?? "none",
+      status: motionSamples ? "ok" : "warn",
+    },
+  ] satisfies Array<{ label: string; value: string; status: "ok" | "warn" }>;
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
