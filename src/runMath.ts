@@ -5,6 +5,7 @@ import type {
   AnalysisSegment,
   AnalysisSegments,
   ArtifactModel,
+  CoachReadySummary,
   DataQualityScores,
   ElevationGrounding,
   ExportPayload,
@@ -33,6 +34,8 @@ const SUSPICIOUS_SPEED_MPS = 7;
 const IMPOSSIBLE_SPEED_MPS = 8;
 const SUSPICIOUS_ACCELERATION_MPS2 = 4;
 const SUSPICIOUS_GRADE_PERCENT = 20;
+const TARGET_DISTANCE_TOLERANCE_METERS = 5;
+const SEGMENT_ARTIFACT_FRACTION_THRESHOLD = 0.1;
 
 interface TrackPoint extends GpsPoint {
   cumulative_meters: number;
@@ -126,10 +129,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
 
   return {
-    schema_version: "0.1.3",
+    schema_version: "0.1.5",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.4",
+      version: "0.1.5",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -192,6 +195,7 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     artifact_model: features.artifactModel,
     data_quality_scores: features.dataQualityScores,
     grounded_debrief_context: features.groundedDebriefContext,
+    coach_ready_summary: features.coachReadySummary,
     time_series: {
       gps_points: run.gps_points,
       analysis_points: features.analysisPoints,
@@ -263,11 +267,14 @@ function computeFeatures(run: ActiveRun) {
     run.pre_run.intended_distance_meters,
     activeStart,
     activeInterpolation.interpolation_confidence,
+    targetDistanceResult,
+    activityWindow,
   );
   const activeTargetDistanceSplits = buildActiveTargetDistanceSplits(activeTrack, run.pre_run.intended_distance_meters);
   const analysisSegments = computeAnalysisSegments(activeTrack, activeStart);
   const pacing = computePacingFeatures(track, splits.thirds);
   const route = computeRouteFeatures(points, run.pre_run.route_direction, run.pre_run.route_name);
+  const greenLakeEnabled = isGreenLakeCalibrationRun(run.pre_run);
   const motion = computeMotionFeatures(
     run.motion_windows,
     durationSeconds,
@@ -285,7 +292,7 @@ function computeFeatures(run: ActiveRun) {
     activeInterpolation,
     elevationGrounding,
     motion,
-    run.pre_run.mode,
+    greenLakeEnabled,
   );
   const inferredRunFacts = computeInferredRunFacts(
     activityWindow,
@@ -298,7 +305,7 @@ function computeFeatures(run: ActiveRun) {
   );
   const targetedFollowupPrompts = buildTargetedFollowups(inferredRunFacts, analysisSegments, activityWindow);
   const greenLakeCalibration = buildGreenLakeCalibration(
-    run.pre_run.mode === "green_lake_5k_calibration",
+    greenLakeEnabled,
     points,
     distanceMeters,
     route,
@@ -312,6 +319,13 @@ function computeFeatures(run: ActiveRun) {
     inferredRunFacts,
     dataQualityScores,
     targetedFollowupPrompts,
+  );
+  const coachReadySummary = buildCoachReadySummary(
+    greenLakeEnabled,
+    activeTargetDistanceResult,
+    activePacing,
+    dataQualityScores,
+    run.post_run,
   );
   const notes = buildQualityNotes(
     points,
@@ -383,6 +397,7 @@ function computeFeatures(run: ActiveRun) {
     artifactModel,
     dataQualityScores,
     groundedDebriefContext,
+    coachReadySummary,
     dataQualityNotes: notes,
   };
 }
@@ -450,10 +465,21 @@ function computeFinalization(run: ActiveRun, analysisPoints: GpsPoint[]): Finali
   const latePoints = rawPoints.filter((point) => !analysisPoints.includes(point));
   const firstLate = latePoints[0] ?? null;
   const lastLate = latePoints[latePoints.length - 1] ?? null;
+  const postStopCount = Math.max(run.finalization?.post_stop_gps_callback_count ?? 0, latePoints.length);
   const drift =
     stopPoint && lastLate
       ? haversineMeters(stopPoint, lastLate)
       : run.finalization?.post_stop_gps_drift_meters ?? null;
+  const stopTime = run.finalization?.stop_clicked_at_utc ? Date.parse(run.finalization.stop_clicked_at_utc) : null;
+  const firstLateTime = firstLate ? Date.parse(firstLate.timestamp_utc) : null;
+  const firstLateClassification =
+    firstLate && stopPoint && firstLate.timestamp_utc === stopPoint.timestamp_utc
+      ? "stop_point_duplicate"
+      : firstLate && stopTime !== null && firstLateTime !== null && firstLateTime <= stopTime
+        ? "stop_point_duplicate"
+        : firstLate || postStopCount > 0
+          ? "post_stop_callback"
+          : null;
 
   return {
     stop_clicked_at_utc: run.finalization?.stop_clicked_at_utc ?? run.run_metadata.end_time_utc,
@@ -463,10 +489,7 @@ function computeFinalization(run: ActiveRun, analysisPoints: GpsPoint[]): Finali
     gps_stale_timers_cleared: Boolean(run.finalization?.gps_stale_timers_cleared),
     finish_point_source: stopPoint ? "last_valid_pre_stop_gps" : "none",
     stop_point: stopPoint,
-    post_stop_gps_callback_count: Math.max(
-      run.finalization?.post_stop_gps_callback_count ?? 0,
-      latePoints.length,
-    ),
+    post_stop_gps_callback_count: postStopCount,
     post_stop_gps_first_timestamp_utc:
       run.finalization?.post_stop_gps_first_timestamp_utc ?? firstLate?.timestamp_utc ?? null,
     post_stop_gps_last_timestamp_utc:
@@ -475,6 +498,10 @@ function computeFinalization(run: ActiveRun, analysisPoints: GpsPoint[]): Finali
     points_excluded_after_stop: Math.max(run.finalization?.points_excluded_after_stop ?? 0, latePoints.length),
     analysis_point_count: analysisPoints.length,
     raw_point_count: rawPoints.length,
+    stored_analysis_point_count: analysisPoints.length,
+    post_stop_callback_count: postStopCount,
+    total_callbacks_seen: rawPoints.length + postStopCount,
+    post_stop_first_callback_classification: firstLateClassification,
   };
 }
 
@@ -919,7 +946,7 @@ function computeTargetDistanceResult(track: TrackPoint[], intendedDistanceMeters
       elapsed === null ? null : round(elapsed / (intendedDistanceMeters / METERS_PER_MILE), 2),
     pace_to_target_seconds_per_km:
       elapsed === null ? null : round(elapsed / (intendedDistanceMeters / METERS_PER_KM), 2),
-    overshoot_meters: targetReached ? round(recordedDistance - intendedDistanceMeters, 2) : null,
+    overshoot_meters: targetReached ? round(Math.max(0, recordedDistance - intendedDistanceMeters), 2) : null,
     distance_recorded_meters: track.length > 0 ? round(recordedDistance, 2) : null,
   };
 }
@@ -929,13 +956,40 @@ function computeActiveTargetDistanceResult(
   intendedDistanceMeters: number,
   activeStartElapsed: number,
   interpolationConfidence: InterpolationFeatures["interpolation_confidence"],
+  recordingTargetDistanceResult: TargetDistanceResult,
+  activityWindow: ActivityWindow,
 ): ActiveTargetDistanceResult {
   const recordedDistance = track.length > 0 ? track[track.length - 1].cumulative_meters : 0;
-  const targetReached = intendedDistanceMeters > 0 && recordedDistance >= intendedDistanceMeters;
-  const targetState = targetReached ? stateAtDistance(track, intendedDistanceMeters) : null;
-  const recordingElapsed = targetState?.elapsed ?? null;
+  const activeCrossed = intendedDistanceMeters > 0 && recordedDistance >= intendedDistanceMeters;
+  const activeWithinTolerance =
+    intendedDistanceMeters > 0 &&
+    recordingTargetDistanceResult.target_reached &&
+    recordedDistance >= intendedDistanceMeters - TARGET_DISTANCE_TOLERANCE_METERS;
+  const recordingTargetAfterActivityStart =
+    recordingTargetDistanceResult.target_reached &&
+    recordingTargetDistanceResult.elapsed_at_target_distance_seconds !== null &&
+    recordingTargetDistanceResult.elapsed_at_target_distance_seconds >= activeStartElapsed;
+  const targetReached = activeCrossed || activeWithinTolerance || recordingTargetAfterActivityStart;
+  const targetState = activeCrossed ? stateAtDistance(track, intendedDistanceMeters) : null;
+  let recordingElapsed = targetState?.elapsed ?? null;
+  let method: ActiveTargetDistanceResult["target_detection_method"] = "not_reached";
+
+  if (activeCrossed) {
+    method = "active_cumulative_crossing";
+  } else if (recordingTargetAfterActivityStart && recordingTargetDistanceResult.elapsed_at_target_distance_seconds !== null) {
+    recordingElapsed = recordingTargetDistanceResult.elapsed_at_target_distance_seconds;
+    method = activeWithinTolerance
+      ? "recording_target_with_active_tolerance"
+      : "recording_target_minus_activity_start";
+  }
+
   const activeElapsed = recordingElapsed === null ? null : Math.max(0, recordingElapsed - activeStartElapsed);
-  const confidence = targetReached ? (interpolationConfidence === "high" ? "high" : "medium") : "low";
+  const confidence =
+    targetReached && interpolationConfidence === "high" && activityWindow.inferred_activity_start_confidence !== "unknown"
+      ? "high"
+      : targetReached
+        ? "medium"
+        : "low";
 
   return {
     intended_distance_meters: intendedDistanceMeters,
@@ -946,9 +1000,17 @@ function computeActiveTargetDistanceResult(
       activeElapsed === null ? null : round(activeElapsed / (intendedDistanceMeters / METERS_PER_MILE), 2),
     active_pace_to_target_seconds_per_km:
       activeElapsed === null ? null : round(activeElapsed / (intendedDistanceMeters / METERS_PER_KM), 2),
-    overshoot_meters: targetReached ? round(recordedDistance - intendedDistanceMeters, 2) : null,
+    overshoot_meters: targetReached ? round(Math.max(0, recordedDistance - intendedDistanceMeters), 2) : null,
     distance_recorded_meters: track.length > 0 ? round(recordedDistance, 2) : null,
     target_distance_confidence: confidence,
+    target_detection_method: method,
+    target_distance_tolerance_meters: TARGET_DISTANCE_TOLERANCE_METERS,
+    diagnostic_note:
+      method === "recording_target_minus_activity_start"
+        ? "Active target time was derived from recording target crossing minus inferred activity start."
+        : method === "recording_target_with_active_tolerance"
+          ? "Active track ended within tolerance of target and recording target crossing was used."
+          : null,
   };
 }
 
@@ -1165,7 +1227,8 @@ function buildAnalysisSegment(
   const distance = Math.max(0, endMeters - startMeters);
   const elevation = elevationInRange(track, startMeters, endMeters);
   const speeds = speedsInRange(track, startMeters, endMeters);
-  const flags = segmentFlags(track, startMeters, endMeters, speeds, elevation, duration, distance);
+  const artifactStats = artifactStatsInRange(track, startMeters, endMeters, distance);
+  const flags = segmentFlags(track, startMeters, endMeters, speeds, elevation, duration, distance, artifactStats);
   const avgGrade =
     distance >= 5 && elevation.gain !== null && elevation.loss !== null
       ? ((elevation.gain - elevation.loss) / distance) * 100
@@ -1188,7 +1251,40 @@ function buildAnalysisSegment(
     avg_horizontal_accuracy_meters: averageAccuracyInRange(track, startMeters, endMeters),
     speed_p50_mps: roundOrNull(percentile(speeds, 0.5), 3),
     speed_p95_mps: roundOrNull(percentile(speeds, 0.95), 3),
+    artifact_excluded_point_count: artifactStats.pointCount,
+    artifact_excluded_distance_meters: artifactStats.distanceMeters,
+    artifact_excluded_fraction: artifactStats.fraction,
     flags,
+  };
+}
+
+function artifactStatsInRange(
+  track: TrackPoint[],
+  startMeters: number,
+  endMeters: number,
+  segmentDistanceMeters: number,
+) {
+  let pointCount = 0;
+  let distanceMeters = 0;
+  for (let i = 1; i < track.length; i += 1) {
+    const previous = track[i - 1];
+    const current = track[i];
+    const segmentStart = previous.cumulative_meters;
+    const segmentEnd = current.cumulative_meters;
+    if (segmentEnd <= startMeters || segmentStart >= endMeters) {
+      continue;
+    }
+    if (current.impossible_speed || current.possible_gps_jump || current.tiny_dt_segment) {
+      pointCount += 1;
+      if (current.impossible_speed || current.possible_gps_jump) {
+        distanceMeters += haversineMeters(previous, current);
+      }
+    }
+  }
+  return {
+    pointCount,
+    distanceMeters: round(distanceMeters, 2),
+    fraction: segmentDistanceMeters > 0 ? round(Math.min(1, distanceMeters / segmentDistanceMeters), 4) : 0,
   };
 }
 
@@ -1207,16 +1303,14 @@ function segmentFlags(
   elevation: { gain: number; loss: number },
   duration: number | null,
   distance: number,
+  artifactStats: { pointCount: number; distanceMeters: number; fraction: number },
 ): string[] {
   const flags = new Set<string>();
   if (startMeters === 0) {
     flags.add("startup");
   }
   const points = track.filter((point) => point.cumulative_meters >= startMeters && point.cumulative_meters <= endMeters);
-  if (points.some((point) => point.tiny_dt_segment)) {
-    flags.add("artifact_excluded");
-  }
-  if (points.some((point) => point.impossible_speed || point.possible_gps_jump)) {
+  if (artifactStats.fraction > SEGMENT_ARTIFACT_FRACTION_THRESHOLD) {
     flags.add("artifact_excluded");
   }
   if (points.some((point, index) => index > 0 && point.t_elapsed_seconds - points[index - 1].t_elapsed_seconds > 5)) {
@@ -1531,7 +1625,7 @@ function computeDataQualityScores(
   activeInterpolation: InterpolationFeatures,
   elevationGrounding: ElevationGrounding,
   motion: Record<string, unknown>,
-  mode: PreRunState["mode"],
+  greenLakeEnabled: boolean,
 ): DataQualityScores {
   const reasons: string[] = [];
   const activeGapOver10 = activeInterpolation.gaps.filter((gap) => gap.duration_seconds > 10).length;
@@ -1575,17 +1669,18 @@ function computeDataQualityScores(
         : "medium";
   const paceConfidence = targetConfidence === "high" && distanceConfidence === "high" ? "high" : distanceConfidence;
   const motionConfidence = motion.motion_usable ? "medium" : "none";
-  const greenLakeUsable =
-    mode === "green_lake_5k_calibration" &&
-    activeTargetDistanceResult.target_reached &&
-    activeReliability !== "low" &&
-    distanceConfidence !== "low";
+  const usableForPacingCalibration =
+    activeTargetDistanceResult.target_reached && activeReliability !== "low" && distanceConfidence !== "low";
+  const usableForFitnessBaseline = greenLakeEnabled && usableForPacingCalibration && targetConfidence !== "low";
+  const usableForMotionAnalysis = Boolean(motion.motion_usable);
+  const usableForElevationAnalysis = elevationGrounding.elevation_confidence !== "low";
+  const greenLakeUsable = greenLakeEnabled && usableForPacingCalibration;
 
   if (!activeTargetDistanceResult.target_reached) {
     reasons.push("Target distance was not reached in the active window.");
   }
   if (!motion.motion_usable) {
-    reasons.push("Motion signal was unavailable or unusable.");
+    reasons.push("Motion signal was unavailable or unusable; pacing calibration can still be valid.");
   }
 
   return {
@@ -1597,6 +1692,10 @@ function computeDataQualityScores(
     elevation_confidence: elevationGrounding.elevation_confidence,
     motion_confidence: motionConfidence,
     green_lake_calibration_usable: greenLakeUsable,
+    usable_for_pacing_calibration: usableForPacingCalibration,
+    usable_for_fitness_baseline: usableForFitnessBaseline,
+    usable_for_motion_analysis: usableForMotionAnalysis,
+    usable_for_elevation_analysis: usableForElevationAnalysis,
     reasons,
   };
 }
@@ -1704,7 +1803,7 @@ function buildGreenLakeCalibration(
     start_point: first ? pickCoursePoint(first) : null,
     finish_point: last ? pickCoursePoint(last) : null,
     route_direction_user_selected: routeDirection === "clockwise" || routeDirection === "counterclockwise" ? routeDirection : "unknown",
-    route_direction_inferred: "unknown",
+    route_direction_inferred: routeDirection === "clockwise" || routeDirection === "counterclockwise" ? routeDirection : "unknown",
     course_fingerprint: {
       bounding_box: (route.bounding_box as Record<string, number | null> | undefined) ?? null,
       polyline_simplified: points.length > 0 ? simplifyPolyline(points) : null,
@@ -1714,6 +1813,14 @@ function buildGreenLakeCalibration(
     known_route_match_score_0_to_1: null,
     course_saved_for_future_matching: enabled,
   };
+}
+
+function isGreenLakeCalibrationRun(preRun: PreRunState): boolean {
+  return (
+    preRun.mode === "green_lake_5k_calibration" ||
+    (preRun.route_name.toLowerCase().includes("green lake") &&
+      Math.abs(preRun.intended_distance_meters - 5000) <= TARGET_DISTANCE_TOLERANCE_METERS)
+  );
 }
 
 function buildGroundedDebriefContext(
@@ -1756,12 +1863,62 @@ function buildGroundedDebriefContext(
     conflicts_or_tensions: [],
     suggested_followup_questions: prompts.map((prompt) => prompt.prompt),
     coach_safe_summary: {
-      usable_for_fitness_update: scores.green_lake_calibration_usable,
-      usable_for_pacing_update: scores.green_lake_calibration_usable && scores.pace_confidence !== "low",
+      usable_for_fitness_update: scores.usable_for_fitness_baseline,
+      usable_for_pacing_update: scores.usable_for_pacing_calibration && scores.pace_confidence !== "low",
       usable_for_app_debug: true,
       primary_data_limitations: limitations,
     },
   };
+}
+
+function buildCoachReadySummary(
+  greenLakeEnabled: boolean,
+  activeTargetDistanceResult: ActiveTargetDistanceResult,
+  activePacing: Record<string, unknown>,
+  scores: DataQualityScores,
+  postRun: PostRunState,
+): CoachReadySummary {
+  const targetTime = activeTargetDistanceResult.active_elapsed_at_target_distance_seconds;
+  const firstPace = asNumber(activePacing.first_third_pace_seconds_per_mile);
+  const finalPace = asNumber(activePacing.final_third_pace_seconds_per_mile);
+  const lateFade = asNumber(activePacing.late_fade_score_seconds_per_mile);
+  const negativeSplit = typeof activePacing.negative_split === "boolean" ? activePacing.negative_split : null;
+  let pacingPattern: CoachReadySummary["pacing_pattern"] = "unknown";
+  if (negativeSplit === true) {
+    pacingPattern = "negative_split";
+  } else if (firstPace !== null && finalPace !== null) {
+    pacingPattern = finalPace - firstPace > 20 ? "positive_split" : Math.abs(finalPace - firstPace) <= 20 ? "even" : "negative_split";
+  }
+  const subjectiveCostAvailable = subjectiveDebriefComplete(postRun);
+  const recommendedPatch =
+    pacingPattern === "positive_split" && lateFade !== null && lateFade > 15 ? "controlled_start_v1" : null;
+
+  return {
+    baseline_green_lake_5k_time_seconds: greenLakeEnabled && activeTargetDistanceResult.target_reached ? targetTime : null,
+    baseline_green_lake_5k_pace_seconds_per_mile:
+      targetTime === null ? null : round(targetTime / (activeTargetDistanceResult.intended_distance_meters / METERS_PER_MILE), 2),
+    pacing_pattern: pacingPattern,
+    late_fade_seconds_per_mile: lateFade,
+    recommended_patch_id: recommendedPatch,
+    subjective_cost_available: subjectiveCostAvailable,
+    usable_for_next_strategy_update: scores.usable_for_pacing_calibration && recommendedPatch !== null,
+  };
+}
+
+function subjectiveDebriefComplete(postRun: PostRunState): boolean {
+  if (postRun.subjective_debrief_skipped && postRun.subjective_debrief_skip_reason) {
+    return false;
+  }
+  const painComplete =
+    !postRun.pain_after_run.present ||
+    (Boolean(postRun.pain_after_run.location) && postRun.pain_after_run.severity_1_to_10 !== null);
+  return (
+    postRun.rpe_1_to_10 !== null &&
+    postRun.energy_after_run_1_to_5 !== null &&
+    postRun.soreness_after_run !== "unknown" &&
+    postRun.primary_limiter !== "unknown" &&
+    painComplete
+  );
 }
 
 function nullableBooleanFromNumber(value: unknown, threshold: number): boolean | null {
@@ -1884,6 +2041,8 @@ function exportPostRun(postRun: PostRunState) {
     immediate_pulse_bpm_manual: postRun.immediate_pulse_bpm_manual,
     pulse_after_3_to_5_min_bpm_manual: postRun.pulse_after_3_to_5_min_bpm_manual,
     breathing_recovered_after: postRun.breathing_recovered_after,
+    subjective_debrief_skipped: postRun.subjective_debrief_skipped,
+    subjective_debrief_skip_reason: postRun.subjective_debrief_skip_reason,
     free_text: postRun.free_text,
   };
 }

@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.4`
+Current version: `0.1.5`
+
+## v0.1.5 focus
+
+- Fixes active target-distance detection for Green Lake runs with small active-window crop tolerance.
+- Auto-enables Green Lake calibration from route/distance, separates pacing usability from motion usability, and adds coach-ready summary.
+- Requires or explicitly skips subjective debrief fields for calibration exports.
+- Adds controlled-start strategy display and live kilometer target-band status.
 
 ## v0.1.4 focus
 

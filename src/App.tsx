@@ -41,11 +41,19 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.4";
+const APP_VERSION = "0.1.5";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const MOTION_WINDOW_SECONDS = 5;
 const ACCEPTABLE_GPS_ACCURACY_METERS = 25;
+const CONTROLLED_START_PATCH_ID = "controlled_start_v1";
+const CONTROLLED_START_BANDS = [
+  { km: 1, label: "Km 1", minSecondsPerKm: 335, maxSecondsPerKm: 340, text: "5:35-5:40" },
+  { km: 2, label: "Km 2", minSecondsPerKm: 335, maxSecondsPerKm: 345, text: "5:35-5:45" },
+  { km: 3, label: "Km 3", minSecondsPerKm: 340, maxSecondsPerKm: 350, text: "5:40-5:50" },
+  { km: 4, label: "Km 4", minSecondsPerKm: null, maxSecondsPerKm: null, text: "hold steady" },
+  { km: 5, label: "Km 5", minSecondsPerKm: null, maxSecondsPerKm: null, text: "squeeze if stable" },
+] as const;
 
 interface MotionBucket {
   start: number;
@@ -97,6 +105,8 @@ const defaultPostRun: PostRunState = {
   immediate_pulse_bpm_manual: null,
   pulse_after_3_to_5_min_bpm_manual: null,
   breathing_recovered_after: "unknown",
+  subjective_debrief_skipped: false,
+  subjective_debrief_skip_reason: null,
   free_text: "",
 };
 
@@ -166,6 +176,10 @@ function defaultFinalization(): FinalizationDiagnostics {
     points_excluded_after_stop: 0,
     analysis_point_count: null,
     raw_point_count: null,
+    stored_analysis_point_count: null,
+    post_stop_callback_count: 0,
+    total_callbacks_seen: null,
+    post_stop_first_callback_classification: null,
   };
 }
 
@@ -259,6 +273,7 @@ export default function App() {
   const motionEventsSeenRef = useRef(initialRun?.motion_debug.sample_events_seen ?? 0);
   const activeRunRef = useRef<ActiveRun | null>(initialRun);
   const serviceWorkerRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
+  const startWeatherRetryTimeoutRef = useRef<number | null>(null);
 
   const liveStats = useMemo(
     () => computeLiveStats(activeRun?.gps_points ?? [], elapsedSeconds),
@@ -408,7 +423,7 @@ export default function App() {
   }, [updatePermissions]);
 
   const fetchWeatherForRun = useCallback(
-    async (kind: "start" | "finish", lat: number, lon: number) => {
+    async (kind: "start" | "finish", lat: number, lon: number, retryAttempt = 0) => {
       updatePermissions({ weather_status: "fetching" });
       try {
         const snapshot = await fetchOpenMeteoWeather(lat, lon);
@@ -416,16 +431,33 @@ export default function App() {
           if (!run) {
             return run;
           }
+          const shouldBackfillStart = kind === "finish" && !run.weather.start_weather.fetched_at_utc;
           return {
             ...run,
             weather: {
               ...run.weather,
               [kind === "start" ? "start_weather" : "finish_weather"]: snapshot,
+              ...(shouldBackfillStart
+                ? {
+                    start_weather: {
+                      ...snapshot,
+                      fallback_source: "finish_weather" as const,
+                    },
+                  }
+                : {}),
             },
           };
         });
         updatePermissions({ weather_status: "fetched" });
       } catch (error) {
+        if (kind === "start" && retryAttempt === 0) {
+          appendQualityNote("Start weather fetch failed; retry scheduled.");
+          startWeatherRetryTimeoutRef.current = window.setTimeout(() => {
+            startWeatherRetryTimeoutRef.current = null;
+            void fetchWeatherForRun("start", lat, lon, 1);
+          }, 30000);
+          return;
+        }
         updatePermissions({ weather_status: "unavailable" });
         appendQualityNote(`${kind === "start" ? "Start" : "Finish"} weather fetch failed.`);
       }
@@ -464,16 +496,21 @@ export default function App() {
             );
             const stopPoint = run.finalization.stop_point;
             const drift = stopPoint ? haversineMetersForApp(stopPoint, latePoint) : run.finalization.post_stop_gps_drift_meters;
+            const callbackCount = run.finalization.post_stop_gps_callback_count + 1;
             return {
               ...run,
               finalization: {
                 ...run.finalization,
-                post_stop_gps_callback_count: run.finalization.post_stop_gps_callback_count + 1,
+                post_stop_gps_callback_count: callbackCount,
+                post_stop_callback_count: callbackCount,
                 post_stop_gps_first_timestamp_utc:
                   run.finalization.post_stop_gps_first_timestamp_utc ?? latePoint.timestamp_utc,
                 post_stop_gps_last_timestamp_utc: latePoint.timestamp_utc,
                 post_stop_gps_drift_meters: drift === null ? null : round(drift, 2),
                 points_excluded_after_stop: run.finalization.points_excluded_after_stop + 1,
+                total_callbacks_seen: run.gps_points.length + callbackCount,
+                post_stop_first_callback_classification:
+                  run.finalization.post_stop_first_callback_classification ?? "post_stop_callback",
               },
             };
           }
@@ -686,6 +723,10 @@ export default function App() {
     setGpsStaleSeconds(0);
     setScreen("live");
     startGpsWatch();
+    if (warmupStatus.latestPoint && warmupStatus.latestPoint.accuracy_ok) {
+      startWeatherFetchStartedRef.current = true;
+      void fetchWeatherForRun("start", warmupStatus.latestPoint.lat, warmupStatus.latestPoint.lon);
+    }
     void requestWakeLock(true);
   };
 
@@ -720,6 +761,8 @@ export default function App() {
               stop_point: stopPoint,
               finish_point_source: stopPoint ? "last_valid_pre_stop_gps" : "none",
               raw_point_count: run.gps_points.length,
+              stored_analysis_point_count: preStopPoints.length,
+              total_callbacks_seen: run.gps_points.length + run.finalization.post_stop_gps_callback_count,
             },
           }
         : run,
@@ -770,6 +813,9 @@ export default function App() {
               stop_point: stopPoint,
               analysis_point_count: run.gps_points.filter((point) => point.t_elapsed_seconds <= elapsed + 0.05).length,
               raw_point_count: run.gps_points.length,
+              stored_analysis_point_count: run.gps_points.filter((point) => point.t_elapsed_seconds <= elapsed + 0.05).length,
+              post_stop_callback_count: run.finalization.post_stop_gps_callback_count,
+              total_callbacks_seen: run.gps_points.length + run.finalization.post_stop_gps_callback_count,
             },
           }
         : run,
@@ -813,6 +859,10 @@ export default function App() {
     }
     stopGpsWatch();
     stopWarmupWatch();
+    if (startWeatherRetryTimeoutRef.current !== null) {
+      window.clearTimeout(startWeatherRetryTimeoutRef.current);
+      startWeatherRetryTimeoutRef.current = null;
+    }
     void releaseWakeLock();
     localStorage.removeItem(STORAGE_KEY);
     setActiveRun(null);
@@ -1214,6 +1264,9 @@ export default function App() {
   useEffect(() => {
     return () => {
       stopGpsWatch();
+      if (startWeatherRetryTimeoutRef.current !== null) {
+        window.clearTimeout(startWeatherRetryTimeoutRef.current);
+      }
       void releaseWakeLock();
     };
   }, [releaseWakeLock, stopGpsWatch]);
@@ -1283,6 +1336,7 @@ export default function App() {
 
       {screen === "post" && activeRun ? (
         <PostRunScreen
+          run={activeRun}
           postRun={activeRun.post_run}
           updatePostRun={updatePostRun}
           updatePostRunPain={updatePostRunPain}
@@ -1451,13 +1505,40 @@ function SetupScreen({
             mode: "green_lake_5k_calibration",
             route_name: "Green Lake calibrated 5K",
             intended_distance_meters: 5000,
-            active_patch_id: "baseline_calibration_v1",
+            active_patch_id: CONTROLLED_START_PATCH_ID,
             route_direction: "unknown",
           })
         }
       >
         Use Green Lake 5K calibration
       </button>
+
+      <section className="preflight-panel">
+        <div className="preflight-header">
+          <strong>Strategy patch</strong>
+          <span>{preRun.active_patch_id}</span>
+        </div>
+        <div className="preflight-list">
+          <div className="preflight-item ok">
+            <span>PATCH</span>
+            <strong>controlled_start_v1</strong>
+            <small>Mission: reduce late fade with a controlled first kilometer.</small>
+          </div>
+          {CONTROLLED_START_BANDS.map((band) => (
+            <div className="preflight-item ok" key={band.km}>
+              <span>{band.label}</span>
+              <strong>{band.text}</strong>
+            </div>
+          ))}
+        </div>
+        <button
+          type="button"
+          className="secondary-button full-width-button"
+          onClick={() => setPreRun({ ...preRun, active_patch_id: CONTROLLED_START_PATCH_ID })}
+        >
+          Load controlled start
+        </button>
+      </section>
 
       {preRun.mode === "green_lake_5k_calibration" ? (
         <section className="preflight-panel">
@@ -1643,6 +1724,8 @@ function LiveScreen({
 }) {
   const remainingMeters = Math.max(0, run.pre_run.intended_distance_meters - liveStats.distanceMeters);
   const gpsStale = gpsStaleSeconds > 10;
+  const strategyStatus =
+    run.pre_run.active_patch_id === CONTROLLED_START_PATCH_ID ? computeControlledStartStatus(run.gps_points) : null;
 
   return (
     <section className="screen-stack live-screen">
@@ -1684,6 +1767,29 @@ function LiveScreen({
         <Metric label="GPS accuracy" value={formatAccuracy(liveStats.lastAccuracy)} />
         <Metric label="Remaining" value={formatMeters(remainingMeters)} />
       </section>
+
+      {strategyStatus ? (
+        <section className="health-panel">
+          <div className="health-header">
+            <strong>Controlled start</strong>
+            <span>{strategyStatus.statusLabel}</span>
+          </div>
+          <div className="health-grid">
+            <div className="health-item ok">
+              <span>Current km</span>
+              <strong>{strategyStatus.band.label}</strong>
+            </div>
+            <div className={strategyStatus.status === "outside" ? "health-item warn" : "health-item ok"}>
+              <span>Split pace</span>
+              <strong>{formatPaceKm(strategyStatus.currentSplitSecondsPerKm)}</strong>
+            </div>
+            <div className="health-item ok">
+              <span>Target</span>
+              <strong>{strategyStatus.band.text}</strong>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       <LiveMap run={run} liveStats={liveStats} />
 
@@ -1926,18 +2032,49 @@ function StopScreen({
 }
 
 function PostRunScreen({
+  run,
   postRun,
   updatePostRun,
   updatePostRunPain,
   onExport,
 }: {
+  run: ActiveRun;
   postRun: PostRunState;
   updatePostRun: (patch: Partial<PostRunState>) => void;
   updatePostRunPain: (patch: Partial<PostRunState["pain_after_run"]>) => void;
   onExport: () => void;
 }) {
+  const exportPayload = buildExportPayload(run);
+  const debriefRequired =
+    run.pre_run.mode === "training_calibration" || run.pre_run.mode === "green_lake_5k_calibration";
+  const debriefComplete = subjectiveDebriefCompleteForApp(postRun);
+  const skipComplete = postRun.subjective_debrief_skipped && Boolean(postRun.subjective_debrief_skip_reason?.trim());
+  const canContinue = !debriefRequired || debriefComplete || skipComplete;
+
   return (
     <section className="screen-stack">
+      <section className="health-panel">
+        <div className="health-header">
+          <strong>Objective facts I inferred</strong>
+          <span>{exportPayload.data_quality_scores.pace_confidence}</span>
+        </div>
+        <div className="preflight-list">
+          {exportPayload.grounded_debrief_context.objective_facts.slice(0, 4).map((fact) => (
+            <div className="preflight-item ok" key={fact}>
+              <span>FACT</span>
+              <strong>{fact}</strong>
+            </div>
+          ))}
+          {exportPayload.targeted_followup_prompts.slice(0, 2).map((prompt) => (
+            <div className="preflight-item warn" key={prompt.id}>
+              <span>FOLLOW</span>
+              <strong>{prompt.prompt}</strong>
+              <small>{prompt.reason}</small>
+            </div>
+          ))}
+        </div>
+      </section>
+
       <section className="form-panel">
         <label>
           RPE
@@ -2029,9 +2166,7 @@ function PostRunScreen({
             <option value="legs">legs</option>
             <option value="heat">heat</option>
             <option value="hills">hills</option>
-            <option value="pacing">pacing</option>
             <option value="motivation">motivation</option>
-            <option value="time">time</option>
             <option value="other">other</option>
           </select>
         </label>
@@ -2085,9 +2220,47 @@ function PostRunScreen({
             onChange={(event) => updatePostRun({ free_text: event.target.value })}
           />
         </label>
+
+        {debriefRequired ? (
+          <section className="preflight-panel">
+            <div className="preflight-header">
+              <strong>Subjective debrief</strong>
+              <span>{debriefComplete ? "complete" : skipComplete ? "skipped" : "required"}</span>
+            </div>
+            <label className="preflight-check">
+              <input
+                type="checkbox"
+                checked={postRun.subjective_debrief_skipped}
+                onChange={(event) =>
+                  updatePostRun({
+                    subjective_debrief_skipped: event.target.checked,
+                    subjective_debrief_skip_reason: event.target.checked
+                      ? postRun.subjective_debrief_skip_reason
+                      : null,
+                  })
+                }
+              />
+              Skip subjective debrief
+            </label>
+            {postRun.subjective_debrief_skipped ? (
+              <label>
+                Skip reason
+                <input
+                  value={postRun.subjective_debrief_skip_reason ?? ""}
+                  onChange={(event) =>
+                    updatePostRun({ subjective_debrief_skip_reason: event.target.value || null })
+                  }
+                />
+              </label>
+            ) : null}
+            {!canContinue ? (
+              <p className="filename">RPE, energy, soreness, pain status, and limiter are required for calibration unless skipped with a reason.</p>
+            ) : null}
+          </section>
+        ) : null}
       </section>
 
-      <button type="button" className="primary-button sticky-action" onClick={onExport}>
+      <button type="button" className="primary-button sticky-action" onClick={onExport} disabled={!canContinue}>
         Continue to export
       </button>
     </section>
@@ -2335,11 +2508,19 @@ function loadStoredRun(): ActiveRun | null {
 }
 
 function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
+  const postRun = {
+    ...defaultPostRun,
+    ...run.post_run,
+    pain_after_run: {
+      ...defaultPostRun.pain_after_run,
+      ...run.post_run?.pain_after_run,
+    },
+  };
   return {
     status: run.status ?? (run.run_metadata?.end_time_utc ? "stopped" : "running"),
     run_metadata: run.run_metadata!,
     pre_run: run.pre_run ?? defaultPreRun,
-    post_run: run.post_run ?? defaultPostRun,
+    post_run: postRun,
     permissions: { ...defaultPermissions(), ...run.permissions },
     weather: run.weather ?? {
       start_weather: emptyWeatherSnapshot(true),
@@ -2533,6 +2714,15 @@ function formatPace(secondsPerMile: number | null): string {
   return `${minutes}:${pad2(seconds)} /mi`;
 }
 
+function formatPaceKm(secondsPerKm: number | null): string {
+  if (secondsPerKm === null || !Number.isFinite(secondsPerKm)) {
+    return "--";
+  }
+  const minutes = Math.floor(secondsPerKm / 60);
+  const seconds = Math.round(secondsPerKm % 60);
+  return `${minutes}:${pad2(seconds)} /km`;
+}
+
 function formatAccuracy(meters: number | null): string {
   return meters === null ? "unknown" : `${Math.round(meters)} m`;
 }
@@ -2552,6 +2742,83 @@ function nearestPointByElapsed(points: GpsPoint[], elapsedSeconds: number): GpsP
     Math.abs(point.t_elapsed_seconds - elapsedSeconds) < Math.abs(nearest.t_elapsed_seconds - elapsedSeconds)
       ? point
       : nearest,
+  );
+}
+
+function computeControlledStartStatus(points: GpsPoint[]) {
+  if (points.length < 2) {
+    return null;
+  }
+  const track = buildAppTrack(points);
+  const latest = track[track.length - 1];
+  const currentKm = Math.min(5, Math.max(1, Math.floor(latest.cumulative_meters / 1000) + 1));
+  const band = CONTROLLED_START_BANDS[currentKm - 1];
+  const kmStartDistance = (currentKm - 1) * 1000;
+  const kmStartElapsed = elapsedAtDistanceForApp(track, kmStartDistance) ?? track[0].t_elapsed_seconds;
+  const splitDistance = Math.max(0, latest.cumulative_meters - kmStartDistance);
+  const splitElapsed = Math.max(0, latest.t_elapsed_seconds - kmStartElapsed);
+  const currentSplitSecondsPerKm = splitDistance >= 50 ? splitElapsed / (splitDistance / 1000) : null;
+  const inBand =
+    currentSplitSecondsPerKm !== null &&
+    band.minSecondsPerKm !== null &&
+    band.maxSecondsPerKm !== null &&
+    currentSplitSecondsPerKm >= band.minSecondsPerKm &&
+    currentSplitSecondsPerKm <= band.maxSecondsPerKm;
+  const outside =
+    currentSplitSecondsPerKm !== null &&
+    band.minSecondsPerKm !== null &&
+    band.maxSecondsPerKm !== null &&
+    !inBand;
+  return {
+    band,
+    currentSplitSecondsPerKm,
+    status: outside ? "outside" : "ok",
+    statusLabel: band.minSecondsPerKm === null ? "steady" : inBand ? "in band" : outside ? "watch pace" : "warming",
+  };
+}
+
+function buildAppTrack(points: GpsPoint[]): Array<GpsPoint & { cumulative_meters: number }> {
+  let cumulative = 0;
+  return points.map((point, index) => {
+    if (index > 0 && !point.impossible_speed && !point.possible_gps_jump) {
+      cumulative += haversineMetersForApp(points[index - 1], point);
+    }
+    return { ...point, cumulative_meters: cumulative };
+  });
+}
+
+function elapsedAtDistanceForApp(
+  track: Array<GpsPoint & { cumulative_meters: number }>,
+  distanceMeters: number,
+): number | null {
+  if (track.length === 0) {
+    return null;
+  }
+  if (distanceMeters <= 0) {
+    return track[0].t_elapsed_seconds;
+  }
+  for (let i = 1; i < track.length; i += 1) {
+    const previous = track[i - 1];
+    const current = track[i];
+    if (current.cumulative_meters < distanceMeters || current.cumulative_meters === previous.cumulative_meters) {
+      continue;
+    }
+    const ratio = (distanceMeters - previous.cumulative_meters) / (current.cumulative_meters - previous.cumulative_meters);
+    return previous.t_elapsed_seconds + (current.t_elapsed_seconds - previous.t_elapsed_seconds) * ratio;
+  }
+  return null;
+}
+
+function subjectiveDebriefCompleteForApp(postRun: PostRunState): boolean {
+  const painComplete =
+    !postRun.pain_after_run.present ||
+    (Boolean(postRun.pain_after_run.location?.trim()) && postRun.pain_after_run.severity_1_to_10 !== null);
+  return (
+    postRun.rpe_1_to_10 !== null &&
+    postRun.energy_after_run_1_to_5 !== null &&
+    postRun.soreness_after_run !== "unknown" &&
+    postRun.primary_limiter !== "unknown" &&
+    painComplete
   );
 }
 

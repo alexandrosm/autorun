@@ -33,7 +33,7 @@ export interface PreRunState {
   goal: "sub_25_5k";
   route_name: string;
   mode: "training_calibration" | "instrumentation_validation" | "green_lake_5k_calibration";
-  active_patch_id: "baseline_calibration_v1";
+  active_patch_id: string;
   route_direction: RouteDirection;
   phone_position: PhonePosition;
   intended_distance_meters: number;
@@ -55,6 +55,8 @@ export interface PostRunState {
   immediate_pulse_bpm_manual: number | null;
   pulse_after_3_to_5_min_bpm_manual: number | null;
   breathing_recovered_after: BreathingRecoveredAfter;
+  subjective_debrief_skipped: boolean;
+  subjective_debrief_skip_reason: string | null;
   free_text: string;
 }
 
@@ -127,6 +129,7 @@ export interface WeatherSnapshot {
   wind_speed_mph: number | null;
   wind_direction_degrees: number | null;
   wind_gusts_mph: number | null;
+  fallback_source?: "finish_weather" | null;
   raw: unknown | null;
 }
 
@@ -171,6 +174,13 @@ export interface ActiveTargetDistanceResult {
   overshoot_meters: number | null;
   distance_recorded_meters: number | null;
   target_distance_confidence: "unknown" | "low" | "medium" | "high";
+  target_detection_method:
+    | "active_cumulative_crossing"
+    | "recording_target_minus_activity_start"
+    | "recording_target_with_active_tolerance"
+    | "not_reached";
+  target_distance_tolerance_meters: number;
+  diagnostic_note: string | null;
 }
 
 export interface LifecycleEvent {
@@ -265,6 +275,10 @@ export interface FinalizationDiagnostics {
   points_excluded_after_stop: number;
   analysis_point_count: number | null;
   raw_point_count: number | null;
+  stored_analysis_point_count: number | null;
+  post_stop_callback_count: number;
+  total_callbacks_seen: number | null;
+  post_stop_first_callback_classification: "post_stop_callback" | "stop_point_duplicate" | null;
 }
 
 export interface ActivityWindow {
@@ -303,6 +317,9 @@ export interface AnalysisSegment {
   avg_horizontal_accuracy_meters: number | null;
   speed_p50_mps: number | null;
   speed_p95_mps: number | null;
+  artifact_excluded_point_count: number;
+  artifact_excluded_distance_meters: number;
+  artifact_excluded_fraction: number;
   flags: string[];
 }
 
@@ -393,7 +410,21 @@ export interface DataQualityScores {
   elevation_confidence: "low" | "medium" | "high";
   motion_confidence: "none" | "low" | "medium" | "high";
   green_lake_calibration_usable: boolean;
+  usable_for_pacing_calibration: boolean;
+  usable_for_fitness_baseline: boolean;
+  usable_for_motion_analysis: boolean;
+  usable_for_elevation_analysis: boolean;
   reasons: string[];
+}
+
+export interface CoachReadySummary {
+  baseline_green_lake_5k_time_seconds: number | null;
+  baseline_green_lake_5k_pace_seconds_per_mile: number | null;
+  pacing_pattern: "positive_split" | "even" | "negative_split" | "unknown";
+  late_fade_seconds_per_mile: number | null;
+  recommended_patch_id: string | null;
+  subjective_cost_available: boolean;
+  usable_for_next_strategy_update: boolean;
 }
 
 export interface GroundedDebriefContext {
@@ -441,10 +472,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.3";
+  schema_version: "0.1.5";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.4";
+    version: "0.1.5";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -513,6 +544,7 @@ export interface ExportPayload {
   artifact_model: ArtifactModel;
   data_quality_scores: DataQualityScores;
   grounded_debrief_context: GroundedDebriefContext;
+  coach_ready_summary: CoachReadySummary;
   time_series: {
     gps_points: GpsPoint[];
     analysis_points: GpsPoint[];
