@@ -2,7 +2,11 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.3`
+Current version: `0.1.4`
+
+## v0.1.4 focus
+
+- Version-only cache refresh so installed phones can confirm they have the latest Green Lake Ready build.
 
 ## v0.1.3 focus
 
