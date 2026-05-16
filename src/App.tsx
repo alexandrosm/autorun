@@ -20,6 +20,7 @@ import type {
   BreathingRecoveredAfter,
   Checkpoint,
   ExportPayload,
+  FinalizationDiagnostics,
   GpsPoint,
   LifecycleEvent,
   MotionWindow,
@@ -36,7 +37,6 @@ import type {
   Screen,
   SorenessLevel,
   WeatherStatusText,
-  YesNoUnsure,
 } from "./types";
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
@@ -150,6 +150,25 @@ function defaultMotionDebug(): MotionDebug {
   };
 }
 
+function defaultFinalization(): FinalizationDiagnostics {
+  return {
+    stop_clicked_at_utc: null,
+    stopped_at_elapsed_seconds: null,
+    gps_watch_cleared: false,
+    motion_listener_removed: false,
+    gps_stale_timers_cleared: false,
+    finish_point_source: "none",
+    stop_point: null,
+    post_stop_gps_callback_count: 0,
+    post_stop_gps_first_timestamp_utc: null,
+    post_stop_gps_last_timestamp_utc: null,
+    post_stop_gps_drift_meters: null,
+    points_excluded_after_stop: 0,
+    analysis_point_count: null,
+    raw_point_count: null,
+  };
+}
+
 function detectPwaState(storagePersisted: boolean | null = null): PwaState {
   return {
     display_mode_standalone:
@@ -168,6 +187,7 @@ function createBlankRun(
 ): ActiveRun {
   const now = new Date();
   return {
+    status: "running",
     run_metadata: {
       run_id: `greenlake_${now.toISOString().replace(/[-:.]/g, "").slice(0, 15)}`,
       start_time_local: formatLocalIso(now),
@@ -191,6 +211,7 @@ function createBlankRun(
     pre_run_gps_warmup: warmup,
     motion_debug: motionDebug,
     pwa_state: pwaState,
+    finalization: defaultFinalization(),
     elapsed_offset_seconds: 0,
     last_saved_at_utc: now.toISOString(),
   };
@@ -319,7 +340,9 @@ export default function App() {
     if (gpsWatchIdRef.current !== null && "geolocation" in navigator) {
       navigator.geolocation.clearWatch(gpsWatchIdRef.current);
       gpsWatchIdRef.current = null;
+      return true;
     }
+    return false;
   }, []);
 
   const stopWarmupWatch = useCallback(() => {
@@ -432,6 +455,27 @@ export default function App() {
         setActiveRun((run) => {
           if (!run) {
             return run;
+          }
+          if (run.status !== "running") {
+            const latePoint = createGpsPointFromPosition(
+              position,
+              run.finalization.stopped_at_elapsed_seconds ?? elapsed,
+              run.gps_points[run.gps_points.length - 1] ?? null,
+            );
+            const stopPoint = run.finalization.stop_point;
+            const drift = stopPoint ? haversineMetersForApp(stopPoint, latePoint) : run.finalization.post_stop_gps_drift_meters;
+            return {
+              ...run,
+              finalization: {
+                ...run.finalization,
+                post_stop_gps_callback_count: run.finalization.post_stop_gps_callback_count + 1,
+                post_stop_gps_first_timestamp_utc:
+                  run.finalization.post_stop_gps_first_timestamp_utc ?? latePoint.timestamp_utc,
+                post_stop_gps_last_timestamp_utc: latePoint.timestamp_utc,
+                post_stop_gps_drift_meters: drift === null ? null : round(drift, 2),
+                points_excluded_after_stop: run.finalization.points_excluded_after_stop + 1,
+              },
+            };
           }
           const previousPoint = run.gps_points[run.gps_points.length - 1] ?? null;
           const point = createGpsPointFromPosition(position, elapsed, previousPoint);
@@ -647,19 +691,85 @@ export default function App() {
 
   const stopRun = async () => {
     const elapsed = getElapsedSeconds();
-    flushMotionBucket(elapsed);
-    stopGpsWatch();
-    await releaseWakeLock();
-    const now = new Date();
+    const stopClickedAt = new Date();
+    const currentRun = activeRunRef.current;
+    const preStopPoints = currentRun?.gps_points.filter((point) => point.t_elapsed_seconds <= elapsed + 0.05) ?? [];
+    const stopPoint = preStopPoints[preStopPoints.length - 1] ?? null;
+    if (currentRun) {
+      activeRunRef.current = {
+        ...currentRun,
+        status: "stopping",
+        finalization: {
+          ...currentRun.finalization,
+          stop_clicked_at_utc: stopClickedAt.toISOString(),
+          stopped_at_elapsed_seconds: round(elapsed, 2),
+          stop_point: stopPoint,
+          finish_point_source: stopPoint ? "last_valid_pre_stop_gps" : "none",
+        },
+      };
+    }
     setActiveRun((run) =>
       run
         ? {
             ...run,
+            status: "stopping",
+            finalization: {
+              ...run.finalization,
+              stop_clicked_at_utc: stopClickedAt.toISOString(),
+              stopped_at_elapsed_seconds: round(elapsed, 2),
+              stop_point: stopPoint,
+              finish_point_source: stopPoint ? "last_valid_pre_stop_gps" : "none",
+              raw_point_count: run.gps_points.length,
+            },
+          }
+        : run,
+    );
+    flushMotionBucket(elapsed);
+    const gpsCleared = stopGpsWatch();
+    if (activeRunRef.current) {
+      activeRunRef.current = {
+        ...activeRunRef.current,
+        status: "stopped",
+        elapsed_offset_seconds: elapsed,
+        run_metadata: {
+          ...activeRunRef.current.run_metadata,
+          end_time_local: formatLocalIso(stopClickedAt),
+          end_time_utc: stopClickedAt.toISOString(),
+        },
+        finalization: {
+          ...activeRunRef.current.finalization,
+          gps_watch_cleared: gpsCleared || activeRunRef.current.finalization.gps_watch_cleared,
+          motion_listener_removed: true,
+          gps_stale_timers_cleared: true,
+        },
+      };
+    }
+    stale5LoggedRef.current = false;
+    stale10LoggedRef.current = false;
+    setGpsStaleSeconds(0);
+    await releaseWakeLock();
+    setActiveRun((run) =>
+      run
+        ? {
+            ...run,
+            status: "stopped",
             elapsed_offset_seconds: elapsed,
             run_metadata: {
               ...run.run_metadata,
-              end_time_local: formatLocalIso(now),
-              end_time_utc: now.toISOString(),
+              end_time_local: formatLocalIso(stopClickedAt),
+              end_time_utc: stopClickedAt.toISOString(),
+            },
+            finalization: {
+              ...run.finalization,
+              stop_clicked_at_utc: stopClickedAt.toISOString(),
+              stopped_at_elapsed_seconds: round(elapsed, 2),
+              gps_watch_cleared: gpsCleared || run.finalization.gps_watch_cleared,
+              motion_listener_removed: true,
+              gps_stale_timers_cleared: true,
+              finish_point_source: stopPoint ? "last_valid_pre_stop_gps" : "none",
+              stop_point: stopPoint,
+              analysis_point_count: run.gps_points.filter((point) => point.t_elapsed_seconds <= elapsed + 0.05).length,
+              raw_point_count: run.gps_points.length,
             },
           }
         : run,
@@ -668,9 +778,8 @@ export default function App() {
     setElapsedSeconds(elapsed);
     setScreen("stop");
 
-    const lastPoint = activeRun?.gps_points[activeRun.gps_points.length - 1];
-    if (lastPoint) {
-      void fetchWeatherForRun("finish", lastPoint.lat, lastPoint.lon);
+    if (stopPoint) {
+      void fetchWeatherForRun("finish", stopPoint.lat, stopPoint.lon);
     }
   };
 
@@ -679,11 +788,13 @@ export default function App() {
       run
         ? {
             ...run,
+            status: "running",
             run_metadata: {
               ...run.run_metadata,
               end_time_local: null,
               end_time_utc: null,
             },
+            finalization: defaultFinalization(),
           }
         : run,
     );
@@ -1322,6 +1433,7 @@ function SetupScreen({
         onClick={() =>
           setPreRun({
             ...preRun,
+            mode: "instrumentation_validation",
             route_name: "instrumentation validation",
             intended_distance_meters: 300,
           })
@@ -1329,6 +1441,48 @@ function SetupScreen({
       >
         Use validation mode
       </button>
+
+      <button
+        type="button"
+        className="secondary-button full-width-button"
+        onClick={() =>
+          setPreRun({
+            ...preRun,
+            mode: "green_lake_5k_calibration",
+            route_name: "Green Lake calibrated 5K",
+            intended_distance_meters: 5000,
+            active_patch_id: "baseline_calibration_v1",
+            route_direction: "unknown",
+          })
+        }
+      >
+        Use Green Lake 5K calibration
+      </button>
+
+      {preRun.mode === "green_lake_5k_calibration" ? (
+        <section className="preflight-panel">
+          <div className="preflight-header">
+            <strong>Green Lake checklist</strong>
+            <span>before start</span>
+          </div>
+          <div className="preflight-list">
+            {[
+              "Install/open PWA",
+              "Put phone in fixed position",
+              "Arm GPS and wait for ready",
+              "Confirm wake lock active",
+              "Start actual run only when ready to move",
+              "Keep app visible",
+              "Stop after target reached banner",
+            ].map((item) => (
+              <div className="preflight-item ok" key={item}>
+                <span>STEP</span>
+                <strong>{item}</strong>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section className="form-panel">
         <ReadonlyField label="Runner ID" value={preRun.runner_id} />
@@ -1713,6 +1867,9 @@ function StopScreen({
 }) {
   const exportPayload = buildExportPayload(run);
   const medianAccuracy = exportPayload.gps_quality.median_horizontal_accuracy_meters as number | null;
+  const activityWindow = exportPayload.activity_window;
+  const activeTarget = exportPayload.active_target_distance_result;
+  const activeReliability = exportPayload.data_quality_scores.active_window_reliability;
 
   return (
     <section className="screen-stack">
@@ -1723,6 +1880,31 @@ function StopScreen({
           <Metric label="Distance" value={formatMeters(liveStats.distanceMeters)} />
           <Metric label="Average pace" value={formatPace(liveStats.averagePaceSecondsPerMile)} />
           <Metric label="GPS quality" value={medianAccuracy === null ? "unknown" : `${medianAccuracy} m median`} />
+        </div>
+      </section>
+
+      <section className="health-panel">
+        <div className="health-header">
+          <strong>Detected run facts</strong>
+          <span>{activityWindow.analysis_basis}</span>
+        </div>
+        <div className="health-grid">
+          <div className="health-item ok">
+            <span>Idle preamble</span>
+            <strong>{activityWindow.idle_preamble_seconds === null ? "unknown" : `${Math.round(activityWindow.idle_preamble_seconds)} s`}</strong>
+          </div>
+          <div className={activeTarget.target_reached ? "health-item ok" : "health-item warn"}>
+            <span>Target</span>
+            <strong>{activeTarget.target_reached ? "reached" : "not reached"}</strong>
+          </div>
+          <div className={activeReliability === "low" ? "health-item warn" : "health-item ok"}>
+            <span>Active GPS</span>
+            <strong>{activeReliability}</strong>
+          </div>
+          <div className="health-item ok">
+            <span>Post-stop filter</span>
+            <strong>{exportPayload.finalization.points_excluded_after_stop} excluded</strong>
+          </div>
         </div>
       </section>
 
@@ -1850,43 +2032,6 @@ function PostRunScreen({
             <option value="pacing">pacing</option>
             <option value="motivation">motivation</option>
             <option value="time">time</option>
-            <option value="other">other</option>
-          </select>
-        </label>
-
-        <label>
-          Started too fast
-          <select
-            value={postRun.started_too_fast}
-            onChange={(event) => updatePostRun({ started_too_fast: event.target.value as YesNoUnsure })}
-          >
-            <YesNoUnsureOptions />
-          </select>
-        </label>
-
-        <label>
-          Final third harder than expected
-          <select
-            value={postRun.final_third_harder_than_expected}
-            onChange={(event) =>
-              updatePostRun({ final_third_harder_than_expected: event.target.value as YesNoUnsure })
-            }
-          >
-            <YesNoUnsureOptions />
-          </select>
-        </label>
-
-        <label>
-          Interruption
-          <select
-            value={postRun.interruption}
-            onChange={(event) => updatePostRun({ interruption: event.target.value as PostRunState["interruption"] })}
-          >
-            <option value="none">none</option>
-            <option value="traffic">traffic</option>
-            <option value="crowd">crowd</option>
-            <option value="GPS issue">GPS issue</option>
-            <option value="bathroom">bathroom</option>
             <option value="other">other</option>
           </select>
         </label>
@@ -2093,7 +2238,7 @@ function buildRunHealth(exportPayload: ExportPayload) {
     lifecycle.wake_lock_events.some((event) => event.status === "active");
   const rawDistance = exportPayload.interpolation_features.raw_recorded_distance_meters;
   const interpolatedDistance = exportPayload.interpolation_features.interpolated_distance_estimate_meters;
-  const distanceConfidence = String(exportPayload.summary.distance_confidence ?? lifecycle.recording_reliability);
+  const distanceConfidence = exportPayload.data_quality_scores.distance_confidence;
   const motionWindows = Number(exportPayload.motion_features.window_count ?? 0);
   const motionDebug = exportPayload.motion_features.motion_permission_debug as
     | { sample_events_seen?: number; request_status?: string }
@@ -2103,8 +2248,8 @@ function buildRunHealth(exportPayload: ExportPayload) {
   return [
     {
       label: "Target",
-      value: exportPayload.target_distance_result.target_reached ? "reached" : "not reached",
-      status: exportPayload.target_distance_result.target_reached ? "ok" : "warn",
+      value: exportPayload.active_target_distance_result.target_reached ? "reached" : "not reached",
+      status: exportPayload.active_target_distance_result.target_reached ? "ok" : "warn",
     },
     {
       label: "Wake lock",
@@ -2136,8 +2281,8 @@ function buildRunHealth(exportPayload: ExportPayload) {
     },
     {
       label: "Confidence",
-      value: distanceConfidence,
-      status: distanceConfidence === "high" ? "ok" : "warn",
+      value: `${exportPayload.data_quality_scores.active_window_reliability}/${distanceConfidence}`,
+      status: exportPayload.data_quality_scores.active_window_reliability === "low" ? "warn" : "ok",
     },
     {
       label: "Motion",
@@ -2177,17 +2322,6 @@ function SorenessOptions({ includeUnknown = false }: { includeUnknown?: boolean 
   );
 }
 
-function YesNoUnsureOptions() {
-  return (
-    <>
-      <option value="unknown">unknown</option>
-      <option value="yes">yes</option>
-      <option value="no">no</option>
-      <option value="unsure">unsure</option>
-    </>
-  );
-}
-
 function loadStoredRun(): ActiveRun | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -2202,6 +2336,7 @@ function loadStoredRun(): ActiveRun | null {
 
 function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
   return {
+    status: run.status ?? (run.run_metadata?.end_time_utc ? "stopped" : "running"),
     run_metadata: run.run_metadata!,
     pre_run: run.pre_run ?? defaultPreRun,
     post_run: run.post_run ?? defaultPostRun,
@@ -2221,6 +2356,7 @@ function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
     pre_run_gps_warmup: { ...defaultWarmup(), ...run.pre_run_gps_warmup },
     motion_debug: { ...defaultMotionDebug(), ...run.motion_debug },
     pwa_state: { ...detectPwaState(), ...run.pwa_state },
+    finalization: { ...defaultFinalization(), ...run.finalization },
     elapsed_offset_seconds: run.elapsed_offset_seconds ?? 0,
     last_saved_at_utc: run.last_saved_at_utc ?? new Date().toISOString(),
   };
@@ -2297,6 +2433,22 @@ function summarizeMotionBucket(bucket: MotionBucket): MotionWindow {
     rotation_rate_magnitude_mean: roundOrNull(mean(bucket.rotationMagnitude), 5),
     rotation_rate_magnitude_std: roundOrNull(std(bucket.rotationMagnitude), 5),
   };
+}
+
+function haversineMetersForApp(a: Pick<GpsPoint, "lat" | "lon">, b: Pick<GpsPoint, "lat" | "lon">): number {
+  const earthRadiusMeters = 6371000;
+  const lat1 = toRadians(a.lat);
+  const lat2 = toRadians(b.lat);
+  const deltaLat = toRadians(b.lat - a.lat);
+  const deltaLon = toRadians(b.lon - a.lon);
+  const sinLat = Math.sin(deltaLat / 2);
+  const sinLon = Math.sin(deltaLon / 2);
+  const h = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLon * sinLon;
+  return earthRadiusMeters * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+function toRadians(degrees: number): number {
+  return (degrees * Math.PI) / 180;
 }
 
 function numeric(value: number | null | undefined): number | null {

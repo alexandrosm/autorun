@@ -6,9 +6,11 @@ Current version: `0.1.3`
 
 ## v0.1.3 focus
 
-- Adds a preflight gate before Start with explicit GPS, wake-lock, motion, visibility, and target checks.
-- Adds a run-health summary on the export screen before download/share/copy.
-- Adds a map tile failure message so the app makes clear that recording continues when OSM tiles are unavailable.
+- Green Lake Ready instrumentation: active-run analysis is separated from recording time.
+- Stop finalization clears GPS, freezes analysis points, and reports post-stop callback diagnostics.
+- Adds active summaries, active target-distance result, 100m/200m/500m segments, elevation grounding, artifact model, and split data-quality scores.
+- Adds Green Lake 5K calibration preset, detected run facts, targeted follow-up prompts, and grounded debrief context.
+- Keeps the v0.1.2 PWA, wake-lock, GPS-gap interpolation, and live OSM map features.
 
 ## v0.1.2 focus
 

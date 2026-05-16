@@ -1,4 +1,5 @@
 export type Screen = "setup" | "live" | "stop" | "post" | "export";
+export type RunStatus = "idle" | "armed" | "running" | "stopping" | "stopped" | "discarded";
 
 export type PermissionStatusText = "unknown" | "ready" | "denied" | "unavailable";
 export type WakeLockStatusText = "active" | "inactive" | "failed" | "unavailable";
@@ -31,7 +32,7 @@ export interface PreRunState {
   runner_id: "user_001";
   goal: "sub_25_5k";
   route_name: string;
-  mode: "training_calibration";
+  mode: "training_calibration" | "instrumentation_validation" | "green_lake_5k_calibration";
   active_patch_id: "baseline_calibration_v1";
   route_direction: RouteDirection;
   phone_position: PhonePosition;
@@ -89,6 +90,7 @@ export interface GpsPoint {
   suspicious_speed?: boolean;
   suspicious_acceleration?: boolean;
   suspicious_grade?: boolean;
+  tiny_dt_segment?: boolean;
 }
 
 export interface MotionWindow {
@@ -157,6 +159,18 @@ export interface TargetDistanceResult {
   pace_to_target_seconds_per_km: number | null;
   overshoot_meters: number | null;
   distance_recorded_meters: number | null;
+}
+
+export interface ActiveTargetDistanceResult {
+  intended_distance_meters: number;
+  target_reached: boolean;
+  active_elapsed_at_target_distance_seconds: number | null;
+  recording_elapsed_at_target_distance_seconds: number | null;
+  active_pace_to_target_seconds_per_mile: number | null;
+  active_pace_to_target_seconds_per_km: number | null;
+  overshoot_meters: number | null;
+  distance_recorded_meters: number | null;
+  target_distance_confidence: "unknown" | "low" | "medium" | "high";
 }
 
 export interface LifecycleEvent {
@@ -236,7 +250,167 @@ export interface InterpolationFeatures {
   gaps: GpsGapInterpolation[];
 }
 
+export interface FinalizationDiagnostics {
+  stop_clicked_at_utc: string | null;
+  stopped_at_elapsed_seconds: number | null;
+  gps_watch_cleared: boolean;
+  motion_listener_removed: boolean;
+  gps_stale_timers_cleared: boolean;
+  finish_point_source: "last_valid_pre_stop_gps" | "none";
+  stop_point: GpsPoint | null;
+  post_stop_gps_callback_count: number;
+  post_stop_gps_first_timestamp_utc: string | null;
+  post_stop_gps_last_timestamp_utc: string | null;
+  post_stop_gps_drift_meters: number | null;
+  points_excluded_after_stop: number;
+  analysis_point_count: number | null;
+  raw_point_count: number | null;
+}
+
+export interface ActivityWindow {
+  recording_start_elapsed_seconds: number;
+  inferred_activity_start_elapsed_seconds: number | null;
+  inferred_activity_start_confidence: "unknown" | "low" | "medium" | "high";
+  idle_preamble_seconds: number | null;
+  inferred_activity_end_elapsed_seconds: number | null;
+  active_duration_seconds: number | null;
+  active_distance_meters: number | null;
+  analysis_basis: "recording_window" | "activity_window";
+  detection_method: string | null;
+  detection_notes: string[];
+  excluded_intervals: Array<{
+    start_elapsed_seconds: number;
+    end_elapsed_seconds: number;
+    duration_seconds: number;
+    reason: "stationary_preamble" | "gps_warmup" | "app_background_gap" | "unknown";
+  }>;
+}
+
+export interface AnalysisSegment {
+  segment_id: string;
+  start_distance_meters: number;
+  end_distance_meters: number;
+  start_recording_elapsed_seconds: number | null;
+  end_recording_elapsed_seconds: number | null;
+  start_active_elapsed_seconds: number | null;
+  end_active_elapsed_seconds: number | null;
+  duration_seconds: number | null;
+  pace_seconds_per_mile: number | null;
+  pace_seconds_per_km: number | null;
+  elevation_gain_meters: number | null;
+  elevation_loss_meters: number | null;
+  avg_grade_percent: number | null;
+  avg_horizontal_accuracy_meters: number | null;
+  speed_p50_mps: number | null;
+  speed_p95_mps: number | null;
+  flags: string[];
+}
+
+export interface AnalysisSegments {
+  fixed_distance_100m: AnalysisSegment[];
+  fixed_distance_200m: AnalysisSegment[];
+  fixed_distance_500m: AnalysisSegment[];
+  fixed_time_30s: AnalysisSegment[];
+  detected_events: Record<string, unknown>[];
+  detected_loops: Record<string, unknown>[];
+}
+
+export interface InferredRunFacts {
+  started_late: boolean | null;
+  idle_preamble_seconds: number | null;
+  target_reached: boolean | null;
+  overshoot_meters: number | null;
+  late_fade_detected: boolean | null;
+  negative_split_detected: boolean | null;
+  first_segment_faster_than_later: boolean | null;
+  first_segment_slower_than_later: boolean | null;
+  stop_or_slowdown_events: Record<string, unknown>[];
+  probable_interruptions: Record<string, unknown>[];
+  gps_gaps_during_active_window: GpsGapInterpolation[];
+  recording_backgrounded_during_active_window: boolean | null;
+  route_direction_inferred: RouteDirection;
+  loop_count_inferred: number | null;
+  elevation_gain_loss_available: boolean | null;
+  motion_usable: boolean | null;
+}
+
+export interface TargetedFollowupPrompt {
+  id: string;
+  prompt: string;
+  default_answer?: string;
+  reason: string;
+}
+
+export interface GreenLakeCalibration {
+  enabled: boolean;
+  calibration_run_number: number;
+  start_point: Pick<GpsPoint, "lat" | "lon" | "timestamp_utc" | "t_elapsed_seconds"> | null;
+  finish_point: Pick<GpsPoint, "lat" | "lon" | "timestamp_utc" | "t_elapsed_seconds"> | null;
+  route_direction_user_selected: RouteDirection;
+  route_direction_inferred: RouteDirection;
+  course_fingerprint: {
+    bounding_box: Record<string, number | null> | null;
+    polyline_simplified: Array<[number, number]> | null;
+    distance_meters: number | null;
+    start_finish_distance_meters: number | null;
+  };
+  known_route_match_score_0_to_1: number | null;
+  course_saved_for_future_matching: boolean;
+}
+
+export interface ElevationGrounding {
+  raw_gps_altitude_available: boolean;
+  altitude_accuracy_available: boolean;
+  raw_elevation_gain_meters: number | null;
+  raw_elevation_loss_meters: number | null;
+  smoothed_elevation_gain_meters: number | null;
+  smoothed_elevation_loss_meters: number | null;
+  smoothing_method: "median_or_rolling_lowpass";
+  map_or_dem_elevation_available: false;
+  map_or_dem_elevation_placeholder: null;
+  chosen_elevation_model: "smoothed_gps" | "raw_gps" | "none";
+  elevation_confidence: "low" | "medium" | "high";
+  elevation_notes: string[];
+}
+
+export interface ArtifactModel {
+  raw_segment_count: number | null;
+  segments_used_for_distance: number | null;
+  segments_excluded_impossible_speed: number | null;
+  segments_excluded_tiny_dt: number | null;
+  segments_excluded_low_accuracy: number | null;
+  rolling_speed_p95_mps: number | null;
+  max_display_speed_mps: number | null;
+  artifact_notes: string[];
+}
+
+export interface DataQualityScores {
+  recording_reliability_overall: "low" | "medium" | "high";
+  active_window_reliability: "low" | "medium" | "high";
+  target_distance_confidence: "low" | "medium" | "high";
+  pace_confidence: "low" | "medium" | "high";
+  distance_confidence: "low" | "medium" | "high";
+  elevation_confidence: "low" | "medium" | "high";
+  motion_confidence: "none" | "low" | "medium" | "high";
+  green_lake_calibration_usable: boolean;
+  reasons: string[];
+}
+
+export interface GroundedDebriefContext {
+  objective_facts: string[];
+  subjective_inputs: string[];
+  conflicts_or_tensions: string[];
+  suggested_followup_questions: string[];
+  coach_safe_summary: {
+    usable_for_fitness_update: boolean;
+    usable_for_pacing_update: boolean;
+    usable_for_app_debug: boolean;
+    primary_data_limitations: string[];
+  };
+}
+
 export interface ActiveRun {
+  status: RunStatus;
   run_metadata: RunMetadata;
   pre_run: PreRunState;
   post_run: PostRunState;
@@ -250,6 +424,7 @@ export interface ActiveRun {
   pre_run_gps_warmup: PreRunGpsWarmup;
   motion_debug: MotionDebug;
   pwa_state: PwaState;
+  finalization: FinalizationDiagnostics;
   elapsed_offset_seconds: number;
   last_saved_at_utc: string;
 }
@@ -266,10 +441,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.2";
+  schema_version: "0.1.3";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.2";
+    version: "0.1.3";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -285,7 +460,7 @@ export interface ExportPayload {
     };
   };
   training_state_before_run: {
-    mode: "training_calibration";
+    mode: PreRunState["mode"];
     active_patch_id: "baseline_calibration_v1";
     active_patch_description: string;
     current_thesis: string;
@@ -299,8 +474,11 @@ export interface ExportPayload {
     recording_reliability: "high" | "medium" | "low";
   };
   pre_run_gps_warmup: PreRunGpsWarmup;
+  finalization: FinalizationDiagnostics;
+  activity_window: ActivityWindow;
   weather: WeatherState;
   summary: Record<string, unknown>;
+  active_summary: Record<string, unknown>;
   gps_quality: Record<string, unknown>;
   interpolation_features: InterpolationFeatures;
   splits: {
@@ -314,12 +492,30 @@ export interface ExportPayload {
     kilometers: SplitFeature[];
     thirds: SplitFeature[];
   };
+  active_target_distance_result: ActiveTargetDistanceResult;
+  active_target_distance_splits: {
+    miles: SplitFeature[];
+    kilometers: SplitFeature[];
+    thirds: SplitFeature[];
+    fixed_100m: SplitFeature[];
+    fixed_200m: SplitFeature[];
+    fixed_500m: SplitFeature[];
+  };
   pacing_features: Record<string, unknown>;
   elevation_features: Record<string, unknown>;
+  elevation_grounding: ElevationGrounding;
   motion_features: Record<string, unknown>;
   route_features: Record<string, unknown>;
+  inferred_run_facts: InferredRunFacts;
+  targeted_followup_prompts: TargetedFollowupPrompt[];
+  analysis_segments: AnalysisSegments;
+  green_lake_calibration: GreenLakeCalibration;
+  artifact_model: ArtifactModel;
+  data_quality_scores: DataQualityScores;
+  grounded_debrief_context: GroundedDebriefContext;
   time_series: {
     gps_points: GpsPoint[];
+    analysis_points: GpsPoint[];
     downsampled_points_5s: GpsPoint[];
   };
   post_run: Record<string, unknown>;

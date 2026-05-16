@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.3";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.3-greenlake-ready";
 const APP_SCOPE = self.registration.scope;
 const APP_SHELL = [APP_SCOPE];
 
