@@ -2,7 +2,15 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.5`
+Current version: `0.1.6`
+
+## v0.1.6 focus
+
+- Adds explicit run modes so short/home-block diagnostics are not mislabeled as Green Lake calibration.
+- Exports short-run diagnostic summaries, 1500m/1-mile estimates, partial-run pacing features, and short-run usability flags.
+- Adds route-truth fields and route memory for local/home-block fingerprints.
+- Improves post-run RPE capture with anchors and a simple effort fallback.
+- Carries the controlled-start patch into setup and coach-ready short-run summaries.
 
 ## v0.1.5 focus
 

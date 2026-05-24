@@ -9,6 +9,14 @@ export type RouteDirection = "clockwise" | "counterclockwise" | "unknown";
 export type PhonePosition = "waist_belt" | "shorts_pocket" | "armband" | "handheld" | "other" | "unknown";
 export type SorenessLevel = "none" | "mild" | "moderate" | "severe" | "unknown";
 export type YesNoUnsure = "yes" | "no" | "unsure" | "unknown";
+export type RunMode =
+  | "green_lake_5k_calibration"
+  | "short_run_diagnostic"
+  | "easy_run"
+  | "recovery_run"
+  | "instrumentation_validation"
+  | "record_mode"
+  | "training_calibration";
 export type PrimaryLimiter =
   | "breathing"
   | "legs"
@@ -21,6 +29,7 @@ export type PrimaryLimiter =
   | "unknown";
 export type Interruption = "none" | "traffic" | "crowd" | "GPS issue" | "bathroom" | "other";
 export type BreathingRecoveredAfter = "<1 min" | "1-3 min" | "3-5 min" | ">5 min" | "unknown";
+export type SimpleEffort = "easy" | "moderate" | "hard" | "very_hard" | "max" | "not_sure" | "unknown";
 
 export interface PainState {
   present: boolean;
@@ -32,7 +41,7 @@ export interface PreRunState {
   runner_id: "user_001";
   goal: "sub_25_5k";
   route_name: string;
-  mode: "training_calibration" | "instrumentation_validation" | "green_lake_5k_calibration";
+  mode: RunMode;
   active_patch_id: string;
   route_direction: RouteDirection;
   phone_position: PhonePosition;
@@ -45,6 +54,8 @@ export interface PreRunState {
 
 export interface PostRunState {
   rpe_1_to_10: number | null;
+  rpe_estimation_source: "manual" | "simple_effort_fallback" | "not_answered";
+  perceived_effort_simple: SimpleEffort;
   energy_after_run_1_to_5: number | null;
   soreness_after_run: SorenessLevel;
   pain_after_run: PainState;
@@ -414,7 +425,39 @@ export interface DataQualityScores {
   usable_for_fitness_baseline: boolean;
   usable_for_motion_analysis: boolean;
   usable_for_elevation_analysis: boolean;
+  usable_for_short_pacing_calibration: boolean;
+  usable_for_short_speed_reserve: boolean;
   reasons: string[];
+}
+
+export interface ShortRunDiagnostic {
+  enabled: boolean;
+  active_distance_meters: number | null;
+  active_duration_seconds: number | null;
+  active_pace_seconds_per_mile: number | null;
+  estimated_1500m_time_seconds: number | null;
+  estimated_1mile_time_seconds: number | null;
+  fixed_500m_pattern: Array<{
+    segment_id: string;
+    distance_meters: number | null;
+    duration_seconds: number | null;
+    pace_seconds_per_mile: number | null;
+  }>;
+  pacing_pattern: "positive_split" | "even" | "negative_split" | "unknown";
+  short_run_usable: boolean;
+  confidence: "low" | "medium" | "high";
+  limitations: string[];
+}
+
+export interface ActivePartialPacingFeatures {
+  actual_distance_thirds: SplitFeature[];
+  fixed_500m_trend: "fading" | "steady" | "speeding_up" | "unknown";
+  first_500m_pace: number | null;
+  second_500m_pace: number | null;
+  final_partial_pace: number | null;
+  early_fast_then_fade_detected: boolean | null;
+  late_fade_seconds_per_mile: number | null;
+  confidence: "low" | "medium" | "high";
 }
 
 export interface CoachReadySummary {
@@ -425,6 +468,14 @@ export interface CoachReadySummary {
   recommended_patch_id: string | null;
   subjective_cost_available: boolean;
   usable_for_next_strategy_update: boolean;
+  short_run: {
+    usable_for_runner_update: boolean;
+    estimated_1500m_time_seconds: number | null;
+    comparison_to_prior_short_runs: string | null;
+    comparison_to_green_lake_baseline_pace: string | null;
+    interpretation: string | null;
+    recommended_patch_id: string | null;
+  };
 }
 
 export interface GroundedDebriefContext {
@@ -472,10 +523,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.5";
+  schema_version: "0.1.6";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.5";
+    version: "0.1.6";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -492,7 +543,7 @@ export interface ExportPayload {
   };
   training_state_before_run: {
     mode: PreRunState["mode"];
-    active_patch_id: "baseline_calibration_v1";
+    active_patch_id: string;
     active_patch_description: string;
     current_thesis: string;
   };
@@ -533,6 +584,7 @@ export interface ExportPayload {
     fixed_500m: SplitFeature[];
   };
   pacing_features: Record<string, unknown>;
+  active_partial_pacing_features: ActivePartialPacingFeatures;
   elevation_features: Record<string, unknown>;
   elevation_grounding: ElevationGrounding;
   motion_features: Record<string, unknown>;
@@ -541,6 +593,7 @@ export interface ExportPayload {
   targeted_followup_prompts: TargetedFollowupPrompt[];
   analysis_segments: AnalysisSegments;
   green_lake_calibration: GreenLakeCalibration;
+  short_run_diagnostic: ShortRunDiagnostic;
   artifact_model: ArtifactModel;
   data_quality_scores: DataQualityScores;
   grounded_debrief_context: GroundedDebriefContext;

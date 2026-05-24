@@ -1,5 +1,6 @@
 import type {
   ActiveRun,
+  ActivePartialPacingFeatures,
   ActiveTargetDistanceResult,
   ActivityWindow,
   AnalysisSegment,
@@ -21,6 +22,7 @@ import type {
   PostRunState,
   PreRunState,
   RecordingLifecycle,
+  ShortRunDiagnostic,
   SplitFeature,
   TargetedFollowupPrompt,
   TargetDistanceResult,
@@ -36,6 +38,17 @@ const SUSPICIOUS_ACCELERATION_MPS2 = 4;
 const SUSPICIOUS_GRADE_PERCENT = 20;
 const TARGET_DISTANCE_TOLERANCE_METERS = 5;
 const SEGMENT_ARTIFACT_FRACTION_THRESHOLD = 0.1;
+
+const PATCH_LIBRARY: Record<string, { description: string; thesis: string }> = {
+  baseline_calibration_v1: {
+    description: "Establish repeatable Green Lake baseline and identify first limiter.",
+    thesis: "Unknown: distinguish pacing discipline, late-run durability, fatigue, weather sensitivity, and route execution.",
+  },
+  controlled_start_v1: {
+    description: "Reduce late fade by starting controlled and aiming for steadier kilometer splits.",
+    thesis: "Speed access exists; sustainable 5K pace and controlled opening effort are the current limiter.",
+  },
+};
 
 interface TrackPoint extends GpsPoint {
   cumulative_meters: number;
@@ -129,10 +142,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
 
   return {
-    schema_version: "0.1.5",
+    schema_version: "0.1.6",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.5",
+      version: "0.1.6",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -149,10 +162,9 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     },
     training_state_before_run: {
       mode: run.pre_run.mode,
-      active_patch_id: "baseline_calibration_v1",
-      active_patch_description: "Establish repeatable Green Lake baseline and identify first limiter.",
-      current_thesis:
-        "Unknown: distinguish pacing discipline, late-run durability, fatigue, weather sensitivity, and route execution.",
+      active_patch_id: run.pre_run.active_patch_id,
+      active_patch_description: patchDescription(run.pre_run.active_patch_id),
+      current_thesis: patchThesis(run.pre_run.active_patch_id),
     },
     pre_run: exportPreRun(run.pre_run),
     run_metadata: {
@@ -184,6 +196,7 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     active_target_distance_result: features.activeTargetDistanceResult,
     active_target_distance_splits: features.activeTargetDistanceSplits,
     pacing_features: features.pacing,
+    active_partial_pacing_features: features.activePartialPacing,
     elevation_features: features.elevation,
     elevation_grounding: features.elevationGrounding,
     motion_features: features.motion,
@@ -192,6 +205,7 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     targeted_followup_prompts: features.targetedFollowupPrompts,
     analysis_segments: features.analysisSegments,
     green_lake_calibration: features.greenLakeCalibration,
+    short_run_diagnostic: features.shortRunDiagnostic,
     artifact_model: features.artifactModel,
     data_quality_scores: features.dataQualityScores,
     grounded_debrief_context: features.groundedDebriefContext,
@@ -272,9 +286,18 @@ function computeFeatures(run: ActiveRun) {
   );
   const activeTargetDistanceSplits = buildActiveTargetDistanceSplits(activeTrack, run.pre_run.intended_distance_meters);
   const analysisSegments = computeAnalysisSegments(activeTrack, activeStart);
+  const activePartialPacing = computeActivePartialPacingFeatures(activeTrack, analysisSegments);
   const pacing = computePacingFeatures(track, splits.thirds);
-  const route = computeRouteFeatures(points, run.pre_run.route_direction, run.pre_run.route_name);
-  const greenLakeEnabled = isGreenLakeCalibrationRun(run.pre_run);
+  const baseRoute = computeRouteFeatures(points, run.pre_run.route_direction, run.pre_run.route_name);
+  const routeTruth = classifyRoute(run.pre_run, activeDistanceMeters, distanceMeters, points);
+  const route = {
+    ...baseRoute,
+    route_type: routeTruth.routeType,
+    route_id: routeTruth.routeId,
+    route_truth_notes: routeTruth.notes,
+    route_memory_saved_for_future_matching: routeTruth.saveForFutureMatching,
+  };
+  const greenLakeEnabled = routeTruth.greenLakeEnabled;
   const motion = computeMotionFeatures(
     run.motion_windows,
     durationSeconds,
@@ -293,6 +316,14 @@ function computeFeatures(run: ActiveRun) {
     elevationGrounding,
     motion,
     greenLakeEnabled,
+    activeDistanceMeters,
+  );
+  const shortRunDiagnostic = buildShortRunDiagnostic(
+    activeDistanceMeters,
+    activeDurationSeconds,
+    activePartialPacing,
+    analysisSegments,
+    dataQualityScores,
   );
   const inferredRunFacts = computeInferredRunFacts(
     activityWindow,
@@ -326,6 +357,8 @@ function computeFeatures(run: ActiveRun) {
     activePacing,
     dataQualityScores,
     run.post_run,
+    shortRunDiagnostic,
+    activePartialPacing,
   );
   const notes = buildQualityNotes(
     points,
@@ -398,6 +431,8 @@ function computeFeatures(run: ActiveRun) {
     dataQualityScores,
     groundedDebriefContext,
     coachReadySummary,
+    shortRunDiagnostic,
+    activePartialPacing,
     dataQualityNotes: notes,
   };
 }
@@ -1360,6 +1395,42 @@ function distanceAtElapsed(track: TrackPoint[], elapsed: number): number | null 
   return null;
 }
 
+function computeActivePartialPacingFeatures(
+  activeTrack: TrackPoint[],
+  analysisSegments: AnalysisSegments,
+): ActivePartialPacingFeatures {
+  const actualThirds = buildThirdSplits(activeTrack);
+  const fixed500 = analysisSegments.fixed_distance_500m;
+  const first500 = fixed500[0]?.pace_seconds_per_mile ?? null;
+  const second500 = fixed500[1]?.pace_seconds_per_mile ?? null;
+  const finalPartial = fixed500[fixed500.length - 1]?.pace_seconds_per_mile ?? null;
+  const validPaces = fixed500.map((segment) => segment.pace_seconds_per_mile).filter(isNumber);
+  const firstPace = validPaces[0] ?? null;
+  const lastPace = validPaces[validPaces.length - 1] ?? null;
+  const fade = firstPace !== null && lastPace !== null ? round(Math.max(0, lastPace - firstPace), 2) : null;
+  const trend =
+    firstPace === null || lastPace === null
+      ? "unknown"
+      : lastPace - firstPace > 15
+        ? "fading"
+        : firstPace - lastPace > 15
+          ? "speeding_up"
+          : "steady";
+  const distance = activeTrack.length > 0 ? activeTrack[activeTrack.length - 1].cumulative_meters : 0;
+  const confidence = distance >= 1000 && validPaces.length >= 2 ? "high" : distance >= 800 ? "medium" : "low";
+
+  return {
+    actual_distance_thirds: actualThirds,
+    fixed_500m_trend: trend,
+    first_500m_pace: first500,
+    second_500m_pace: second500,
+    final_partial_pace: finalPartial,
+    early_fast_then_fade_detected: fade === null ? null : fade > 15,
+    late_fade_seconds_per_mile: fade,
+    confidence,
+  };
+}
+
 function computePacingFeatures(track: TrackPoint[], thirds: SplitFeature[]) {
   const first = thirds[0]?.pace_seconds_per_mile ?? null;
   const middle = thirds[1]?.pace_seconds_per_mile ?? null;
@@ -1472,6 +1543,11 @@ function computeElevationGrounding(points: GpsPoint[]): ElevationGrounding {
   if (points.some((point) => point.suspicious_grade)) {
     notes.push("Suspicious raw grade spikes were excluded from chosen elevation metrics.");
   }
+  const track = buildTrack(points);
+  const distanceMeters = track.length > 0 ? track[track.length - 1].cumulative_meters : 0;
+  if (distanceMeters > 0 && distanceMeters < 3000 && (smoothed.gain > 30 || smoothed.loss > 30)) {
+    notes.push("Smoothed elevation gain/loss appears high for a short local route; do not use for coaching.");
+  }
   const confidence: ElevationGrounding["elevation_confidence"] =
     rawAvailable && altitudeAccuracyAvailable && points.length > 50 ? "medium" : "low";
 
@@ -1566,6 +1642,10 @@ function computeMotionFeatures(
         ? motionDebug.request_status
         : permissions.device_motion_permission;
   const motionUsable = usableWindows.length > 0 && usableSampleCount >= 10;
+  const motionSupportedByBrowser =
+    !permissions.device_motion_available
+      ? false
+      : !(permissions.device_motion_permission === "ready" && motionDebug.sample_events_seen > 0 && usableSampleCount === 0);
   const unusableReason = motionUsable
     ? null
     : permissions.device_motion_available
@@ -1576,6 +1656,7 @@ function computeMotionFeatures(
 
   return {
     motion_available: permissions.device_motion_available && (permissions.device_motion_permission === "ready" || windows.length > 0),
+    motion_supported_by_browser: motionSupportedByBrowser,
     motion_permission: motionPermission,
     motion_usable: motionUsable,
     motion_unusable_reason: unusableReason,
@@ -1626,6 +1707,7 @@ function computeDataQualityScores(
   elevationGrounding: ElevationGrounding,
   motion: Record<string, unknown>,
   greenLakeEnabled: boolean,
+  activeDistanceMeters: number,
 ): DataQualityScores {
   const reasons: string[] = [];
   const activeGapOver10 = activeInterpolation.gaps.filter((gap) => gap.duration_seconds > 10).length;
@@ -1671,12 +1753,18 @@ function computeDataQualityScores(
   const motionConfidence = motion.motion_usable ? "medium" : "none";
   const usableForPacingCalibration =
     activeTargetDistanceResult.target_reached && activeReliability !== "low" && distanceConfidence !== "low";
+  const usableForShortPacingCalibration =
+    activeDistanceMeters >= 1000 &&
+    activeReliability !== "low" &&
+    distanceConfidence !== "low" &&
+    activeGapOver10 === 0;
+  const usableForShortSpeedReserve = usableForShortPacingCalibration && activeDistanceMeters <= 3000;
   const usableForFitnessBaseline = greenLakeEnabled && usableForPacingCalibration && targetConfidence !== "low";
   const usableForMotionAnalysis = Boolean(motion.motion_usable);
   const usableForElevationAnalysis = elevationGrounding.elevation_confidence !== "low";
   const greenLakeUsable = greenLakeEnabled && usableForPacingCalibration;
 
-  if (!activeTargetDistanceResult.target_reached) {
+  if (!activeTargetDistanceResult.target_reached && !usableForShortPacingCalibration) {
     reasons.push("Target distance was not reached in the active window.");
   }
   if (!motion.motion_usable) {
@@ -1696,8 +1784,73 @@ function computeDataQualityScores(
     usable_for_fitness_baseline: usableForFitnessBaseline,
     usable_for_motion_analysis: usableForMotionAnalysis,
     usable_for_elevation_analysis: usableForElevationAnalysis,
+    usable_for_short_pacing_calibration: usableForShortPacingCalibration,
+    usable_for_short_speed_reserve: usableForShortSpeedReserve,
     reasons,
   };
+}
+
+function buildShortRunDiagnostic(
+  activeDistanceMeters: number,
+  activeDurationSeconds: number,
+  partialPacing: ActivePartialPacingFeatures,
+  segments: AnalysisSegments,
+  scores: DataQualityScores,
+): ShortRunDiagnostic {
+  const enabled = activeDistanceMeters >= 800 && activeDistanceMeters <= 3000;
+  const activePaceSecondsPerMile =
+    activeDistanceMeters > 0 ? round(activeDurationSeconds / (activeDistanceMeters / METERS_PER_MILE), 2) : null;
+  const estimated1500 =
+    activeDistanceMeters > 0 ? round(activeDurationSeconds * (1500 / activeDistanceMeters), 2) : null;
+  const estimatedMile =
+    activeDistanceMeters > 0 ? round(activeDurationSeconds * (METERS_PER_MILE / activeDistanceMeters), 2) : null;
+  const limitations: string[] = [];
+  if (!enabled) {
+    limitations.push("Active distance was outside the 800-3000m short-run diagnostic range.");
+  }
+  if (!scores.usable_for_short_pacing_calibration) {
+    limitations.push("Short-run pacing calibration usability was not met.");
+  }
+  if (scores.motion_confidence === "none") {
+    limitations.push("Motion signal was not usable; short-run interpretation is GPS-only.");
+  }
+
+  return {
+    enabled,
+    active_distance_meters: activeDistanceMeters > 0 ? round(activeDistanceMeters, 2) : null,
+    active_duration_seconds: activeDurationSeconds > 0 ? round(activeDurationSeconds, 2) : null,
+    active_pace_seconds_per_mile: activePaceSecondsPerMile,
+    estimated_1500m_time_seconds: estimated1500,
+    estimated_1mile_time_seconds: estimatedMile,
+    fixed_500m_pattern: segments.fixed_distance_500m.map((segment) => ({
+      segment_id: segment.segment_id,
+      distance_meters: round(segment.end_distance_meters - segment.start_distance_meters, 2),
+      duration_seconds: segment.duration_seconds,
+      pace_seconds_per_mile: segment.pace_seconds_per_mile,
+    })),
+    pacing_pattern: pacingPatternFromPartial(partialPacing),
+    short_run_usable: enabled && scores.usable_for_short_pacing_calibration,
+    confidence:
+      enabled && scores.usable_for_short_pacing_calibration && partialPacing.confidence === "high"
+        ? "high"
+        : enabled && scores.usable_for_short_pacing_calibration
+          ? "medium"
+          : "low",
+    limitations,
+  };
+}
+
+function pacingPatternFromPartial(partialPacing: ActivePartialPacingFeatures): ShortRunDiagnostic["pacing_pattern"] {
+  if (partialPacing.fixed_500m_trend === "fading") {
+    return "positive_split";
+  }
+  if (partialPacing.fixed_500m_trend === "speeding_up") {
+    return "negative_split";
+  }
+  if (partialPacing.fixed_500m_trend === "steady") {
+    return "even";
+  }
+  return "unknown";
 }
 
 function computeInferredRunFacts(
@@ -1815,12 +1968,48 @@ function buildGreenLakeCalibration(
   };
 }
 
-function isGreenLakeCalibrationRun(preRun: PreRunState): boolean {
-  return (
-    preRun.mode === "green_lake_5k_calibration" ||
-    (preRun.route_name.toLowerCase().includes("green lake") &&
-      Math.abs(preRun.intended_distance_meters - 5000) <= TARGET_DISTANCE_TOLERANCE_METERS)
+function classifyRoute(
+  preRun: PreRunState,
+  activeDistanceMeters: number,
+  recordedDistanceMeters: number,
+  points: GpsPoint[],
+) {
+  const routeText = `${preRun.route_name} ${preRun.free_text}`.toLowerCase();
+  const shortCue = /\b(home block|short run|test run|block|sidewalk|short diagnostic)\b/.test(routeText);
+  const greenLakeName = preRun.route_name.toLowerCase().includes("green lake");
+  const targetIs5k = Math.abs(preRun.intended_distance_meters - 5000) <= TARGET_DISTANCE_TOLERANCE_METERS;
+  const nearGreenLake = points.some(
+    (point) => point.lat >= 47.67 && point.lat <= 47.69 && point.lon >= -122.35 && point.lon <= -122.325,
   );
+  const explicitGreenLake = preRun.mode === "green_lake_5k_calibration" && !shortCue;
+  const strongGreenLakeSignal = greenLakeName && targetIs5k && activeDistanceMeters > 4500 && nearGreenLake && !shortCue;
+  const greenLakeEnabled = explicitGreenLake || strongGreenLakeSignal;
+  const routeType = greenLakeEnabled
+    ? "green_lake_calibration"
+    : shortCue || activeDistanceMeters < 3000
+      ? "home_block_or_short_route"
+      : preRun.mode;
+  const routeId = routeType === "home_block_or_short_route" ? "home_block_short_loop_v1" : greenLakeEnabled ? "green_lake_5k_v1" : null;
+  const notes: string[] = [];
+  if (shortCue && greenLakeName) {
+    notes.push("Short/home-block language overrode Green Lake route name.");
+  }
+  if (greenLakeName && !greenLakeEnabled) {
+    notes.push("Green Lake name alone did not enable Green Lake calibration.");
+  }
+  if (greenLakeName && targetIs5k && activeDistanceMeters > 4500 && !nearGreenLake) {
+    notes.push("Route did not fall inside the rough Green Lake area check.");
+  }
+  if (points.length > 0 && recordedDistanceMeters < 3000) {
+    notes.push("Route fingerprint was treated as a short/local route.");
+  }
+  return {
+    greenLakeEnabled,
+    routeType,
+    routeId,
+    saveForFutureMatching: Boolean(routeId),
+    notes,
+  };
 }
 
 function buildGroundedDebriefContext(
@@ -1851,7 +2040,12 @@ function buildGroundedDebriefContext(
   }
 
   const subjectiveInputs = [
-    run.post_run.rpe_1_to_10 === null ? null : `RPE = ${run.post_run.rpe_1_to_10}`,
+    run.post_run.rpe_1_to_10 === null
+      ? null
+      : `RPE = ${run.post_run.rpe_1_to_10} (${run.post_run.rpe_estimation_source})`,
+    run.post_run.perceived_effort_simple === "unknown"
+      ? null
+      : `Simple effort = ${run.post_run.perceived_effort_simple}`,
     run.post_run.energy_after_run_1_to_5 === null ? null : `Energy after = ${run.post_run.energy_after_run_1_to_5}`,
     run.post_run.primary_limiter === "unknown" ? null : `Primary limiter = ${run.post_run.primary_limiter}`,
     run.post_run.pain_after_run.present ? `Pain = ${run.post_run.pain_after_run.location ?? "present"}` : "Pain = false",
@@ -1877,6 +2071,8 @@ function buildCoachReadySummary(
   activePacing: Record<string, unknown>,
   scores: DataQualityScores,
   postRun: PostRunState,
+  shortRun: ShortRunDiagnostic,
+  partialPacing: ActivePartialPacingFeatures,
 ): CoachReadySummary {
   const targetTime = activeTargetDistanceResult.active_elapsed_at_target_distance_seconds;
   const firstPace = asNumber(activePacing.first_third_pace_seconds_per_mile);
@@ -1892,16 +2088,36 @@ function buildCoachReadySummary(
   const subjectiveCostAvailable = subjectiveDebriefComplete(postRun);
   const recommendedPatch =
     pacingPattern === "positive_split" && lateFade !== null && lateFade > 15 ? "controlled_start_v1" : null;
+  const shortRecommendedPatch =
+    shortRun.enabled && partialPacing.early_fast_then_fade_detected ? "controlled_start_v1" : recommendedPatch;
 
   return {
     baseline_green_lake_5k_time_seconds: greenLakeEnabled && activeTargetDistanceResult.target_reached ? targetTime : null,
     baseline_green_lake_5k_pace_seconds_per_mile:
-      targetTime === null ? null : round(targetTime / (activeTargetDistanceResult.intended_distance_meters / METERS_PER_MILE), 2),
+      greenLakeEnabled && targetTime !== null
+        ? round(targetTime / (activeTargetDistanceResult.intended_distance_meters / METERS_PER_MILE), 2)
+        : null,
     pacing_pattern: pacingPattern,
     late_fade_seconds_per_mile: lateFade,
     recommended_patch_id: recommendedPatch,
     subjective_cost_available: subjectiveCostAvailable,
     usable_for_next_strategy_update: scores.usable_for_pacing_calibration && recommendedPatch !== null,
+    short_run: {
+      usable_for_runner_update: shortRun.short_run_usable,
+      estimated_1500m_time_seconds: shortRun.estimated_1500m_time_seconds,
+      comparison_to_prior_short_runs: shortRun.enabled ? "Compare against prior local short-run diagnostics by route_id when available." : null,
+      comparison_to_green_lake_baseline_pace:
+        shortRun.active_pace_seconds_per_mile !== null
+          ? "Short-run pace can be compared with the current Green Lake baseline pace, but should not be extrapolated directly to 5K."
+          : null,
+      interpretation:
+        shortRun.enabled && partialPacing.early_fast_then_fade_detected
+          ? "Short run shows fast start followed by pacing drift; useful as speed-reserve and pacing-drift evidence."
+          : shortRun.enabled
+            ? "Short run is usable for short-distance pacing diagnostics."
+            : null,
+      recommended_patch_id: shortRecommendedPatch,
+    },
   };
 }
 
@@ -2013,6 +2229,14 @@ function buildQualityNotes(
   return notes;
 }
 
+function patchDescription(patchId: string): string {
+  return PATCH_LIBRARY[patchId]?.description ?? "Manual/local coach patch selected before run.";
+}
+
+function patchThesis(patchId: string): string {
+  return PATCH_LIBRARY[patchId]?.thesis ?? "Manual patch: evaluate objective split pattern against post-run subjective cost.";
+}
+
 function exportPreRun(preRun: PreRunState) {
   return {
     mode: preRun.mode,
@@ -2031,6 +2255,8 @@ function exportPreRun(preRun: PreRunState) {
 function exportPostRun(postRun: PostRunState) {
   return {
     rpe_1_to_10: postRun.rpe_1_to_10,
+    rpe_estimation_source: postRun.rpe_estimation_source,
+    perceived_effort_simple: postRun.perceived_effort_simple,
     energy_after_run_1_to_5: postRun.energy_after_run_1_to_5,
     soreness_after_run: postRun.soreness_after_run,
     pain_after_run: postRun.pain_after_run,

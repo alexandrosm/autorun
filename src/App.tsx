@@ -34,16 +34,19 @@ import type {
   PwaState,
   RecordingLifecycle,
   RouteDirection,
+  RunMode,
   Screen,
+  SimpleEffort,
   SorenessLevel,
   WeatherStatusText,
 } from "./types";
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.5";
+const APP_VERSION = "0.1.6";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
+const ROUTE_MEMORY_KEY = "greenlake_autoresearch_logger_route_memory_v0_1";
 const MOTION_WINDOW_SECONDS = 5;
 const ACCEPTABLE_GPS_ACCURACY_METERS = 25;
 const CONTROLLED_START_PATCH_ID = "controlled_start_v1";
@@ -54,6 +57,24 @@ const CONTROLLED_START_BANDS = [
   { km: 4, label: "Km 4", minSecondsPerKm: null, maxSecondsPerKm: null, text: "hold steady" },
   { km: 5, label: "Km 5", minSecondsPerKm: null, maxSecondsPerKm: null, text: "squeeze if stable" },
 ] as const;
+const RUN_MODE_OPTIONS: Array<{ value: RunMode; label: string }> = [
+  { value: "short_run_diagnostic", label: "short run diagnostic" },
+  { value: "green_lake_5k_calibration", label: "Green Lake 5K calibration" },
+  { value: "instrumentation_validation", label: "instrumentation validation" },
+  { value: "easy_run", label: "easy run" },
+  { value: "recovery_run", label: "recovery run" },
+  { value: "record_mode", label: "record mode" },
+  { value: "training_calibration", label: "training calibration" },
+];
+const RPE_ANCHORS = [
+  "1-2 very easy / walking",
+  "3-4 easy, conversational",
+  "5-6 moderate, controlled",
+  "7 hard but sustainable",
+  "8 very hard",
+  "9 near max",
+  "10 all-out",
+];
 
 interface MotionBucket {
   start: number;
@@ -73,12 +94,12 @@ interface MotionBucket {
 const defaultPreRun: PreRunState = {
   runner_id: "user_001",
   goal: "sub_25_5k",
-  route_name: "Green Lake calibrated 5K",
-  mode: "training_calibration",
-  active_patch_id: "baseline_calibration_v1",
+  route_name: "Home block short run",
+  mode: "short_run_diagnostic",
+  active_patch_id: CONTROLLED_START_PATCH_ID,
   route_direction: "unknown",
   phone_position: "unknown",
-  intended_distance_meters: 5000,
+  intended_distance_meters: 1500,
   energy_before_run_1_to_5: null,
   soreness_before_run: "unknown",
   pain_before_run: {
@@ -91,6 +112,8 @@ const defaultPreRun: PreRunState = {
 
 const defaultPostRun: PostRunState = {
   rpe_1_to_10: null,
+  rpe_estimation_source: "not_answered",
+  perceived_effort_simple: "unknown",
   energy_after_run_1_to_5: null,
   soreness_after_run: "unknown",
   pain_after_run: {
@@ -903,7 +926,11 @@ export default function App() {
   };
 
   const continueToExport = () => {
-    setExportCreatedAt(new Date().toISOString());
+    const createdAt = new Date().toISOString();
+    if (activeRun) {
+      saveRouteMemory(buildExportPayload(activeRun, createdAt));
+    }
+    setExportCreatedAt(createdAt);
     setScreen("export");
   };
 
@@ -1487,6 +1514,23 @@ function SetupScreen({
         onClick={() =>
           setPreRun({
             ...preRun,
+            mode: "short_run_diagnostic",
+            route_name: "Home block short run",
+            intended_distance_meters: 1500,
+            active_patch_id: CONTROLLED_START_PATCH_ID,
+            route_direction: "unknown",
+          })
+        }
+      >
+        Use short run diagnostic
+      </button>
+
+      <button
+        type="button"
+        className="secondary-button full-width-button"
+        onClick={() =>
+          setPreRun({
+            ...preRun,
             mode: "instrumentation_validation",
             route_name: "instrumentation validation",
             intended_distance_meters: 300,
@@ -1568,8 +1612,31 @@ function SetupScreen({
       <section className="form-panel">
         <ReadonlyField label="Runner ID" value={preRun.runner_id} />
         <ReadonlyField label="Goal" value={preRun.goal} />
-        <ReadonlyField label="Mode" value={preRun.mode} />
-        <ReadonlyField label="Active patch" value={preRun.active_patch_id} />
+
+        <label>
+          Run mode
+          <select
+            value={preRun.mode}
+            onChange={(event) => setPreRun(applyRunModeDefaults(preRun, event.target.value as RunMode))}
+          >
+            {RUN_MODE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
+          Active patch
+          <select
+            value={preRun.active_patch_id}
+            onChange={(event) => setPreRun({ ...preRun, active_patch_id: event.target.value })}
+          >
+            <option value="baseline_calibration_v1">baseline_calibration_v1</option>
+            <option value={CONTROLLED_START_PATCH_ID}>controlled_start_v1</option>
+          </select>
+        </label>
 
         <label>
           Route
@@ -2076,11 +2143,32 @@ function PostRunScreen({
       </section>
 
       <section className="form-panel">
+        <section className="preflight-panel">
+          <div className="preflight-header">
+            <strong>RPE anchors</strong>
+            <span>effort</span>
+          </div>
+          <div className="preflight-list">
+            {RPE_ANCHORS.map((anchor) => (
+              <div className="preflight-item ok" key={anchor}>
+                <span>RPE</span>
+                <strong>{anchor}</strong>
+              </div>
+            ))}
+          </div>
+        </section>
+
         <label>
           RPE
           <select
             value={postRun.rpe_1_to_10 ?? ""}
-            onChange={(event) => updatePostRun({ rpe_1_to_10: numberFromInput(event.target.value) })}
+            onChange={(event) => {
+              const value = numberFromInput(event.target.value);
+              updatePostRun({
+                rpe_1_to_10: value,
+                rpe_estimation_source: value === null ? "not_answered" : "manual",
+              });
+            }}
           >
             <option value="">unknown</option>
             {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((value) => (
@@ -2088,6 +2176,30 @@ function PostRunScreen({
                 {value}
               </option>
             ))}
+          </select>
+        </label>
+
+        <label>
+          How did it feel?
+          <select
+            value={postRun.perceived_effort_simple}
+            onChange={(event) => {
+              const effort = event.target.value as SimpleEffort;
+              const fallbackRpe = rpeFromSimpleEffort(effort);
+              updatePostRun({
+                perceived_effort_simple: effort,
+                rpe_1_to_10: fallbackRpe,
+                rpe_estimation_source: fallbackRpe === null ? "not_answered" : "simple_effort_fallback",
+              });
+            }}
+          >
+            <option value="unknown">unknown</option>
+            <option value="easy">easy</option>
+            <option value="moderate">moderate</option>
+            <option value="hard">hard</option>
+            <option value="very_hard">very hard</option>
+            <option value="max">max</option>
+            <option value="not_sure">not sure</option>
           </select>
         </label>
 
@@ -2417,12 +2529,17 @@ function buildRunHealth(exportPayload: ExportPayload) {
     | { sample_events_seen?: number; request_status?: string }
     | undefined;
   const motionSamples = motionWindows > 0 || Number(motionDebug?.sample_events_seen ?? 0) > 0;
+  const shortRunUsable = exportPayload.short_run_diagnostic.short_run_usable;
 
   return [
     {
       label: "Target",
-      value: exportPayload.active_target_distance_result.target_reached ? "reached" : "not reached",
-      status: exportPayload.active_target_distance_result.target_reached ? "ok" : "warn",
+      value: exportPayload.active_target_distance_result.target_reached
+        ? "reached"
+        : shortRunUsable
+          ? "short run"
+          : "not reached",
+      status: exportPayload.active_target_distance_result.target_reached || shortRunUsable ? "ok" : "warn",
     },
     {
       label: "Wake lock",
@@ -2495,6 +2612,39 @@ function SorenessOptions({ includeUnknown = false }: { includeUnknown?: boolean 
   );
 }
 
+function applyRunModeDefaults(preRun: PreRunState, mode: RunMode): PreRunState {
+  if (mode === "green_lake_5k_calibration") {
+    return {
+      ...preRun,
+      mode,
+      route_name: "Green Lake calibrated 5K",
+      intended_distance_meters: 5000,
+      active_patch_id: preRun.active_patch_id || CONTROLLED_START_PATCH_ID,
+    };
+  }
+  if (mode === "short_run_diagnostic") {
+    return {
+      ...preRun,
+      mode,
+      route_name: preRun.route_name.toLowerCase().includes("green lake") ? "Home block short run" : preRun.route_name,
+      intended_distance_meters: preRun.intended_distance_meters === 5000 ? 1500 : preRun.intended_distance_meters,
+      active_patch_id: preRun.active_patch_id || CONTROLLED_START_PATCH_ID,
+    };
+  }
+  if (mode === "instrumentation_validation") {
+    return {
+      ...preRun,
+      mode,
+      route_name: "instrumentation validation",
+      intended_distance_meters: 300,
+    };
+  }
+  return {
+    ...preRun,
+    mode,
+  };
+}
+
 function loadStoredRun(): ActiveRun | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -2541,6 +2691,30 @@ function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
     elapsed_offset_seconds: run.elapsed_offset_seconds ?? 0,
     last_saved_at_utc: run.last_saved_at_utc ?? new Date().toISOString(),
   };
+}
+
+function saveRouteMemory(exportPayload: ExportPayload) {
+  const routeId = exportPayload.route_features.route_id;
+  if (typeof routeId !== "string" || routeId.length === 0) {
+    return;
+  }
+  try {
+    const raw = localStorage.getItem(ROUTE_MEMORY_KEY);
+    const current = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    current[routeId] = {
+      route_id: routeId,
+      route_type: exportPayload.route_features.route_type ?? null,
+      route_name: exportPayload.pre_run.route_name ?? null,
+      last_run_id: exportPayload.run_metadata.run_id ?? null,
+      updated_at_utc: exportPayload.app.created_at_utc,
+      active_distance_meters: exportPayload.active_summary.distance_meters ?? null,
+      bounding_box: exportPayload.route_features.bounding_box ?? null,
+      course_fingerprint: exportPayload.green_lake_calibration.course_fingerprint,
+    };
+    localStorage.setItem(ROUTE_MEMORY_KEY, JSON.stringify(current));
+  } catch {
+    // Route memory is opportunistic; export should never depend on localStorage writes.
+  }
 }
 
 function createMotionBucket(start: number): MotionBucket {
@@ -2685,6 +2859,24 @@ function numberFromInput(value: string): number | null {
   }
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function rpeFromSimpleEffort(value: SimpleEffort): number | null {
+  switch (value) {
+    case "easy":
+      return 3;
+    case "moderate":
+      return 5;
+    case "hard":
+      return 7;
+    case "very_hard":
+      return 8;
+    case "max":
+      return 10;
+    case "not_sure":
+    case "unknown":
+      return null;
+  }
 }
 
 function formatDuration(seconds: number): string {
