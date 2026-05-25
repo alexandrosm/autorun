@@ -503,6 +503,27 @@ button {
   font-weight: 800;
 }
 
+.inline-warning-button {
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 1px solid #985200;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #623400;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.countdown-banner {
+  justify-content: center;
+  text-align: center;
+}
+
+.countdown-banner strong {
+  font-size: 3rem;
+  line-height: 1;
+}
+
 .map-panel {
   overflow: hidden;
   border: 1px solid #cfddd5;

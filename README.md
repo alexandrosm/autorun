@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.9`
+Current version: `0.1.10`
+
+## v0.1.10 focus
+
+- Auto-arms GPS opportunistically on setup so the normal pre-run action is Start.
+- Adds a GPS-gated `3-2-1` countdown; the timer starts after the countdown, not while GPS warms.
+- Uses the Start tap to request motion opportunistically without blocking GPS/route capture.
+- Moves manual GPS, wake lock, and motion controls into the optional details drawer.
 
 ## v0.1.9 focus
 

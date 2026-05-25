@@ -45,7 +45,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.9";
+const APP_VERSION = "0.1.10";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -57,6 +57,10 @@ const MSGPACK_MIME = "application/msgpack";
 const ZIP_MIME = "application/zip";
 const MOTION_WINDOW_SECONDS = 5;
 const ACCEPTABLE_GPS_ACCURACY_METERS = 25;
+const GPS_READY_ACCURACY_METERS = 25;
+const GPS_READY_FIX_AGE_SECONDS = 5;
+const START_GPS_TIMEOUT_SECONDS = 15;
+const START_COUNTDOWN_SECONDS = 3;
 const CONTROLLED_START_PATCH_ID = "controlled_start_v1";
 const CONTROLLED_START_BANDS = [
   { km: 1, label: "Km 1", minSecondsPerKm: 335, maxSecondsPerKm: 340, text: "5:35-5:40" },
@@ -295,6 +299,9 @@ export default function App() {
     latestPoint: GpsPoint | null;
     latestAccuracy: number | null;
   }>({ active: false, latestPoint: null, latestAccuracy: null });
+  const [pendingStart, setPendingStart] = useState(false);
+  const [gpsStartTimedOut, setGpsStartTimedOut] = useState(false);
+  const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
   const [gpsStaleSeconds, setGpsStaleSeconds] = useState(0);
   const [serviceWorkerUpdateReady, setServiceWorkerUpdateReady] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
@@ -322,6 +329,8 @@ export default function App() {
   const serviceWorkerRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
   const startWeatherRetryTimeoutRef = useRef<number | null>(null);
   const recoverySuppressedRef = useRef(false);
+  const countdownIntervalRef = useRef<number | null>(null);
+  const startGpsTimeoutRef = useRef<number | null>(null);
 
   const liveStats = useMemo(
     () => computeLiveStats(activeRun?.gps_points ?? [], elapsedSeconds),
@@ -428,14 +437,18 @@ export default function App() {
     setWarmupStatus((current) => ({ ...current, active: false }));
   }, []);
 
-  const armGps = useCallback(() => {
+  const armGps = useCallback((silent = false) => {
     if (!("geolocation" in navigator)) {
       updatePermissions({ geolocation_available: false, geolocation_permission: "unavailable" });
-      setActionMessage("GPS unavailable.");
+      if (!silent) {
+        setActionMessage("GPS unavailable.");
+      }
       return;
     }
     if (warmupWatchIdRef.current !== null) {
-      setActionMessage("GPS warmup already armed.");
+      if (!silent) {
+        setActionMessage("GPS warmup already armed.");
+      }
       return;
     }
 
@@ -448,7 +461,9 @@ export default function App() {
       last_accuracy_before_start_meters: null,
     });
     setWarmupStatus({ active: true, latestPoint: null, latestAccuracy: null });
-    setActionMessage("GPS warmup armed.");
+    if (!silent) {
+      setActionMessage("GPS warmup armed.");
+    }
 
     warmupWatchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
@@ -472,7 +487,9 @@ export default function App() {
           geolocation_permission: error.code === error.PERMISSION_DENIED ? "denied" : "unavailable",
         });
         setWarmupStatus((current) => ({ ...current, active: false }));
-        setActionMessage(error.code === error.PERMISSION_DENIED ? "GPS denied." : "GPS warmup unavailable.");
+        if (!silent) {
+          setActionMessage(error.code === error.PERMISSION_DENIED ? "GPS denied." : "GPS warmup unavailable.");
+        }
       },
       {
         enableHighAccuracy: true,
@@ -723,7 +740,7 @@ export default function App() {
     );
   };
 
-  const requestMotionPermission = async () => {
+  const requestMotionPermission = useCallback(async (silent = false) => {
     if (!permissions.device_motion_available) {
       updatePermissions({ device_motion_permission: "unavailable" });
       updateMotionDebug({
@@ -731,7 +748,16 @@ export default function App() {
         requested_at_utc: new Date().toISOString(),
         result_at_utc: new Date().toISOString(),
       });
-      setActionMessage("Motion unavailable.");
+      if (!silent) {
+        setActionMessage("Motion unavailable.");
+      }
+      return;
+    }
+    if (
+      permissions.device_motion_permission === "ready" ||
+      permissions.device_motion_permission === "denied" ||
+      permissions.device_motion_permission === "unavailable"
+    ) {
       return;
     }
 
@@ -747,20 +773,46 @@ export default function App() {
           request_status: result === "granted" ? "granted" : "denied",
           result_at_utc: new Date().toISOString(),
         });
-        setActionMessage(result === "granted" ? "Motion ready." : "Motion denied.");
+        if (!silent) {
+          setActionMessage(result === "granted" ? "Motion ready." : "Motion denied.");
+        }
       } else {
         updatePermissions({ device_motion_permission: "ready" });
         updateMotionDebug({ request_status: "granted", result_at_utc: new Date().toISOString() });
-        setActionMessage("Motion ready.");
+        if (!silent) {
+          setActionMessage("Motion ready.");
+        }
       }
     } catch {
       updatePermissions({ device_motion_permission: "denied" });
       updateMotionDebug({ request_status: "failed", result_at_utc: new Date().toISOString() });
-      setActionMessage("Motion permission failed.");
+      if (!silent) {
+        setActionMessage("Motion permission failed.");
+      }
     }
-  };
+  }, [
+    permissions.device_motion_available,
+    permissions.device_motion_permission,
+    updateMotionDebug,
+    updatePermissions,
+  ]);
 
-  const startRun = () => {
+  const clearStartTimers = useCallback(() => {
+    if (countdownIntervalRef.current !== null) {
+      window.clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    if (startGpsTimeoutRef.current !== null) {
+      window.clearTimeout(startGpsTimeoutRef.current);
+      startGpsTimeoutRef.current = null;
+    }
+  }, []);
+
+  const startRun = useCallback(() => {
+    clearStartTimers();
+    setPendingStart(false);
+    setGpsStartTimedOut(false);
+    setCountdownSeconds(null);
     const startedAt = new Date();
     const warmupStartedAt = warmup.armed_at_utc ? Date.parse(warmup.armed_at_utc) : null;
     const finalWarmup: PreRunGpsWarmup = {
@@ -796,7 +848,75 @@ export default function App() {
       void fetchWeatherForRun("start", warmupStatus.latestPoint.lat, warmupStatus.latestPoint.lon);
     }
     void requestWakeLock(true);
-  };
+  }, [
+    clearStartTimers,
+    fetchWeatherForRun,
+    motionDebugDraft,
+    permissions,
+    preRun,
+    pwaState,
+    requestWakeLock,
+    startGpsWatch,
+    stopWarmupWatch,
+    warmup,
+    warmupStatus.latestAccuracy,
+    warmupStatus.latestPoint,
+  ]);
+
+  const beginStartCountdown = useCallback(
+    (startAnyway = false) => {
+      clearStartTimers();
+      setPendingStart(false);
+      setGpsStartTimedOut(false);
+      setCountdownSeconds(START_COUNTDOWN_SECONDS);
+      setActionMessage(startAnyway ? "Starting without a fresh GPS fix." : "Starting in 3...");
+      let nextSecond = START_COUNTDOWN_SECONDS;
+      countdownIntervalRef.current = window.setInterval(() => {
+        nextSecond -= 1;
+        if (nextSecond <= 0) {
+          clearStartTimers();
+          setCountdownSeconds(null);
+          startRun();
+          return;
+        }
+        setCountdownSeconds(nextSecond);
+      }, 1000);
+    },
+    [clearStartTimers, startRun],
+  );
+
+  const handleStartPressed = useCallback(() => {
+    void requestMotionPermission(true);
+    void requestWakeLock(true);
+
+    if (isWarmupGpsReady(warmupStatus.latestPoint, warmupStatus.latestAccuracy)) {
+      beginStartCountdown();
+      return;
+    }
+
+    setPendingStart(true);
+    setGpsStartTimedOut(false);
+    setActionMessage("Getting GPS. Countdown will start when the fix is fresh.");
+    if (!warmupStatus.active) {
+      armGps(true);
+    }
+
+    if (startGpsTimeoutRef.current !== null) {
+      window.clearTimeout(startGpsTimeoutRef.current);
+    }
+    startGpsTimeoutRef.current = window.setTimeout(() => {
+      setGpsStartTimedOut(true);
+      setActionMessage("GPS is not ready yet. Keep waiting, or start anyway.");
+    }, START_GPS_TIMEOUT_SECONDS * 1000);
+  }, [
+    armGps,
+    beginStartCountdown,
+    requestMotionPermission,
+    requestWakeLock,
+    warmupStatus.active,
+    warmupStatus.latestAccuracy,
+    warmupStatus.latestPoint,
+  ]);
 
   const stopRun = async () => {
     const elapsed = getElapsedSeconds();
@@ -998,6 +1118,7 @@ export default function App() {
     }
     stopGpsWatch();
     stopWarmupWatch();
+    clearStartTimers();
     if (startWeatherRetryTimeoutRef.current !== null) {
       window.clearTimeout(startWeatherRetryTimeoutRef.current);
       startWeatherRetryTimeoutRef.current = null;
@@ -1013,6 +1134,9 @@ export default function App() {
     setWarmupStatus({ active: false, latestPoint: null, latestAccuracy: null });
     setMotionDebugDraft(defaultMotionDebug());
     setElapsedSeconds(0);
+    setPendingStart(false);
+    setGpsStartTimedOut(false);
+    setCountdownSeconds(null);
     setActionMessage("");
     runStartPerfRef.current = null;
     motionBucketRef.current = null;
@@ -1310,6 +1434,44 @@ export default function App() {
 
   useEffect(() => {
     if (
+      screen !== "setup" ||
+      activeRun ||
+      warmupStatus.active ||
+      warmup.armed_at_utc ||
+      permissions.geolocation_permission === "denied" ||
+      permissions.geolocation_permission === "unavailable"
+    ) {
+      return;
+    }
+    armGps(true);
+  }, [
+    activeRun,
+    armGps,
+    permissions.geolocation_permission,
+    screen,
+    warmup.armed_at_utc,
+    warmupStatus.active,
+  ]);
+
+  useEffect(() => {
+    if (
+      !pendingStart ||
+      countdownSeconds !== null ||
+      !isWarmupGpsReady(warmupStatus.latestPoint, warmupStatus.latestAccuracy)
+    ) {
+      return;
+    }
+    beginStartCountdown();
+  }, [
+    beginStartCountdown,
+    countdownSeconds,
+    pendingStart,
+    warmupStatus.latestAccuracy,
+    warmupStatus.latestPoint,
+  ]);
+
+  useEffect(() => {
+    if (
       !activeRun ||
       screen !== "live" ||
       targetCheckpointRecorded ||
@@ -1482,13 +1644,14 @@ export default function App() {
 
   useEffect(() => {
     return () => {
+      clearStartTimers();
       stopGpsWatch();
       if (startWeatherRetryTimeoutRef.current !== null) {
         window.clearTimeout(startWeatherRetryTimeoutRef.current);
       }
       void releaseWakeLock();
     };
-  }, [releaseWakeLock, stopGpsWatch]);
+  }, [clearStartTimers, releaseWakeLock, stopGpsWatch]);
 
   return (
     <main className="app-shell">
@@ -1518,14 +1681,18 @@ export default function App() {
           permissions={permissions}
           warmup={warmup}
           warmupStatus={warmupStatus}
+          pendingStart={pendingStart}
+          gpsStartTimedOut={gpsStartTimedOut}
+          countdownSeconds={countdownSeconds}
           appVisible={document.visibilityState === "visible"}
           setPreRun={setPreRun}
           onGps={requestGpsPermission}
-          onArmGps={armGps}
+          onArmGps={() => armGps(false)}
           onStopWarmup={stopWarmupWatch}
-          onMotion={requestMotionPermission}
+          onMotion={() => void requestMotionPermission(false)}
           onWakeLock={() => void requestWakeLock(false)}
-          onStart={startRun}
+          onStart={handleStartPressed}
+          onStartAnyway={() => beginStartCountdown(true)}
         />
       ) : null}
 
@@ -1668,6 +1835,9 @@ function SetupScreen({
   permissions,
   warmup,
   warmupStatus,
+  pendingStart,
+  gpsStartTimedOut,
+  countdownSeconds,
   appVisible,
   setPreRun,
   onGps,
@@ -1676,11 +1846,15 @@ function SetupScreen({
   onMotion,
   onWakeLock,
   onStart,
+  onStartAnyway,
 }: {
   preRun: PreRunState;
   permissions: PermissionState;
   warmup: PreRunGpsWarmup;
   warmupStatus: { active: boolean; latestPoint: GpsPoint | null; latestAccuracy: number | null };
+  pendingStart: boolean;
+  gpsStartTimedOut: boolean;
+  countdownSeconds: number | null;
   appVisible: boolean;
   setPreRun: (next: PreRunState) => void;
   onGps: () => void;
@@ -1689,17 +1863,26 @@ function SetupScreen({
   onMotion: () => void;
   onWakeLock: () => void;
   onStart: () => void;
+  onStartAnyway: () => void;
 }) {
-  const [motionSkipped, setMotionSkipped] = useState(false);
   const setPain = (patch: Partial<PreRunState["pain_before_run"]>) => {
     setPreRun({
       ...preRun,
       pain_before_run: { ...preRun.pain_before_run, ...patch },
     });
   };
-  const preflightItems = buildPreflightItems(preRun, permissions, warmupStatus, motionSkipped, appVisible);
+  const gpsReady = isWarmupGpsReady(warmupStatus.latestPoint, warmupStatus.latestAccuracy);
+  const preflightItems = buildPreflightItems(preRun, permissions, warmupStatus, false, appVisible);
   const preflightReady = preflightItems.every((item) => item.ok);
-  const canStart = true;
+  const canStart = countdownSeconds === null && !pendingStart;
+  const startLabel =
+    countdownSeconds !== null
+      ? String(countdownSeconds)
+      : pendingStart
+        ? "Getting GPS..."
+        : gpsReady
+          ? "Start"
+          : "Start (get GPS first)";
 
   return (
     <section className="screen-stack">
@@ -1713,17 +1896,6 @@ function SetupScreen({
         <StatusItem label="GPS" value={permissionLabel(permissions.geolocation_permission)} />
         <StatusItem label="Wake lock" value={wakeLabel(permissions.wake_lock_status)} />
         <StatusItem label="Weather" value={weatherLabel(permissions.weather_status)} />
-      </section>
-
-      <section className="button-grid">
-        <button type="button" className="secondary-button" onClick={warmupStatus.active ? onStopWarmup : onArmGps}>
-          <MapPin size={18} />
-          {warmupStatus.active ? "Stop warmup" : "Arm GPS"}
-        </button>
-        <button type="button" className="secondary-button" onClick={onWakeLock}>
-          <Lock size={18} />
-          Enable wake lock
-        </button>
       </section>
 
       {warmupStatus.active || warmup.armed_at_utc ? (
@@ -1743,6 +1915,42 @@ function SetupScreen({
         </section>
       ) : null}
 
+      {pendingStart || countdownSeconds !== null ? (
+        <section className={countdownSeconds !== null ? "target-banner countdown-banner" : "warmup-panel"}>
+          {countdownSeconds !== null ? (
+            <>
+              <strong>{countdownSeconds}</strong>
+              <span>Go on zero.</span>
+            </>
+          ) : (
+            <>
+              <div>
+                <span>Start requested</span>
+                <strong>Getting GPS</strong>
+              </div>
+              <div>
+                <span>Accuracy</span>
+                <strong>{formatAccuracy(warmupStatus.latestAccuracy)}</strong>
+              </div>
+              <div>
+                <span>Countdown</span>
+                <strong>auto-starts when ready</strong>
+              </div>
+            </>
+          )}
+        </section>
+      ) : null}
+
+      {gpsStartTimedOut ? (
+        <section className="warning-banner">
+          <strong>GPS not ready</strong>
+          <span>Keep waiting or start anyway.</span>
+          <button type="button" className="inline-warning-button" onClick={onStartAnyway}>
+            Start anyway
+          </button>
+        </section>
+      ) : null}
+
       <section className="preflight-panel">
         <div className="preflight-header">
           <strong>Preflight</strong>
@@ -1757,19 +1965,19 @@ function SetupScreen({
             </div>
           ))}
         </div>
-        <label className="preflight-check">
-          <input
-            type="checkbox"
-            checked={motionSkipped}
-            onChange={(event) => setMotionSkipped(event.target.checked)}
-          />
-          Skip motion for this run
-        </label>
       </section>
 
       <details className="form-panel">
         <summary>Edit details</summary>
         <section className="button-grid">
+          <button type="button" className="secondary-button" onClick={warmupStatus.active ? onStopWarmup : onArmGps}>
+            <MapPin size={18} />
+            {warmupStatus.active ? "Stop GPS warmup" : "Arm GPS"}
+          </button>
+          <button type="button" className="secondary-button" onClick={onWakeLock}>
+            <Lock size={18} />
+            Enable wake lock
+          </button>
           <button type="button" className="secondary-button" onClick={onGps}>
             <MapPin size={18} />
             Request GPS
@@ -2037,7 +2245,7 @@ function SetupScreen({
 
       <button type="button" className="primary-button sticky-action" onClick={onStart} disabled={!canStart}>
         <Play size={20} />
-        {warmup.armed_at_utc ? "Start actual run" : "Start run"}
+        {startLabel}
       </button>
     </section>
   );
@@ -2847,33 +3055,24 @@ function buildPreflightItems(
 ) {
   const gpsOk =
     warmupStatus.latestAccuracy !== null && warmupStatus.latestAccuracy <= ACCEPTABLE_GPS_ACCURACY_METERS;
-  const motionOk =
-    motionSkipped ||
-    permissions.device_motion_permission === "ready" ||
-    permissions.device_motion_permission === "denied" ||
-    permissions.device_motion_permission === "unavailable";
+  const motionOk = true;
   const targetOk = Number.isFinite(preRun.intended_distance_meters) && preRun.intended_distance_meters >= 100;
 
   return [
     {
       label: "GPS warmed",
       ok: gpsOk,
-      detail: gpsOk ? formatAccuracy(warmupStatus.latestAccuracy) : "arm GPS and wait for <=25 m",
+      detail: gpsOk ? formatAccuracy(warmupStatus.latestAccuracy) : "warming automatically",
     },
     {
-      label: "Wake lock active",
-      ok: permissions.wake_lock_status === "active",
-      detail: permissions.wake_lock_status === "active" ? "screen should stay on" : "enable wake lock or keep screen on",
+      label: "Wake lock",
+      ok: permissions.wake_lock_status !== "failed",
+      detail: permissions.wake_lock_status === "active" ? "active" : "Start will request it",
     },
     {
-      label: "Motion decision",
+      label: "Motion",
       ok: motionOk,
-      detail:
-        permissions.device_motion_permission === "ready"
-          ? "motion ready"
-          : motionSkipped
-            ? "motion skipped"
-            : "request motion or skip it",
+      detail: permissions.device_motion_permission === "ready" ? "will record if samples arrive" : "optional; Start will try once",
     },
     {
       label: "App visible",
@@ -3463,6 +3662,17 @@ function warmupReadyLabel(accuracy: number | null): string {
     return "warming";
   }
   return accuracy <= ACCEPTABLE_GPS_ACCURACY_METERS ? "GPS ready" : "improving";
+}
+
+function isWarmupGpsReady(point: GpsPoint | null, accuracy: number | null): boolean {
+  if (!point || accuracy === null || accuracy > GPS_READY_ACCURACY_METERS) {
+    return false;
+  }
+  const fixTime = Date.parse(point.timestamp_utc);
+  if (!Number.isFinite(fixTime)) {
+    return true;
+  }
+  return Date.now() - fixTime <= GPS_READY_FIX_AGE_SECONDS * 1000;
 }
 
 function nearestPointByElapsed(points: GpsPoint[], elapsedSeconds: number): GpsPoint | null {
