@@ -528,10 +528,34 @@ button {
   gap: 6px;
 }
 
+.map-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #cfddd5;
+  background: #f6faf8;
+}
+
+.map-control {
+  min-height: 36px;
+  border: 1px solid #b8ccc2;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #17372a;
+  font-weight: 900;
+}
+
+.map-control.active {
+  border-color: #12683f;
+  background: #e5f5ec;
+}
+
 .live-map {
   width: 100%;
   height: 220px;
   background: #dfe8e2;
+  touch-action: pan-x pan-y;
 }
 
 .map-frame {

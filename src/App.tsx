@@ -45,9 +45,12 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.8";
+const APP_VERSION = "0.1.9";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
+const IDB_DB_NAME = "greenlake_autoresearch_logger";
+const IDB_STORE_NAME = "runs";
+const IDB_ACTIVE_RUN_KEY = "active_run";
 const ROUTE_MEMORY_KEY = "greenlake_autoresearch_logger_route_memory_v0_1";
 const CURRENT_PATCH_KEY = "greenlake_autoresearch_logger_current_patch_v0_1";
 const MSGPACK_MIME = "application/msgpack";
@@ -98,6 +101,9 @@ interface MotionBucket {
 
 interface ExportArtifacts {
   json_bytes: number;
+  coach_summary_json: string;
+  coach_summary_bytes: number;
+  coach_summary_filename: string;
   msgpack_bytes: Uint8Array;
   msgpack_filename: string;
   zip_bytes: Uint8Array;
@@ -216,6 +222,8 @@ function defaultFinalization(): FinalizationDiagnostics {
     post_stop_callback_count: 0,
     total_callbacks_seen: null,
     post_stop_first_callback_classification: null,
+    gps_callback_cleanup_status: "clean",
+    cleanup_failed: false,
   };
 }
 
@@ -275,7 +283,7 @@ export default function App() {
   const [permissions, setPermissions] = useState<PermissionState>(initialRun?.permissions ?? defaultPermissions);
   const [activeRun, setActiveRun] = useState<ActiveRun | null>(initialRun);
   const [screen, setScreen] = useState<Screen>(
-    initialRun ? (initialRun.run_metadata.end_time_utc ? "export" : "live") : "setup",
+    initialRun ? "recovery" : "setup",
   );
   const [elapsedSeconds, setElapsedSeconds] = useState(initialRun?.elapsed_offset_seconds ?? 0);
   const [exportCreatedAt, setExportCreatedAt] = useState(new Date().toISOString());
@@ -293,6 +301,7 @@ export default function App() {
   const [pwaState, setPwaState] = useState<PwaState>(initialRun?.pwa_state ?? detectPwaState());
 
   const gpsWatchIdRef = useRef<number | null>(null);
+  const gpsWatchIdsRef = useRef<Set<number>>(new Set());
   const warmupWatchIdRef = useRef<number | null>(null);
   const elapsedSecondsRef = useRef(initialRun?.elapsed_offset_seconds ?? 0);
   const runStartPerfRef = useRef<number | null>(
@@ -312,6 +321,7 @@ export default function App() {
   const activeRunRef = useRef<ActiveRun | null>(initialRun);
   const serviceWorkerRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
   const startWeatherRetryTimeoutRef = useRef<number | null>(null);
+  const recoverySuppressedRef = useRef(false);
 
   const liveStats = useMemo(
     () => computeLiveStats(activeRun?.gps_points ?? [], elapsedSeconds),
@@ -319,8 +329,8 @@ export default function App() {
   );
 
   const exportPayload = useMemo(
-    () => (activeRun ? buildExportPayload(activeRun, exportCreatedAt) : null),
-    [activeRun, exportCreatedAt],
+    () => (screen === "export" && activeRun ? buildExportPayload(activeRun, exportCreatedAt) : null),
+    [activeRun, exportCreatedAt, screen],
   );
   const exportJson = useMemo(
     () => (exportPayload ? JSON.stringify(exportPayload, null, 2) : ""),
@@ -394,12 +404,20 @@ export default function App() {
   }, []);
 
   const stopGpsWatch = useCallback(() => {
-    if (gpsWatchIdRef.current !== null && "geolocation" in navigator) {
-      navigator.geolocation.clearWatch(gpsWatchIdRef.current);
-      gpsWatchIdRef.current = null;
-      return true;
+    let cleared = false;
+    if ("geolocation" in navigator) {
+      for (const watchId of gpsWatchIdsRef.current) {
+        navigator.geolocation.clearWatch(watchId);
+        cleared = true;
+      }
+      if (gpsWatchIdRef.current !== null && !gpsWatchIdsRef.current.has(gpsWatchIdRef.current)) {
+        navigator.geolocation.clearWatch(gpsWatchIdRef.current);
+        cleared = true;
+      }
     }
-    return false;
+    gpsWatchIdsRef.current.clear();
+    gpsWatchIdRef.current = null;
+    return cleared;
   }, []);
 
   const stopWarmupWatch = useCallback(() => {
@@ -517,9 +535,12 @@ export default function App() {
       return;
     }
 
-    gpsWatchIdRef.current = navigator.geolocation.watchPosition(
+    const watchId = navigator.geolocation.watchPosition(
       (position) => {
         const elapsed = getElapsedSeconds();
+        if (activeRunRef.current && activeRunRef.current.status !== "running") {
+          stopGpsWatch();
+        }
         const pointForWeather: { current: GpsPoint | null } = { current: null };
         const pointCountForWeather: { current: number } = { current: 0 };
         stale5LoggedRef.current = false;
@@ -553,6 +574,8 @@ export default function App() {
                 total_callbacks_seen: run.gps_points.length + callbackCount,
                 post_stop_first_callback_classification:
                   run.finalization.post_stop_first_callback_classification ?? "post_stop_callback",
+                gps_callback_cleanup_status: callbackCount > 3 ? "failed" : "callbacks_after_stop",
+                cleanup_failed: true,
               },
             };
           }
@@ -593,7 +616,9 @@ export default function App() {
         timeout: 10000,
       },
     );
-  }, [appendQualityNote, fetchWeatherForRun, getElapsedSeconds, updatePermissions]);
+    gpsWatchIdRef.current = watchId;
+    gpsWatchIdsRef.current.add(watchId);
+  }, [appendQualityNote, fetchWeatherForRun, getElapsedSeconds, stopGpsWatch, updatePermissions]);
 
   const releaseWakeLock = useCallback(async () => {
     const lock = wakeLockRef.current;
@@ -751,6 +776,7 @@ export default function App() {
     setWarmup(finalWarmup);
 
     const run = createBlankRun(preRun, permissions, finalWarmup, pwaState, motionDebugDraft);
+    recoverySuppressedRef.current = false;
     setActiveRun(run);
     setElapsedSeconds(0);
     setExportCreatedAt(new Date().toISOString());
@@ -826,6 +852,8 @@ export default function App() {
           gps_watch_cleared: gpsCleared || activeRunRef.current.finalization.gps_watch_cleared,
           motion_listener_removed: true,
           gps_stale_timers_cleared: true,
+          gps_callback_cleanup_status: "clean",
+          cleanup_failed: false,
         },
       };
     }
@@ -851,6 +879,9 @@ export default function App() {
               gps_watch_cleared: gpsCleared || run.finalization.gps_watch_cleared,
               motion_listener_removed: true,
               gps_stale_timers_cleared: true,
+              gps_callback_cleanup_status:
+                run.finalization.post_stop_gps_callback_count > 0 ? "callbacks_after_stop" : "clean",
+              cleanup_failed: run.finalization.post_stop_gps_callback_count > 0,
               finish_point_source: stopPoint ? "last_valid_pre_stop_gps" : "none",
               stop_point: stopPoint,
               analysis_point_count: run.gps_points.filter((point) => point.t_elapsed_seconds <= elapsed + 0.05).length,
@@ -894,6 +925,72 @@ export default function App() {
     }
   };
 
+  const resumeRecoveredRun = () => {
+    if (!activeRun) {
+      setScreen("setup");
+      return;
+    }
+    const offset = activeRun.elapsed_offset_seconds ?? elapsedSeconds;
+    setActiveRun((run) =>
+      run
+        ? {
+            ...run,
+            status: "running",
+            run_metadata: {
+              ...run.run_metadata,
+              end_time_local: null,
+              end_time_utc: null,
+            },
+          }
+        : run,
+    );
+    runStartPerfRef.current = performance.now() - offset * 1000;
+    setElapsedSeconds(offset);
+    setScreen("live");
+    startGpsWatch();
+    void requestWakeLock(true);
+    setActionMessage("Recovered run resumed.");
+  };
+
+  const finalizeRecoveredRun = () => {
+    if (!activeRun) {
+      setScreen("setup");
+      return;
+    }
+    const now = new Date();
+    const stopElapsed = activeRun.finalization.stopped_at_elapsed_seconds ?? activeRun.elapsed_offset_seconds ?? elapsedSeconds;
+    const stopPoint = activeRun.finalization.stop_point ?? activeRun.gps_points[activeRun.gps_points.length - 1] ?? null;
+    stopGpsWatch();
+    setActiveRun((run) =>
+      run
+        ? {
+            ...run,
+            status: "stopped",
+            elapsed_offset_seconds: stopElapsed,
+            run_metadata: {
+              ...run.run_metadata,
+              end_time_local: run.run_metadata.end_time_local ?? formatLocalIso(now),
+              end_time_utc: run.run_metadata.end_time_utc ?? now.toISOString(),
+            },
+            finalization: {
+              ...run.finalization,
+              stop_clicked_at_utc: run.finalization.stop_clicked_at_utc ?? now.toISOString(),
+              stopped_at_elapsed_seconds: stopElapsed,
+              gps_watch_cleared: true,
+              motion_listener_removed: true,
+              gps_stale_timers_cleared: true,
+              finish_point_source: stopPoint ? "last_valid_pre_stop_gps" : "none",
+              stop_point: stopPoint,
+            },
+          }
+        : run,
+    );
+    runStartPerfRef.current = null;
+    setElapsedSeconds(stopElapsed);
+    setScreen("post");
+    setActionMessage("Recovered run finalized.");
+  };
+
   const discardRun = () => {
     const confirmed = window.confirm("Discard the active run and local draft?");
     if (!confirmed) {
@@ -906,7 +1003,9 @@ export default function App() {
       startWeatherRetryTimeoutRef.current = null;
     }
     void releaseWakeLock();
+    recoverySuppressedRef.current = true;
     localStorage.removeItem(STORAGE_KEY);
+    void deleteRunFromIndexedDb();
     setActiveRun(null);
     setPreRun(defaultPreRun);
     setPermissions(defaultPermissions());
@@ -993,6 +1092,17 @@ export default function App() {
     }
     downloadBlob(bytesToBlob(exportArtifacts.zip_bytes, ZIP_MIME), exportArtifacts.zip_filename);
     setActionMessage("ZIP download started.");
+  };
+
+  const downloadCoachSummary = () => {
+    if (!exportArtifacts) {
+      return;
+    }
+    downloadBlob(
+      new Blob([exportArtifacts.coach_summary_json], { type: "application/json" }),
+      exportArtifacts.coach_summary_filename,
+    );
+    setActionMessage("Coach summary download started.");
   };
 
   const copyJson = async () => {
@@ -1176,6 +1286,29 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (activeRun || recoverySuppressedRef.current) {
+      return;
+    }
+    let canceled = false;
+    void loadRunFromIndexedDb().then((storedRun) => {
+      if (canceled || !storedRun) {
+        return;
+      }
+      setActiveRun(storedRun);
+      setPreRun(storedRun.pre_run);
+      setPermissions(storedRun.permissions);
+      setWarmup(storedRun.pre_run_gps_warmup);
+      setMotionDebugDraft(storedRun.motion_debug);
+      setElapsedSeconds(storedRun.elapsed_offset_seconds);
+      setScreen("recovery");
+      setActionMessage("Recovered a saved run draft from device storage.");
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [activeRun]);
+
+  useEffect(() => {
     if (
       !activeRun ||
       screen !== "live" ||
@@ -1327,12 +1460,16 @@ export default function App() {
     if (!activeRun) {
       return;
     }
-    const savedRun: ActiveRun = {
-      ...activeRun,
-      elapsed_offset_seconds: screen === "live" ? elapsedSeconds : activeRun.elapsed_offset_seconds,
-      last_saved_at_utc: new Date().toISOString(),
-    };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(savedRun));
+    const saveId = window.setTimeout(() => {
+      const savedRun: ActiveRun = {
+        ...activeRun,
+        elapsed_offset_seconds: screen === "live" ? elapsedSeconds : activeRun.elapsed_offset_seconds,
+        last_saved_at_utc: new Date().toISOString(),
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(savedRun));
+      void saveRunToIndexedDb(savedRun);
+    }, 500);
+    return () => window.clearTimeout(saveId);
   }, [activeRun, elapsedSeconds, screen]);
 
   useEffect(() => {
@@ -1392,6 +1529,15 @@ export default function App() {
         />
       ) : null}
 
+      {screen === "recovery" && activeRun ? (
+        <RecoveryScreen
+          run={activeRun}
+          onResume={resumeRecoveredRun}
+          onFinalize={finalizeRecoveredRun}
+          onDiscard={discardRun}
+        />
+      ) : null}
+
       {screen === "live" && activeRun ? (
         <LiveScreen
           run={activeRun}
@@ -1439,11 +1585,81 @@ export default function App() {
           onCopyMsgpack={() => void copyMsgpackBase64()}
           onDownloadZip={downloadZip}
           onCopyZip={() => void copyZipBase64()}
+          onDownloadCoachSummary={downloadCoachSummary}
           onBackToPost={() => setScreen("post")}
           onDiscard={discardRun}
         />
       ) : null}
     </main>
+  );
+}
+
+function RecoveryScreen({
+  run,
+  onResume,
+  onFinalize,
+  onDiscard,
+}: {
+  run: ActiveRun;
+  onResume: () => void;
+  onFinalize: () => void;
+  onDiscard: () => void;
+}) {
+  const isStopped = Boolean(run.run_metadata.end_time_utc) || run.status === "stopped";
+  const pointCount = run.gps_points.length;
+  const savedAt = run.last_saved_at_utc ? new Date(run.last_saved_at_utc).toLocaleTimeString() : "unknown";
+
+  return (
+    <section className="screen-stack">
+      <section className="result-panel">
+        <h2>Saved run found</h2>
+        <p className="filename">
+          {pointCount} GPS points, saved {savedAt}
+        </p>
+      </section>
+
+      <section className="health-panel">
+        <div className="health-header">
+          <strong>Recovery options</strong>
+          <span>{isStopped ? "stopped draft" : "active draft"}</span>
+        </div>
+        <div className="health-grid">
+          <div className="health-item ok">
+            <span>Status</span>
+            <strong>{run.status}</strong>
+          </div>
+          <div className="health-item ok">
+            <span>Elapsed</span>
+            <strong>{formatDuration(run.elapsed_offset_seconds)}</strong>
+          </div>
+          <div className="health-item ok">
+            <span>Route</span>
+            <strong>{run.pre_run.route_name}</strong>
+          </div>
+          <div className="health-item ok">
+            <span>Patch</span>
+            <strong>{run.pre_run.active_patch_id}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section className="button-grid vertical">
+        {!isStopped ? (
+          <button type="button" className="primary-button" onClick={onResume}>
+            <Play size={18} />
+            Resume recording
+          </button>
+        ) : null}
+        <button type="button" className={isStopped ? "primary-button" : "secondary-button"} onClick={onFinalize}>
+          <Clipboard size={18} />
+          Finalize previous run
+        </button>
+        <button type="button" className="danger-button" onClick={onDiscard}>
+          <Trash2 size={18} />
+          Discard previous run
+        </button>
+      </section>
+    </section>
   );
 }
 
@@ -1849,7 +2065,9 @@ function LiveScreen({
   const remainingMeters = Math.max(0, run.pre_run.intended_distance_meters - liveStats.distanceMeters);
   const gpsStale = gpsStaleSeconds > 10;
   const strategyStatus =
-    run.pre_run.active_patch_id === CONTROLLED_START_PATCH_ID ? computeControlledStartStatus(run.gps_points) : null;
+    run.pre_run.active_patch_id === CONTROLLED_START_PATCH_ID && run.pre_run.mode === "green_lake_5k_calibration"
+      ? computeControlledStartStatus(run.gps_points)
+      : null;
 
   return (
     <section className="screen-stack live-screen">
@@ -1903,7 +2121,7 @@ function LiveScreen({
               <span>Current km</span>
               <strong>{strategyStatus.band.label}</strong>
             </div>
-            <div className={strategyStatus.status === "outside" ? "health-item warn" : "health-item ok"}>
+            <div className={strategyStatus.status === "in_band" ? "health-item ok" : "health-item warn"}>
               <span>Split pace</span>
               <strong>{formatPaceKm(strategyStatus.currentSplitSecondsPerKm)}</strong>
             </div>
@@ -1954,6 +2172,7 @@ function LiveMap({
   const mapRef = useRef<L.Map | null>(null);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
   const [tileFailure, setTileFailure] = useState(false);
+  const [followLocked, setFollowLocked] = useState(true);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) {
@@ -1962,9 +2181,12 @@ function LiveMap({
 
     const map = L.map(containerRef.current, {
       attributionControl: false,
-      zoomControl: false,
+      zoomControl: true,
       dragging: true,
+      touchZoom: true,
+      scrollWheelZoom: false,
     }).setView([47.679, -122.328], 14);
+    map.on("dragstart zoomstart", () => setFollowLocked(false));
 
     const tileLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19,
@@ -2054,10 +2276,12 @@ function LiveMap({
     }
 
     const bounds = L.latLngBounds(latLngs);
-    if (bounds.isValid()) {
+    if (followLocked && latest) {
+      map.setView([latest.lat, latest.lon], Math.max(map.getZoom(), 16), { animate: false });
+    } else if (bounds.isValid() && points.length < 5) {
       map.fitBounds(bounds.pad(0.25), { animate: false, maxZoom: 17 });
     }
-  }, [run.checkpoints, run.gps_points]);
+  }, [followLocked, run.checkpoints, run.gps_points]);
 
   return (
     <section className="map-panel">
@@ -2067,6 +2291,21 @@ function LiveMap({
           Track
         </span>
         <strong>{formatMeters(liveStats.distanceMeters)}</strong>
+      </div>
+      <div className="map-controls">
+        <button type="button" className={followLocked ? "map-control active" : "map-control"} onClick={() => setFollowLocked(true)}>
+          Lock follow
+        </button>
+        <button
+          type="button"
+          className="map-control"
+          onClick={() => {
+            mapRef.current?.invalidateSize();
+            setFollowLocked(true);
+          }}
+        >
+          Reset map
+        </button>
       </div>
       <div className="map-frame">
         <div ref={containerRef} className="live-map" />
@@ -2095,7 +2334,21 @@ function StopScreen({
   onResume: () => void;
   onDiscard: () => void;
 }) {
-  const exportPayload = buildExportPayload(run);
+  const exportPayload = useMemo(
+    () => buildExportPayload({ ...run, post_run: defaultPostRun }),
+    [
+      run.checkpoints,
+      run.elapsed_offset_seconds,
+      run.finalization,
+      run.gps_points,
+      run.motion_windows,
+      run.permissions,
+      run.pre_run,
+      run.recording_lifecycle,
+      run.run_metadata,
+      run.weather,
+    ],
+  );
   const medianAccuracy = exportPayload.gps_quality.median_horizontal_accuracy_meters as number | null;
   const activityWindow = exportPayload.activity_window;
   const activeTarget = exportPayload.active_target_distance_result;
@@ -2452,6 +2705,7 @@ function ExportScreen({
   onCopyMsgpack,
   onDownloadZip,
   onCopyZip,
+  onDownloadCoachSummary,
   onBackToPost,
   onDiscard,
 }: {
@@ -2466,6 +2720,7 @@ function ExportScreen({
   onCopyMsgpack: () => void;
   onDownloadZip: () => void;
   onCopyZip: () => void;
+  onDownloadCoachSummary: () => void;
   onBackToPost: () => void;
   onDiscard: () => void;
 }) {
@@ -2514,6 +2769,10 @@ function ExportScreen({
               <span>ZIP</span>
               <strong>{formatBytes(exportArtifacts.zip_bytes.byteLength)}</strong>
             </div>
+            <div className="health-item ok">
+              <span>Coach summary</span>
+              <strong>{formatBytes(exportArtifacts.coach_summary_bytes)}</strong>
+            </div>
           </div>
         </section>
       ) : null}
@@ -2549,6 +2808,10 @@ function ExportScreen({
         <button type="button" className="secondary-button" onClick={onCopyZip}>
           <Clipboard size={18} />
           Copy ZIP base64
+        </button>
+        <button type="button" className="secondary-button" onClick={onDownloadCoachSummary}>
+          <Download size={18} />
+          Download coach_summary.json
         </button>
       </section>
 
@@ -2643,6 +2906,7 @@ function buildRunHealth(exportPayload: ExportPayload) {
     | undefined;
   const motionSamples = motionWindows > 0 || Number(motionDebug?.sample_events_seen ?? 0) > 0;
   const shortRunUsable = exportPayload.short_run_diagnostic.short_run_usable;
+  const cleanupStatus = exportPayload.finalization.gps_callback_cleanup_status;
 
   return [
     {
@@ -2684,8 +2948,13 @@ function buildRunHealth(exportPayload: ExportPayload) {
     },
     {
       label: "Confidence",
-      value: `${exportPayload.data_quality_scores.active_window_reliability}/${distanceConfidence}`,
-      status: exportPayload.data_quality_scores.active_window_reliability === "low" ? "warn" : "ok",
+      value: `${exportPayload.data_quality_scores.analysis_reliability}/${distanceConfidence}`,
+      status: exportPayload.data_quality_scores.analysis_reliability === "low" ? "warn" : "ok",
+    },
+    {
+      label: "GPS cleanup",
+      value: cleanupStatus,
+      status: cleanupStatus === "clean" || cleanupStatus === "callbacks_after_stop" ? "ok" : "warn",
     },
     {
       label: "Motion",
@@ -2770,6 +3039,68 @@ function loadStoredRun(): ActiveRun | null {
   }
 }
 
+function openRunDatabase(): Promise<IDBDatabase | null> {
+  if (!("indexedDB" in window)) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    const request = indexedDB.open(IDB_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(IDB_STORE_NAME)) {
+        db.createObjectStore(IDB_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+  });
+}
+
+async function saveRunToIndexedDb(run: ActiveRun): Promise<void> {
+  const db = await openRunDatabase();
+  if (!db) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+    transaction.objectStore(IDB_STORE_NAME).put(run, IDB_ACTIVE_RUN_KEY);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => resolve();
+    transaction.onabort = () => resolve();
+  });
+  db.close();
+}
+
+async function loadRunFromIndexedDb(): Promise<ActiveRun | null> {
+  const db = await openRunDatabase();
+  if (!db) {
+    return null;
+  }
+  const value = await new Promise<Partial<ActiveRun> | null>((resolve) => {
+    const transaction = db.transaction(IDB_STORE_NAME, "readonly");
+    const request = transaction.objectStore(IDB_STORE_NAME).get(IDB_ACTIVE_RUN_KEY);
+    request.onsuccess = () => resolve((request.result as Partial<ActiveRun> | undefined) ?? null);
+    request.onerror = () => resolve(null);
+  });
+  db.close();
+  return value ? normalizeStoredRun(value) : null;
+}
+
+async function deleteRunFromIndexedDb(): Promise<void> {
+  const db = await openRunDatabase();
+  if (!db) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+    transaction.objectStore(IDB_STORE_NAME).delete(IDB_ACTIVE_RUN_KEY);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => resolve();
+    transaction.onabort = () => resolve();
+  });
+  db.close();
+}
+
 function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
   const postRun = {
     ...defaultPostRun,
@@ -2848,12 +3179,39 @@ function saveCurrentPatchId(patchId: string) {
 
 function buildExportArtifacts(exportPayload: ExportPayload, exportJson: string, jsonFilename: string): ExportArtifacts {
   const msgpackBytes = encodeMsgpack(exportPayload);
+  const coachSummaryJson = JSON.stringify(buildCompactCoachSummary(exportPayload), null, 2);
   return {
     json_bytes: new TextEncoder().encode(exportJson).byteLength,
+    coach_summary_json: coachSummaryJson,
+    coach_summary_bytes: new TextEncoder().encode(coachSummaryJson).byteLength,
+    coach_summary_filename: replaceFileExtension(jsonFilename, ".coach_summary.json"),
     msgpack_bytes: msgpackBytes,
     msgpack_filename: replaceFileExtension(jsonFilename, ".msgpack"),
     zip_bytes: zipSync({ [jsonFilename]: strToU8(exportJson) }, { level: 9 }),
     zip_filename: replaceFileExtension(jsonFilename, ".json.zip"),
+  };
+}
+
+function buildCompactCoachSummary(exportPayload: ExportPayload) {
+  return {
+    schema_version: exportPayload.schema_version,
+    app_version: exportPayload.app.version,
+    run_id: exportPayload.run_metadata.run_id ?? null,
+    created_at_utc: exportPayload.app.created_at_utc,
+    run_classification: exportPayload.run_classification,
+    route_direction: exportPayload.route_direction,
+    route_snapping: exportPayload.route_snapping,
+    active_target_distance_result: exportPayload.active_target_distance_result,
+    active_target_distance_splits: {
+      kilometers: exportPayload.active_target_distance_splits.kilometers,
+      fixed_500m: exportPayload.active_target_distance_splits.fixed_500m,
+    },
+    data_quality_scores: exportPayload.data_quality_scores,
+    usability: exportPayload.usability,
+    subjective_debrief: exportPayload.subjective_debrief,
+    coach_ready_summary: exportPayload.coach_ready_summary,
+    patch_execution_assessment: exportPayload.patch_execution_assessment,
+    data_quality_notes: exportPayload.data_quality_notes,
   };
 }
 
@@ -3137,16 +3495,30 @@ function computeControlledStartStatus(points: GpsPoint[]) {
     band.maxSecondsPerKm !== null &&
     currentSplitSecondsPerKm >= band.minSecondsPerKm &&
     currentSplitSecondsPerKm <= band.maxSecondsPerKm;
-  const outside =
+  const tooFast =
     currentSplitSecondsPerKm !== null &&
     band.minSecondsPerKm !== null &&
+    currentSplitSecondsPerKm < band.minSecondsPerKm;
+  const tooSlow =
+    currentSplitSecondsPerKm !== null &&
     band.maxSecondsPerKm !== null &&
-    !inBand;
+    currentSplitSecondsPerKm > band.maxSecondsPerKm;
   return {
     band,
     currentSplitSecondsPerKm,
-    status: outside ? "outside" : "ok",
-    statusLabel: band.minSecondsPerKm === null ? "steady" : inBand ? "in band" : outside ? "watch pace" : "warming",
+    status: band.minSecondsPerKm === null ? "steady" : inBand ? "in_band" : tooFast ? "too_fast" : tooSlow ? "too_slow" : "warming",
+    statusLabel:
+      band.minSecondsPerKm === null
+        ? "steady"
+        : inBand
+          ? "in band"
+          : tooFast
+            ? currentKm === 1 && currentSplitSecondsPerKm !== null && currentSplitSecondsPerKm < 330
+              ? "too fast for test"
+              : "too fast"
+            : tooSlow
+              ? "too slow"
+              : "warming",
   };
 }
 
@@ -3220,6 +3592,8 @@ function screenLabel(screen: Screen): string {
   switch (screen) {
     case "setup":
       return "pre-run";
+    case "recovery":
+      return "recovery";
     case "live":
       return "live";
     case "stop":

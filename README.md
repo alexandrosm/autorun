@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.8`
+Current version: `0.1.9`
+
+## v0.1.9 focus
+
+- Adds IndexedDB-backed run persistence with recovery choices after reload/app exit.
+- Tightens GPS watch cleanup diagnostics and separates lifecycle, sensor, and analysis reliability.
+- Adds route-snapping projection-error stats, patch execution assessment, and compact coach-summary JSON export.
+- Improves controlled-start live split feedback, map follow controls, and defers heavy export generation until export.
 
 ## v0.1.8 focus
 

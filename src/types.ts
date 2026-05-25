@@ -1,4 +1,4 @@
-export type Screen = "setup" | "live" | "stop" | "post" | "export";
+export type Screen = "setup" | "recovery" | "live" | "stop" | "post" | "export";
 export type RunStatus = "idle" | "armed" | "running" | "stopping" | "stopped" | "discarded";
 
 export type PermissionStatusText = "unknown" | "ready" | "denied" | "unavailable";
@@ -185,6 +185,9 @@ export interface ActiveTargetDistanceResult {
   active_pace_to_target_seconds_per_km: number | null;
   overshoot_meters: number | null;
   distance_recorded_meters: number | null;
+  stop_time_seconds: number | null;
+  time_after_target_seconds: number | null;
+  distance_after_target_meters: number | null;
   target_distance_confidence: "unknown" | "low" | "medium" | "high";
   target_detection_method:
     | "active_cumulative_crossing"
@@ -291,6 +294,8 @@ export interface FinalizationDiagnostics {
   post_stop_callback_count: number;
   total_callbacks_seen: number | null;
   post_stop_first_callback_classification: "post_stop_callback" | "stop_point_duplicate" | null;
+  gps_callback_cleanup_status: "clean" | "callbacks_after_stop" | "failed";
+  cleanup_failed: boolean;
 }
 
 export interface ActivityWindow {
@@ -420,6 +425,9 @@ export interface ArtifactModel {
 
 export interface DataQualityScores {
   recording_reliability_overall: "low" | "medium" | "high";
+  lifecycle_reliability: "low" | "medium" | "high";
+  sensor_reliability: "low" | "medium" | "high";
+  analysis_reliability: "low" | "medium" | "high";
   active_window_reliability: "low" | "medium" | "high";
   target_distance_confidence: "low" | "medium" | "high";
   pace_confidence: "low" | "medium" | "high";
@@ -505,6 +513,25 @@ export interface CoachReadySummary {
   };
 }
 
+export interface PatchExecutionAssessment {
+  patch_id: string;
+  intended_strategy: Record<string, string>;
+  actual_splits: Array<{
+    split_id: string;
+    distance_meters: number | null;
+    duration_seconds: number | null;
+    pace_seconds_per_km: number | null;
+    status: "too_fast" | "in_band" | "too_slow" | "not_applicable" | "unknown";
+    target_band_seconds_per_km: {
+      min: number | null;
+      max: number | null;
+    };
+  }>;
+  followed_patch: boolean;
+  evaluated_as: "record_mode_result" | "controlled_start_calibration" | "not_evaluated";
+  reason: string;
+}
+
 export interface RouteDirectionInference {
   user_selected: RouteDirection | null;
   inferred: RouteDirection;
@@ -541,6 +568,15 @@ export interface RouteSnapping {
   distance_basis: "raw_gps" | "artifact_filtered_gps" | "route_snapped";
   median_projection_error_meters: number | null;
   p90_projection_error_meters: number | null;
+  max_projection_error_meters: number | null;
+  projection_error_by_segment: Array<{
+    segment_id: string;
+    start_distance_meters: number;
+    end_distance_meters: number;
+    median_projection_error_meters: number | null;
+    p90_projection_error_meters: number | null;
+    max_projection_error_meters: number | null;
+  }>;
   off_route_event_count: number;
   route_progress_meters: number | null;
   loop_count: number | null;
@@ -661,10 +697,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.8";
+  schema_version: "0.1.9";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.8";
+    version: "0.1.9";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -747,6 +783,7 @@ export interface ExportPayload {
   current_patch: CurrentPatch;
   grounded_debrief_context: GroundedDebriefContext;
   coach_ready_summary: CoachReadySummary;
+  patch_execution_assessment: PatchExecutionAssessment;
   time_series: {
     gps_points: GpsPoint[];
     analysis_points: GpsPoint[];
