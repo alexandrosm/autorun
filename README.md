@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.6`
+Current version: `0.1.7`
+
+## v0.1.7 focus
+
+- Adds MessagePack and zipped JSON export downloads alongside raw JSON.
+- Adds clipboard base64 copies for MessagePack and zipped JSON for paste/upload testing.
+- Shows export sizes so the smallest transfer format is visible before sharing.
 
 ## v0.1.6 focus
 

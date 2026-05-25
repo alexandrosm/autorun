@@ -11,6 +11,8 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
+import { encode as encodeMsgpack } from "@msgpack/msgpack";
+import { strToU8, zipSync } from "fflate";
 import L from "leaflet";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "leaflet/dist/leaflet.css";
@@ -43,10 +45,12 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.6";
+const APP_VERSION = "0.1.7";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const ROUTE_MEMORY_KEY = "greenlake_autoresearch_logger_route_memory_v0_1";
+const MSGPACK_MIME = "application/msgpack";
+const ZIP_MIME = "application/zip";
 const MOTION_WINDOW_SECONDS = 5;
 const ACCEPTABLE_GPS_ACCURACY_METERS = 25;
 const CONTROLLED_START_PATCH_ID = "controlled_start_v1";
@@ -89,6 +93,14 @@ interface MotionBucket {
   rotationBeta: number[];
   rotationGamma: number[];
   rotationMagnitude: number[];
+}
+
+interface ExportArtifacts {
+  json_bytes: number;
+  msgpack_bytes: Uint8Array;
+  msgpack_filename: string;
+  zip_bytes: Uint8Array;
+  zip_filename: string;
 }
 
 const defaultPreRun: PreRunState = {
@@ -314,6 +326,10 @@ export default function App() {
   const exportFilename = useMemo(
     () => (activeRun ? buildExportFilename(activeRun.run_metadata.start_time_utc) : "greenlake_run_user_001.json"),
     [activeRun],
+  );
+  const exportArtifacts = useMemo(
+    () => (exportPayload ? buildExportArtifacts(exportPayload, exportJson, exportFilename) : null),
+    [exportPayload, exportJson, exportFilename],
   );
   const targetCheckpointRecorded = Boolean(
     activeRun?.checkpoints.some((checkpoint) => checkpoint.label === "target_distance_reached"),
@@ -956,16 +972,24 @@ export default function App() {
     if (!exportJson) {
       return;
     }
-    const blob = new Blob([exportJson], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = exportFilename;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    downloadBlob(new Blob([exportJson], { type: "application/json" }), exportFilename);
     setActionMessage("JSON download started.");
+  };
+
+  const downloadMsgpack = () => {
+    if (!exportArtifacts) {
+      return;
+    }
+    downloadBlob(bytesToBlob(exportArtifacts.msgpack_bytes, MSGPACK_MIME), exportArtifacts.msgpack_filename);
+    setActionMessage("MessagePack download started.");
+  };
+
+  const downloadZip = () => {
+    if (!exportArtifacts) {
+      return;
+    }
+    downloadBlob(bytesToBlob(exportArtifacts.zip_bytes, ZIP_MIME), exportArtifacts.zip_filename);
+    setActionMessage("ZIP download started.");
   };
 
   const copyJson = async () => {
@@ -977,6 +1001,30 @@ export default function App() {
       setActionMessage("JSON copied.");
     } catch {
       setActionMessage("Clipboard unavailable. Use Download JSON.");
+    }
+  };
+
+  const copyMsgpackBase64 = async () => {
+    if (!exportArtifacts) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(bytesToBase64(exportArtifacts.msgpack_bytes));
+      setActionMessage("MessagePack base64 copied.");
+    } catch {
+      setActionMessage("Clipboard unavailable. Use Download MessagePack.");
+    }
+  };
+
+  const copyZipBase64 = async () => {
+    if (!exportArtifacts) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(bytesToBase64(exportArtifacts.zip_bytes));
+      setActionMessage("ZIP base64 copied.");
+    } catch {
+      setActionMessage("Clipboard unavailable. Use Download ZIP.");
     }
   };
 
@@ -1375,10 +1423,15 @@ export default function App() {
         <ExportScreen
           exportPayload={exportPayload}
           exportJson={exportJson}
+          exportArtifacts={exportArtifacts}
           filename={exportFilename}
           onDownload={downloadJson}
           onCopy={() => void copyJson()}
           onShare={() => void shareJson()}
+          onDownloadMsgpack={downloadMsgpack}
+          onCopyMsgpack={() => void copyMsgpackBase64()}
+          onDownloadZip={downloadZip}
+          onCopyZip={() => void copyZipBase64()}
           onBackToPost={() => setScreen("post")}
           onDiscard={discardRun}
         />
@@ -2382,19 +2435,29 @@ function PostRunScreen({
 function ExportScreen({
   exportPayload,
   exportJson,
+  exportArtifacts,
   filename,
   onDownload,
   onCopy,
   onShare,
+  onDownloadMsgpack,
+  onCopyMsgpack,
+  onDownloadZip,
+  onCopyZip,
   onBackToPost,
   onDiscard,
 }: {
   exportPayload: ExportPayload | null;
   exportJson: string;
+  exportArtifacts: ExportArtifacts | null;
   filename: string;
   onDownload: () => void;
   onCopy: () => void;
   onShare: () => void;
+  onDownloadMsgpack: () => void;
+  onCopyMsgpack: () => void;
+  onDownloadZip: () => void;
+  onCopyZip: () => void;
   onBackToPost: () => void;
   onDiscard: () => void;
 }) {
@@ -2424,6 +2487,29 @@ function ExportScreen({
         </section>
       ) : null}
 
+      {exportArtifacts ? (
+        <section className="health-panel">
+          <div className="health-header">
+            <strong>Export sizes</strong>
+            <span>try smaller</span>
+          </div>
+          <div className="health-grid">
+            <div className="health-item ok">
+              <span>JSON</span>
+              <strong>{formatBytes(exportArtifacts.json_bytes)}</strong>
+            </div>
+            <div className="health-item ok">
+              <span>MessagePack</span>
+              <strong>{formatBytes(exportArtifacts.msgpack_bytes.byteLength)}</strong>
+            </div>
+            <div className="health-item ok">
+              <span>ZIP</span>
+              <strong>{formatBytes(exportArtifacts.zip_bytes.byteLength)}</strong>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
       <section className="button-grid vertical">
         <button type="button" className="primary-button" onClick={onDownload}>
           <Download size={18} />
@@ -2436,6 +2522,25 @@ function ExportScreen({
         <button type="button" className="secondary-button" onClick={onCopy}>
           <Clipboard size={18} />
           Copy JSON
+        </button>
+      </section>
+
+      <section className="button-grid vertical">
+        <button type="button" className="secondary-button" onClick={onDownloadMsgpack}>
+          <Download size={18} />
+          Download MessagePack
+        </button>
+        <button type="button" className="secondary-button" onClick={onCopyMsgpack}>
+          <Clipboard size={18} />
+          Copy MessagePack base64
+        </button>
+        <button type="button" className="secondary-button" onClick={onDownloadZip}>
+          <Download size={18} />
+          Download ZIP
+        </button>
+        <button type="button" className="secondary-button" onClick={onCopyZip}>
+          <Clipboard size={18} />
+          Copy ZIP base64
         </button>
       </section>
 
@@ -2717,6 +2822,48 @@ function saveRouteMemory(exportPayload: ExportPayload) {
   }
 }
 
+function buildExportArtifacts(exportPayload: ExportPayload, exportJson: string, jsonFilename: string): ExportArtifacts {
+  const msgpackBytes = encodeMsgpack(exportPayload);
+  return {
+    json_bytes: new TextEncoder().encode(exportJson).byteLength,
+    msgpack_bytes: msgpackBytes,
+    msgpack_filename: replaceFileExtension(jsonFilename, ".msgpack"),
+    zip_bytes: zipSync({ [jsonFilename]: strToU8(exportJson) }, { level: 9 }),
+    zip_filename: replaceFileExtension(jsonFilename, ".json.zip"),
+  };
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function bytesToBlob(bytes: Uint8Array, type: string): Blob {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return new Blob([copy.buffer], { type });
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.byteLength; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function replaceFileExtension(filename: string, extension: string): string {
+  return filename.replace(/\.json$/i, extension);
+}
+
 function createMotionBucket(start: number): MotionBucket {
   return {
     start,
@@ -2895,6 +3042,16 @@ function formatMeters(meters: number): string {
     return `${(meters / 1000).toFixed(2)} km`;
   }
   return `${Math.round(meters)} m`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+  return `${bytes} B`;
 }
 
 function formatPace(secondsPerMile: number | null): string {

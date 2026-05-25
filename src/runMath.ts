@@ -142,10 +142,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
 
   return {
-    schema_version: "0.1.6",
+    schema_version: "0.1.7",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.6",
+      version: "0.1.7",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
