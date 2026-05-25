@@ -7,6 +7,7 @@ import type {
   AnalysisSegments,
   ArtifactModel,
   CoachReadySummary,
+  CurrentPatch,
   DataQualityScores,
   ElevationGrounding,
   ExportPayload,
@@ -17,15 +18,24 @@ import type {
   GroundedDebriefContext,
   InferredRunFacts,
   InterpolationFeatures,
+  MeasurementReconciliation,
   MotionWindow,
   PermissionState,
   PostRunState,
   PreRunState,
   RecordingLifecycle,
+  RouteDirection,
+  RouteDirectionInference,
+  RouteLibrary,
+  RouteSnapping,
+  RunClassification,
   ShortRunDiagnostic,
   SplitFeature,
+  SubjectiveDebrief,
   TargetedFollowupPrompt,
   TargetDistanceResult,
+  TargetInference,
+  Usability,
 } from "./types";
 
 const METERS_PER_MILE = 1609.344;
@@ -142,10 +152,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
 
   return {
-    schema_version: "0.1.7",
+    schema_version: "0.1.8",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.7",
+      version: "0.1.8",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -201,6 +211,13 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     elevation_grounding: features.elevationGrounding,
     motion_features: features.motion,
     route_features: features.route,
+    route_direction: features.routeDirection,
+    run_classification: features.runClassification,
+    target_inference: features.targetInference,
+    route_library: features.routeLibrary,
+    route_snapping: features.routeSnapping,
+    measurement_reconciliation: features.measurementReconciliation,
+    external_observations: [],
     inferred_run_facts: features.inferredRunFacts,
     targeted_followup_prompts: features.targetedFollowupPrompts,
     analysis_segments: features.analysisSegments,
@@ -208,6 +225,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     short_run_diagnostic: features.shortRunDiagnostic,
     artifact_model: features.artifactModel,
     data_quality_scores: features.dataQualityScores,
+    usability: features.usability,
+    subjective_debrief: buildSubjectiveDebrief(run.post_run),
+    ux_prompt_policy: buildUxPromptPolicy(),
+    current_patch: buildCurrentPatch(run.pre_run.active_patch_id),
     grounded_debrief_context: features.groundedDebriefContext,
     coach_ready_summary: features.coachReadySummary,
     time_series: {
@@ -288,8 +309,12 @@ function computeFeatures(run: ActiveRun) {
   const analysisSegments = computeAnalysisSegments(activeTrack, activeStart);
   const activePartialPacing = computeActivePartialPacingFeatures(activeTrack, analysisSegments);
   const pacing = computePacingFeatures(track, splits.thirds);
-  const baseRoute = computeRouteFeatures(points, run.pre_run.route_direction, run.pre_run.route_name);
+  const routeDirection = inferRouteDirection(activePoints.length >= 2 ? activePoints : points, run.pre_run.route_direction);
   const routeTruth = classifyRoute(run.pre_run, activeDistanceMeters, distanceMeters, points);
+  const runClassification = buildRunClassification(routeTruth, run.pre_run, activeDistanceMeters, distanceMeters, points);
+  const targetInference = inferTargetDistance(run.pre_run, runClassification);
+  const routeSnapping = computeRouteSnapping(routeTruth, runClassification, points, activeDistanceMeters, distanceMeters);
+  const baseRoute = computeRouteFeatures(points, routeDirection.inferred, run.pre_run.route_name);
   const route = {
     ...baseRoute,
     route_type: routeTruth.routeType,
@@ -325,6 +350,7 @@ function computeFeatures(run: ActiveRun) {
     analysisSegments,
     dataQualityScores,
   );
+  const usability = buildUsability(dataQualityScores, greenLakeEnabled, shortRunDiagnostic, routeTruth, activeTargetDistanceResult);
   const inferredRunFacts = computeInferredRunFacts(
     activityWindow,
     activeTargetDistanceResult,
@@ -333,6 +359,10 @@ function computeFeatures(run: ActiveRun) {
     run.recording_lifecycle,
     elevationGrounding,
     motion,
+    routeTruth.routeId,
+    routeDirection.inferred,
+    routeSnapping,
+    run.weather.start_weather.fetched_at_utc !== null || run.weather.finish_weather.fetched_at_utc !== null,
   );
   const targetedFollowupPrompts = buildTargetedFollowups(inferredRunFacts, analysisSegments, activityWindow);
   const greenLakeCalibration = buildGreenLakeCalibration(
@@ -340,9 +370,17 @@ function computeFeatures(run: ActiveRun) {
     points,
     distanceMeters,
     route,
-    run.pre_run.route_direction,
+    routeDirection,
   );
   const activePacing = computePacingFeatures(activeTrack, activeTargetDistanceSplits.thirds);
+  const measurementReconciliation = buildMeasurementReconciliation(
+    durationSeconds,
+    activeDurationSeconds,
+    interpolation,
+    activeInterpolation,
+    routeSnapping,
+    dataQualityScores,
+  );
   const groundedDebriefContext = buildGroundedDebriefContext(
     run,
     activityWindow,
@@ -359,6 +397,9 @@ function computeFeatures(run: ActiveRun) {
     run.post_run,
     shortRunDiagnostic,
     activePartialPacing,
+    runClassification,
+    measurementReconciliation,
+    usability,
   );
   const notes = buildQualityNotes(
     points,
@@ -422,6 +463,12 @@ function computeFeatures(run: ActiveRun) {
     elevation,
     elevationGrounding,
     route,
+    routeDirection,
+    runClassification,
+    targetInference,
+    routeSnapping,
+    routeLibrary: buildRouteLibrary(routeTruth, points, distanceMeters, run.run_metadata.run_id),
+    measurementReconciliation,
     motion,
     inferredRunFacts,
     targetedFollowupPrompts,
@@ -429,6 +476,7 @@ function computeFeatures(run: ActiveRun) {
     greenLakeCalibration,
     artifactModel,
     dataQualityScores,
+    usability,
     groundedDebriefContext,
     coachReadySummary,
     shortRunDiagnostic,
@@ -1490,6 +1538,53 @@ function computeRouteFeatures(points: GpsPoint[], routeDirection: string, routeN
   };
 }
 
+function inferRouteDirection(points: GpsPoint[], userSelected: RouteDirection): RouteDirectionInference {
+  if (points.length < 8) {
+    return {
+      user_selected: userSelected === "unknown" ? null : userSelected,
+      inferred: userSelected === "unknown" ? "unknown" : userSelected,
+      confidence: userSelected === "unknown" ? "unknown" : "medium",
+      method: userSelected === "unknown" ? "insufficient_track" : "manual_override",
+      manual_override_used: userSelected !== "unknown",
+      signed_winding_radians: null,
+    };
+  }
+
+  const meanLat = mean(points.map((point) => point.lat)) ?? points[0].lat;
+  const meanLon = mean(points.map((point) => point.lon)) ?? points[0].lon;
+  const cosLat = Math.cos(toRadians(meanLat));
+  const angles = points.map((point) => {
+    const x = (point.lon - meanLon) * cosLat;
+    const y = point.lat - meanLat;
+    return Math.atan2(y, x);
+  });
+  let winding = 0;
+  for (let index = 1; index < angles.length; index += 1) {
+    let delta = angles[index] - angles[index - 1];
+    while (delta > Math.PI) {
+      delta -= Math.PI * 2;
+    }
+    while (delta < -Math.PI) {
+      delta += Math.PI * 2;
+    }
+    winding += delta;
+  }
+
+  const absWinding = Math.abs(winding);
+  const inferred: RouteDirection = absWinding >= Math.PI ? (winding > 0 ? "counterclockwise" : "clockwise") : "unknown";
+  const confidence: RouteDirectionInference["confidence"] =
+    inferred === "unknown" ? "unknown" : absWinding >= Math.PI * 1.6 ? "high" : "medium";
+
+  return {
+    user_selected: userSelected === "unknown" ? null : userSelected,
+    inferred,
+    confidence,
+    method: "signed_winding_around_route_centroid",
+    manual_override_used: false,
+    signed_winding_radians: round(winding, 3),
+  };
+}
+
 function computeArtifactModel(points: GpsPoint[]): ArtifactModel {
   const segmentPoints = points.slice(1);
   const plausibleSpeeds = segmentPoints.map(plausibleSpeedForPoint).filter(isNumber);
@@ -1861,6 +1956,10 @@ function computeInferredRunFacts(
   lifecycle: RecordingLifecycle,
   elevationGrounding: ElevationGrounding,
   motion: Record<string, unknown>,
+  routeId: string | null,
+  routeDirection: RouteDirection,
+  routeSnapping: RouteSnapping,
+  weatherAvailable: boolean,
 ): InferredRunFacts {
   const idle = activityWindow.idle_preamble_seconds;
   const lateFade = nullableBooleanFromNumber(activePacing.late_fade_score_seconds_per_mile, 15);
@@ -1882,6 +1981,8 @@ function computeInferredRunFacts(
   return {
     started_late: idle === null ? null : idle >= 10,
     idle_preamble_seconds: idle,
+    route_id: routeId,
+    route_direction: routeDirection,
     target_reached: activeTargetDistanceResult.target_reached,
     overshoot_meters: activeTargetDistanceResult.overshoot_meters,
     late_fade_detected: lateFade,
@@ -1891,12 +1992,15 @@ function computeInferredRunFacts(
     first_segment_slower_than_later:
       firstPace !== null && middlePace !== null && finalPace !== null ? firstPace > Math.max(middlePace, finalPace) : null,
     stop_or_slowdown_events: [],
+    slowdown_events: [],
     probable_interruptions: [],
     gps_gaps_during_active_window: activeInterpolation.gaps,
+    off_route_events: [],
     recording_backgrounded_during_active_window: hiddenDuringActive,
-    route_direction_inferred: "unknown",
-    loop_count_inferred: null,
+    route_direction_inferred: routeDirection,
+    loop_count_inferred: routeSnapping.loop_count,
     elevation_gain_loss_available: elevationGrounding.smoothed_elevation_gain_meters !== null,
+    weather_context_available: weatherAvailable,
     motion_usable: Boolean(motion.motion_usable),
   };
 }
@@ -1938,7 +2042,7 @@ function buildTargetedFollowups(
       reason: "Activity-window inference used a low-confidence fallback.",
     });
   }
-  return prompts;
+  return prompts.slice(0, 1);
 }
 
 function buildGreenLakeCalibration(
@@ -1946,7 +2050,7 @@ function buildGreenLakeCalibration(
   points: GpsPoint[],
   distanceMeters: number,
   route: Record<string, unknown>,
-  routeDirection: string,
+  routeDirection: RouteDirectionInference,
 ): GreenLakeCalibration {
   const first = points[0] ?? null;
   const last = points[points.length - 1] ?? null;
@@ -1955,8 +2059,8 @@ function buildGreenLakeCalibration(
     calibration_run_number: enabled ? 1 : 0,
     start_point: first ? pickCoursePoint(first) : null,
     finish_point: last ? pickCoursePoint(last) : null,
-    route_direction_user_selected: routeDirection === "clockwise" || routeDirection === "counterclockwise" ? routeDirection : "unknown",
-    route_direction_inferred: routeDirection === "clockwise" || routeDirection === "counterclockwise" ? routeDirection : "unknown",
+    route_direction_user_selected: routeDirection.user_selected ?? "unknown",
+    route_direction_inferred: routeDirection.inferred,
     course_fingerprint: {
       bounding_box: (route.bounding_box as Record<string, number | null> | undefined) ?? null,
       polyline_simplified: points.length > 0 ? simplifyPolyline(points) : null,
@@ -1982,7 +2086,7 @@ function classifyRoute(
     (point) => point.lat >= 47.67 && point.lat <= 47.69 && point.lon >= -122.35 && point.lon <= -122.325,
   );
   const explicitGreenLake = preRun.mode === "green_lake_5k_calibration" && !shortCue;
-  const strongGreenLakeSignal = greenLakeName && targetIs5k && activeDistanceMeters > 4500 && nearGreenLake && !shortCue;
+  const strongGreenLakeSignal = targetIs5k && activeDistanceMeters > 4500 && nearGreenLake && !shortCue;
   const greenLakeEnabled = explicitGreenLake || strongGreenLakeSignal;
   const routeType = greenLakeEnabled
     ? "green_lake_calibration"
@@ -2008,7 +2112,230 @@ function classifyRoute(
     routeType,
     routeId,
     saveForFutureMatching: Boolean(routeId),
+    nearGreenLake,
+    shortCue,
     notes,
+  };
+}
+
+function buildRunClassification(
+  routeTruth: ReturnType<typeof classifyRoute>,
+  preRun: PreRunState,
+  activeDistanceMeters: number,
+  recordedDistanceMeters: number,
+  points: GpsPoint[],
+): RunClassification {
+  const startFinish = points.length > 1 ? haversineMeters(points[0], points[points.length - 1]) : null;
+  const smallLoop = startFinish !== null && startFinish < 120 && activeDistanceMeters >= 800 && activeDistanceMeters <= 3000;
+  const reasons = [...routeTruth.notes];
+  const manualOverrides: string[] = [];
+  if (preRun.mode !== "record_mode") {
+    manualOverrides.push(`pre_run.mode=${preRun.mode}`);
+  }
+  if (routeTruth.greenLakeEnabled) {
+    reasons.push(routeTruth.nearGreenLake ? "Track fell inside the Green Lake area and covered a near-5K distance." : "User selected Green Lake calibration mode.");
+    return {
+      inferred_mode: "green_lake_5k_calibration",
+      inferred_route_type: "known_course",
+      route_id: "green_lake_5k_v1",
+      route_confidence: routeTruth.nearGreenLake && activeDistanceMeters > 4500 ? "high" : "medium",
+      mode_confidence: routeTruth.nearGreenLake && activeDistanceMeters > 4500 ? "high" : "medium",
+      reasons,
+      manual_overrides: manualOverrides,
+    };
+  }
+  if (routeTruth.shortCue || smallLoop || (activeDistanceMeters >= 800 && activeDistanceMeters <= 3000 && recordedDistanceMeters < 3200)) {
+    reasons.push(smallLoop ? "Start/finish proximity and active distance indicate a short loop route." : "Active distance fits short-run diagnostic range.");
+    return {
+      inferred_mode: "short_run_diagnostic",
+      inferred_route_type: "home_block_or_short_route",
+      route_id: "home_block_short_loop_v1",
+      route_confidence: smallLoop || routeTruth.shortCue ? "high" : "medium",
+      mode_confidence: activeDistanceMeters >= 800 ? "high" : "medium",
+      reasons,
+      manual_overrides: manualOverrides,
+    };
+  }
+  if (preRun.mode === "instrumentation_validation" || (preRun.intended_distance_meters <= 500 && recordedDistanceMeters <= 700)) {
+    reasons.push("Short target and/or selected validation mode indicate instrumentation validation.");
+    return {
+      inferred_mode: "instrumentation_validation",
+      inferred_route_type: "instrumentation_validation",
+      route_id: null,
+      route_confidence: "medium",
+      mode_confidence: "high",
+      reasons,
+      manual_overrides: manualOverrides,
+    };
+  }
+  return {
+    inferred_mode: "free_run",
+    inferred_route_type: "free_run",
+    route_id: null,
+    route_confidence: points.length > 0 ? "low" : "unknown",
+    mode_confidence: points.length > 0 ? "low" : "unknown",
+    reasons: reasons.length > 0 ? reasons : ["No known-route or short-run classifier reached medium confidence."],
+    manual_overrides: manualOverrides,
+  };
+}
+
+function inferTargetDistance(preRun: PreRunState, classification: RunClassification): TargetInference {
+  if (classification.inferred_mode === "green_lake_5k_calibration") {
+    return {
+      target_distance_meters: 5000,
+      source: "inferred_from_route_and_patch",
+      confidence: "high",
+      manual_override_used: false,
+    };
+  }
+  if (classification.inferred_mode === "short_run_diagnostic") {
+    return {
+      target_distance_meters: preRun.intended_distance_meters >= 800 && preRun.intended_distance_meters <= 3000 ? preRun.intended_distance_meters : 1500,
+      source: "inferred_from_route",
+      confidence: classification.mode_confidence === "high" ? "medium" : "low",
+      manual_override_used: false,
+    };
+  }
+  if (preRun.active_patch_id === "controlled_start_v1") {
+    return {
+      target_distance_meters: 5000,
+      source: "inferred_from_patch",
+      confidence: "medium",
+      manual_override_used: false,
+    };
+  }
+  return {
+    target_distance_meters: preRun.intended_distance_meters > 0 ? preRun.intended_distance_meters : null,
+    source: preRun.intended_distance_meters > 0 ? "manual_override" : "none",
+    confidence: preRun.intended_distance_meters > 0 ? "low" : "unknown",
+    manual_override_used: preRun.intended_distance_meters > 0,
+  };
+}
+
+function computeRouteSnapping(
+  routeTruth: ReturnType<typeof classifyRoute>,
+  classification: RunClassification,
+  points: GpsPoint[],
+  activeDistanceMeters: number,
+  recordedDistanceMeters: number,
+): RouteSnapping {
+  const greenLakeSnapped = routeTruth.greenLakeEnabled && classification.route_confidence === "high" && activeDistanceMeters >= 4990;
+  const routeId = classification.route_id;
+  return {
+    enabled: greenLakeSnapped,
+    route_id: routeId,
+    route_prior_strength: classification.route_confidence === "high" ? "high" : classification.route_confidence === "medium" ? "medium" : "none",
+    raw_gps_distance_meters: points.length > 0 ? round(recordedDistanceMeters, 2) : null,
+    artifact_filtered_gps_distance_meters: points.length > 0 ? round(activeDistanceMeters, 2) : null,
+    snapped_distance_meters: greenLakeSnapped ? 5000 : null,
+    distance_basis: greenLakeSnapped ? "route_snapped" : "artifact_filtered_gps",
+    median_projection_error_meters: null,
+    p90_projection_error_meters: null,
+    off_route_event_count: 0,
+    route_progress_meters: greenLakeSnapped ? 5000 : activeDistanceMeters > 0 ? round(activeDistanceMeters, 2) : null,
+    loop_count: inferLoopCount(points, activeDistanceMeters),
+    confidence: greenLakeSnapped ? "high" : classification.route_confidence === "high" ? "medium" : "low",
+    notes: greenLakeSnapped
+      ? ["Known-route snapping used Green Lake 5K prior distance because route confidence was high."]
+      : ["Route snapping retained artifact-filtered GPS distance until a confirmed route polyline is available."],
+  };
+}
+
+function inferLoopCount(points: GpsPoint[], activeDistanceMeters: number): number | null {
+  if (points.length < 20 || activeDistanceMeters < 500) {
+    return null;
+  }
+  const startFinish = haversineMeters(points[0], points[points.length - 1]);
+  if (startFinish > 150) {
+    return null;
+  }
+  if (activeDistanceMeters >= 800 && activeDistanceMeters <= 3000) {
+    return 1;
+  }
+  return null;
+}
+
+function buildRouteLibrary(
+  routeTruth: ReturnType<typeof classifyRoute>,
+  points: GpsPoint[],
+  distanceMeters: number,
+  runId: string,
+): RouteLibrary {
+  if (!routeTruth.routeId || points.length < 2) {
+    return { routes: [] };
+  }
+  return {
+    routes: [
+      {
+        route_id: routeTruth.routeId,
+        type: routeTruth.greenLakeEnabled ? "known_course" : "sidewalk_loop",
+        polyline: simplifyPolyline(points),
+        distance_meters: routeTruth.greenLakeEnabled ? 5000 : round(distanceMeters, 2),
+        loop_length_meters: routeTruth.greenLakeEnabled ? null : null,
+        start_zones: [],
+        finish_zones: [],
+        aliases: routeTruth.greenLakeEnabled ? ["Green Lake calibrated 5K"] : ["Home block short route"],
+        calibration_status: routeTruth.greenLakeEnabled ? "learned" : "needs_user_confirmation",
+        created_from_run_id: runId,
+        confidence: routeTruth.greenLakeEnabled ? "medium" : "low",
+      },
+    ],
+  };
+}
+
+function buildMeasurementReconciliation(
+  durationSeconds: number,
+  activeDurationSeconds: number,
+  interpolation: InterpolationFeatures,
+  activeInterpolation: InterpolationFeatures,
+  routeSnapping: RouteSnapping,
+  scores: DataQualityScores,
+): MeasurementReconciliation {
+  const chosenBasis =
+    routeSnapping.distance_basis === "route_snapped"
+      ? "route_snapped"
+      : scores.distance_confidence === "high"
+        ? "active_gps"
+        : "artifact_filtered_gps";
+  return {
+    distance_estimates: {
+      raw_gps: interpolation.raw_recorded_distance_meters,
+      artifact_filtered_gps: activeInterpolation.raw_recorded_distance_meters,
+      route_snapped: routeSnapping.snapped_distance_meters,
+      provider_speed_integral: null,
+      external_app: null,
+    },
+    time_estimates: {
+      recording_elapsed: round(durationSeconds, 2),
+      active_elapsed: round(activeDurationSeconds, 2),
+      external_app: null,
+    },
+    chosen_basis: chosenBasis,
+    confidence: routeSnapping.confidence === "high" || scores.distance_confidence === "high" ? "high" : scores.distance_confidence,
+    notes: routeSnapping.distance_basis === "route_snapped"
+      ? ["Route-snapped distance is the preferred basis for this export."]
+      : ["Artifact-filtered active GPS remains the preferred basis until route snapping is confirmed."],
+  };
+}
+
+function buildUsability(
+  scores: DataQualityScores,
+  greenLakeEnabled: boolean,
+  shortRun: ShortRunDiagnostic,
+  routeTruth: ReturnType<typeof classifyRoute>,
+  activeTargetDistanceResult: ActiveTargetDistanceResult,
+): Usability {
+  const usableForPacing = scores.usable_for_pacing_calibration || shortRun.short_run_usable;
+  const usableForFitness = greenLakeEnabled && activeTargetDistanceResult.target_reached && scores.pace_confidence !== "low";
+  return {
+    usable_for_pacing_calibration: scores.usable_for_pacing_calibration,
+    usable_for_fitness_baseline: usableForFitness,
+    usable_for_short_run_diagnostic: shortRun.short_run_usable,
+    usable_for_motion_analysis: scores.usable_for_motion_analysis,
+    usable_for_elevation_analysis: scores.usable_for_elevation_analysis ? true : "low_confidence",
+    usable_for_route_learning: Boolean(routeTruth.routeId),
+    usable_for_coach_update: usableForPacing || usableForFitness,
+    reasons: scores.reasons,
   };
 }
 
@@ -2073,6 +2400,9 @@ function buildCoachReadySummary(
   postRun: PostRunState,
   shortRun: ShortRunDiagnostic,
   partialPacing: ActivePartialPacingFeatures,
+  classification: RunClassification,
+  reconciliation: MeasurementReconciliation,
+  usability: Usability,
 ): CoachReadySummary {
   const targetTime = activeTargetDistanceResult.active_elapsed_at_target_distance_seconds;
   const firstPace = asNumber(activePacing.first_third_pace_seconds_per_mile);
@@ -2092,6 +2422,14 @@ function buildCoachReadySummary(
     shortRun.enabled && partialPacing.early_fast_then_fade_detected ? "controlled_start_v1" : recommendedPatch;
 
   return {
+    run_type: classification.inferred_mode,
+    chosen_distance_basis: reconciliation.chosen_basis,
+    active_time_seconds: reconciliation.time_estimates.active_elapsed,
+    target_time_seconds: activeTargetDistanceResult.target_reached ? targetTime : null,
+    pace_seconds_per_mile:
+      targetTime !== null && activeTargetDistanceResult.target_reached
+        ? round(targetTime / (activeTargetDistanceResult.intended_distance_meters / METERS_PER_MILE), 2)
+        : shortRun.active_pace_seconds_per_mile,
     baseline_green_lake_5k_time_seconds: greenLakeEnabled && activeTargetDistanceResult.target_reached ? targetTime : null,
     baseline_green_lake_5k_pace_seconds_per_mile:
       greenLakeEnabled && targetTime !== null
@@ -2099,9 +2437,19 @@ function buildCoachReadySummary(
         : null,
     pacing_pattern: pacingPattern,
     late_fade_seconds_per_mile: lateFade,
+    short_run_estimate_1500m_seconds: shortRun.estimated_1500m_time_seconds,
     recommended_patch_id: recommendedPatch,
     subjective_cost_available: subjectiveCostAvailable,
+    primary_limiter: postRun.primary_limiter,
+    pain_present: postRun.pain_after_run.present,
+    usable_for_runner_update: usability.usable_for_coach_update,
     usable_for_next_strategy_update: scores.usable_for_pacing_calibration && recommendedPatch !== null,
+    next_best_test:
+      recommendedPatch === "controlled_start_v1"
+        ? "controlled_start_green_lake_5k"
+        : shortRun.short_run_usable
+          ? "controlled_even_short_diagnostic"
+          : null,
     short_run: {
       usable_for_runner_update: shortRun.short_run_usable,
       estimated_1500m_time_seconds: shortRun.estimated_1500m_time_seconds,
@@ -2129,9 +2477,7 @@ function subjectiveDebriefComplete(postRun: PostRunState): boolean {
     !postRun.pain_after_run.present ||
     (Boolean(postRun.pain_after_run.location) && postRun.pain_after_run.severity_1_to_10 !== null);
   return (
-    postRun.rpe_1_to_10 !== null &&
-    postRun.energy_after_run_1_to_5 !== null &&
-    postRun.soreness_after_run !== "unknown" &&
+    (postRun.rpe_1_to_10 !== null || postRun.perceived_effort_simple !== "unknown") &&
     postRun.primary_limiter !== "unknown" &&
     painComplete
   );
@@ -2235,6 +2581,58 @@ function patchDescription(patchId: string): string {
 
 function patchThesis(patchId: string): string {
   return PATCH_LIBRARY[patchId]?.thesis ?? "Manual patch: evaluate objective split pattern against post-run subjective cost.";
+}
+
+function buildSubjectiveDebrief(postRun: PostRunState): SubjectiveDebrief {
+  const rpeSource =
+    postRun.rpe_estimation_source === "manual"
+      ? "manual"
+      : postRun.rpe_1_to_10 !== null && postRun.perceived_effort_simple !== "unknown"
+        ? "effort_label_mapping"
+        : "not_answered";
+  return {
+    effort_label: postRun.perceived_effort_simple,
+    rpe_estimated: postRun.rpe_1_to_10,
+    rpe_source: rpeSource,
+    pain_present: postRun.pain_after_run.present,
+    pain_location: postRun.pain_after_run.location,
+    pain_severity_1_to_10: postRun.pain_after_run.severity_1_to_10,
+    primary_limiter: postRun.primary_limiter,
+    free_text: postRun.free_text,
+  };
+}
+
+function buildUxPromptPolicy() {
+  return {
+    max_pre_run_required_inputs: 0,
+    max_post_run_required_inputs: 3,
+    max_adaptive_followups: 1,
+    allow_skip_all_subjective: true,
+    skip_requires_reason: false,
+  };
+}
+
+function buildCurrentPatch(patchId: string): CurrentPatch {
+  return {
+    patch_id: patchId,
+    mission:
+      patchId === "controlled_start_v1"
+        ? "Reduce late fade by controlling the opening pace."
+        : patchDescription(patchId),
+    status: "active" as const,
+    evaluation_window:
+      patchId === "controlled_start_v1" ? "next comparable Green Lake run" : "next comparable run",
+    strategy:
+      patchId === "controlled_start_v1"
+        ? {
+            km1: "5:35-5:40",
+            km2: "5:35-5:45",
+            km3: "5:40-5:50",
+            km4: "hold steady",
+            km5: "squeeze only if stable",
+          }
+        : {},
+  };
 }
 
 function exportPreRun(preRun: PreRunState) {

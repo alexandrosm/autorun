@@ -45,10 +45,11 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.7";
+const APP_VERSION = "0.1.8";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const ROUTE_MEMORY_KEY = "greenlake_autoresearch_logger_route_memory_v0_1";
+const CURRENT_PATCH_KEY = "greenlake_autoresearch_logger_current_patch_v0_1";
 const MSGPACK_MIME = "application/msgpack";
 const ZIP_MIME = "application/zip";
 const MOTION_WINDOW_SECONDS = 5;
@@ -106,12 +107,12 @@ interface ExportArtifacts {
 const defaultPreRun: PreRunState = {
   runner_id: "user_001",
   goal: "sub_25_5k",
-  route_name: "Home block short run",
-  mode: "short_run_diagnostic",
+  route_name: "Inferred from GPS",
+  mode: "record_mode",
   active_patch_id: CONTROLLED_START_PATCH_ID,
   route_direction: "unknown",
   phone_position: "unknown",
-  intended_distance_meters: 1500,
+  intended_distance_meters: 5000,
   energy_before_run_1_to_5: null,
   soreness_before_run: "unknown",
   pain_before_run: {
@@ -268,7 +269,9 @@ function createBlankRun(
 
 export default function App() {
   const [initialRun] = useState(loadStoredRun);
-  const [preRun, setPreRun] = useState<PreRunState>(initialRun?.pre_run ?? defaultPreRun);
+  const [preRun, setPreRun] = useState<PreRunState>(
+    initialRun?.pre_run ?? { ...defaultPreRun, active_patch_id: loadCurrentPatchId() },
+  );
   const [permissions, setPermissions] = useState<PermissionState>(initialRun?.permissions ?? defaultPermissions);
   const [activeRun, setActiveRun] = useState<ActiveRun | null>(initialRun);
   const [screen, setScreen] = useState<Screen>(
@@ -1337,6 +1340,10 @@ export default function App() {
   }, [pwaState]);
 
   useEffect(() => {
+    saveCurrentPatchId(preRun.active_patch_id);
+  }, [preRun.active_patch_id]);
+
+  useEffect(() => {
     return () => {
       stopGpsWatch();
       if (startWeatherRetryTimeoutRef.current !== null) {
@@ -1468,7 +1475,6 @@ function SetupScreen({
   onStart: () => void;
 }) {
   const [motionSkipped, setMotionSkipped] = useState(false);
-  const [preflightOverride, setPreflightOverride] = useState(false);
   const setPain = (patch: Partial<PreRunState["pain_before_run"]>) => {
     setPreRun({
       ...preRun,
@@ -1477,33 +1483,27 @@ function SetupScreen({
   };
   const preflightItems = buildPreflightItems(preRun, permissions, warmupStatus, motionSkipped, appVisible);
   const preflightReady = preflightItems.every((item) => item.ok);
-  const canStart = preflightReady || preflightOverride;
+  const canStart = true;
 
   return (
     <section className="screen-stack">
+      <section className="result-panel">
+        <p className="eyebrow">Today's mission</p>
+        <h2>Controlled start</h2>
+        <p className="filename">Likely route and target will be inferred from GPS. Current patch: {preRun.active_patch_id}.</p>
+      </section>
+
       <section className="status-grid">
         <StatusItem label="GPS" value={permissionLabel(permissions.geolocation_permission)} />
-        <StatusItem label="Motion" value={permissionLabel(permissions.device_motion_permission)} />
         <StatusItem label="Wake lock" value={wakeLabel(permissions.wake_lock_status)} />
         <StatusItem label="Weather" value={weatherLabel(permissions.weather_status)} />
       </section>
 
       <section className="button-grid">
-        <button type="button" className="secondary-button" onClick={onGps}>
-          <MapPin size={18} />
-          Request GPS
-        </button>
         <button type="button" className="secondary-button" onClick={warmupStatus.active ? onStopWarmup : onArmGps}>
           <MapPin size={18} />
           {warmupStatus.active ? "Stop warmup" : "Arm GPS"}
         </button>
-        <button type="button" className="secondary-button" onClick={onMotion}>
-          <Activity size={18} />
-          Request motion
-        </button>
-      </section>
-
-      <section className="button-grid">
         <button type="button" className="secondary-button" onClick={onWakeLock}>
           <Lock size={18} />
           Enable wake lock
@@ -1549,17 +1549,20 @@ function SetupScreen({
           />
           Skip motion for this run
         </label>
-        {!preflightReady ? (
-          <label className="preflight-check">
-            <input
-              type="checkbox"
-              checked={preflightOverride}
-              onChange={(event) => setPreflightOverride(event.target.checked)}
-            />
-            Start anyway
-          </label>
-        ) : null}
       </section>
+
+      <details className="form-panel">
+        <summary>Edit details</summary>
+        <section className="button-grid">
+          <button type="button" className="secondary-button" onClick={onGps}>
+            <MapPin size={18} />
+            Request GPS
+          </button>
+          <button type="button" className="secondary-button" onClick={onMotion}>
+            <Activity size={18} />
+            Request motion
+          </button>
+        </section>
 
       <button
         type="button"
@@ -1662,7 +1665,7 @@ function SetupScreen({
         </section>
       ) : null}
 
-      <section className="form-panel">
+      <section>
         <ReadonlyField label="Runner ID" value={preRun.runner_id} />
         <ReadonlyField label="Goal" value={preRun.goal} />
 
@@ -1814,6 +1817,7 @@ function SetupScreen({
           />
         </label>
       </section>
+      </details>
 
       <button type="button" className="primary-button sticky-action" onClick={onStart} disabled={!canStart}>
         <Play size={20} />
@@ -2165,11 +2169,10 @@ function PostRunScreen({
   onExport: () => void;
 }) {
   const exportPayload = buildExportPayload(run);
-  const debriefRequired =
-    run.pre_run.mode === "training_calibration" || run.pre_run.mode === "green_lake_5k_calibration";
+  const debriefRequired = false;
   const debriefComplete = subjectiveDebriefCompleteForApp(postRun);
   const skipComplete = postRun.subjective_debrief_skipped && Boolean(postRun.subjective_debrief_skip_reason?.trim());
-  const canContinue = !debriefRequired || debriefComplete || skipComplete;
+  const canContinue = true;
 
   return (
     <section className="screen-stack">
@@ -2196,6 +2199,31 @@ function PostRunScreen({
       </section>
 
       <section className="form-panel">
+        <label>
+          How did it feel?
+          <select
+            value={postRun.perceived_effort_simple}
+            onChange={(event) => {
+              const effort = event.target.value as SimpleEffort;
+              const fallbackRpe = rpeFromSimpleEffort(effort);
+              updatePostRun({
+                perceived_effort_simple: effort,
+                rpe_1_to_10: fallbackRpe,
+                rpe_estimation_source: fallbackRpe === null ? "not_answered" : "simple_effort_fallback",
+              });
+            }}
+          >
+            <option value="unknown">not sure</option>
+            <option value="easy">easy</option>
+            <option value="moderate">moderate</option>
+            <option value="hard">hard</option>
+            <option value="very_hard">very hard</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+
+        <details className="preflight-panel">
+          <summary>Optional RPE and recovery details</summary>
         <section className="preflight-panel">
           <div className="preflight-header">
             <strong>RPE anchors</strong>
@@ -2233,30 +2261,6 @@ function PostRunScreen({
         </label>
 
         <label>
-          How did it feel?
-          <select
-            value={postRun.perceived_effort_simple}
-            onChange={(event) => {
-              const effort = event.target.value as SimpleEffort;
-              const fallbackRpe = rpeFromSimpleEffort(effort);
-              updatePostRun({
-                perceived_effort_simple: effort,
-                rpe_1_to_10: fallbackRpe,
-                rpe_estimation_source: fallbackRpe === null ? "not_answered" : "simple_effort_fallback",
-              });
-            }}
-          >
-            <option value="unknown">unknown</option>
-            <option value="easy">easy</option>
-            <option value="moderate">moderate</option>
-            <option value="hard">hard</option>
-            <option value="very_hard">very hard</option>
-            <option value="max">max</option>
-            <option value="not_sure">not sure</option>
-          </select>
-        </label>
-
-        <label>
           Energy after
           <select
             value={postRun.energy_after_run_1_to_5 ?? ""}
@@ -2282,6 +2286,7 @@ function PostRunScreen({
             <SorenessOptions includeUnknown />
           </select>
         </label>
+        </details>
 
         <div className="toggle-row">
           <span>Pain after</span>
@@ -2336,6 +2341,8 @@ function PostRunScreen({
           </select>
         </label>
 
+        <details className="preflight-panel">
+          <summary>Optional recovery details</summary>
         <div className="paired-fields">
           <label>
             Immediate pulse
@@ -2376,6 +2383,7 @@ function PostRunScreen({
             <option value=">5 min">&gt;5 min</option>
           </select>
         </label>
+        </details>
 
         <label>
           Post-run note
@@ -2819,6 +2827,22 @@ function saveRouteMemory(exportPayload: ExportPayload) {
     localStorage.setItem(ROUTE_MEMORY_KEY, JSON.stringify(current));
   } catch {
     // Route memory is opportunistic; export should never depend on localStorage writes.
+  }
+}
+
+function loadCurrentPatchId(): string {
+  try {
+    return localStorage.getItem(CURRENT_PATCH_KEY) || CONTROLLED_START_PATCH_ID;
+  } catch {
+    return CONTROLLED_START_PATCH_ID;
+  }
+}
+
+function saveCurrentPatchId(patchId: string) {
+  try {
+    localStorage.setItem(CURRENT_PATCH_KEY, patchId);
+  } catch {
+    // Current patch persistence is best effort.
   }
 }
 

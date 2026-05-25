@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.7`
+Current version: `0.1.8`
+
+## v0.1.8 focus
+
+- Moves the default flow toward inference-first capture: Arm GPS, Start, Stop, then minimal subjective taps.
+- Adds inferred route direction, run classification, target inference, route snapping, measurement reconciliation, usability, prompt policy, current patch, and subjective debrief export sections.
+- Keeps compressed exports from v0.1.7.
 
 ## v0.1.7 focus
 

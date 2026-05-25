@@ -30,6 +30,7 @@ export type PrimaryLimiter =
 export type Interruption = "none" | "traffic" | "crowd" | "GPS issue" | "bathroom" | "other";
 export type BreathingRecoveredAfter = "<1 min" | "1-3 min" | "3-5 min" | ">5 min" | "unknown";
 export type SimpleEffort = "easy" | "moderate" | "hard" | "very_hard" | "max" | "not_sure" | "unknown";
+export type Confidence = "low" | "medium" | "high";
 
 export interface PainState {
   present: boolean;
@@ -346,6 +347,8 @@ export interface AnalysisSegments {
 export interface InferredRunFacts {
   started_late: boolean | null;
   idle_preamble_seconds: number | null;
+  route_id: string | null;
+  route_direction: RouteDirection;
   target_reached: boolean | null;
   overshoot_meters: number | null;
   late_fade_detected: boolean | null;
@@ -353,12 +356,15 @@ export interface InferredRunFacts {
   first_segment_faster_than_later: boolean | null;
   first_segment_slower_than_later: boolean | null;
   stop_or_slowdown_events: Record<string, unknown>[];
+  slowdown_events: Record<string, unknown>[];
   probable_interruptions: Record<string, unknown>[];
   gps_gaps_during_active_window: GpsGapInterpolation[];
+  off_route_events: Record<string, unknown>[];
   recording_backgrounded_during_active_window: boolean | null;
   route_direction_inferred: RouteDirection;
   loop_count_inferred: number | null;
   elevation_gain_loss_available: boolean | null;
+  weather_context_available: boolean | null;
   motion_usable: boolean | null;
 }
 
@@ -430,6 +436,17 @@ export interface DataQualityScores {
   reasons: string[];
 }
 
+export interface Usability {
+  usable_for_pacing_calibration: boolean;
+  usable_for_fitness_baseline: boolean;
+  usable_for_short_run_diagnostic: boolean;
+  usable_for_motion_analysis: boolean;
+  usable_for_elevation_analysis: boolean | "low_confidence";
+  usable_for_route_learning: boolean;
+  usable_for_coach_update: boolean;
+  reasons: string[];
+}
+
 export interface ShortRunDiagnostic {
   enabled: boolean;
   active_distance_meters: number | null;
@@ -461,13 +478,23 @@ export interface ActivePartialPacingFeatures {
 }
 
 export interface CoachReadySummary {
+  run_type: string | null;
+  chosen_distance_basis: string | null;
+  active_time_seconds: number | null;
+  target_time_seconds: number | null;
+  pace_seconds_per_mile: number | null;
   baseline_green_lake_5k_time_seconds: number | null;
   baseline_green_lake_5k_pace_seconds_per_mile: number | null;
   pacing_pattern: "positive_split" | "even" | "negative_split" | "unknown";
   late_fade_seconds_per_mile: number | null;
+  short_run_estimate_1500m_seconds: number | null;
   recommended_patch_id: string | null;
   subjective_cost_available: boolean;
+  primary_limiter: PrimaryLimiter;
+  pain_present: boolean;
+  usable_for_runner_update: boolean;
   usable_for_next_strategy_update: boolean;
+  next_best_test: string | null;
   short_run: {
     usable_for_runner_update: boolean;
     estimated_1500m_time_seconds: number | null;
@@ -476,6 +503,117 @@ export interface CoachReadySummary {
     interpretation: string | null;
     recommended_patch_id: string | null;
   };
+}
+
+export interface RouteDirectionInference {
+  user_selected: RouteDirection | null;
+  inferred: RouteDirection;
+  confidence: "unknown" | Confidence;
+  method: "signed_winding_around_route_centroid" | "manual_override" | "insufficient_track";
+  manual_override_used: boolean;
+  signed_winding_radians: number | null;
+}
+
+export interface RunClassification {
+  inferred_mode: RunMode | "free_run";
+  inferred_route_type: "known_course" | "home_block_or_short_route" | "instrumentation_validation" | "free_run";
+  route_id: string | null;
+  route_confidence: "unknown" | Confidence;
+  mode_confidence: "unknown" | Confidence;
+  reasons: string[];
+  manual_overrides: string[];
+}
+
+export interface TargetInference {
+  target_distance_meters: number | null;
+  source: "inferred_from_route_and_patch" | "inferred_from_route" | "inferred_from_patch" | "manual_override" | "none";
+  confidence: "unknown" | Confidence;
+  manual_override_used: boolean;
+}
+
+export interface RouteSnapping {
+  enabled: boolean;
+  route_id: string | null;
+  route_prior_strength: "none" | Confidence;
+  raw_gps_distance_meters: number | null;
+  artifact_filtered_gps_distance_meters: number | null;
+  snapped_distance_meters: number | null;
+  distance_basis: "raw_gps" | "artifact_filtered_gps" | "route_snapped";
+  median_projection_error_meters: number | null;
+  p90_projection_error_meters: number | null;
+  off_route_event_count: number;
+  route_progress_meters: number | null;
+  loop_count: number | null;
+  confidence: "unknown" | Confidence;
+  notes: string[];
+}
+
+export interface MeasurementReconciliation {
+  distance_estimates: {
+    raw_gps: number | null;
+    artifact_filtered_gps: number | null;
+    route_snapped: number | null;
+    provider_speed_integral: number | null;
+    external_app: number | null;
+  };
+  time_estimates: {
+    recording_elapsed: number | null;
+    active_elapsed: number | null;
+    external_app: number | null;
+  };
+  chosen_basis: "route_snapped" | "active_gps" | "artifact_filtered_gps" | "raw_gps";
+  confidence: "unknown" | Confidence;
+  notes: string[];
+}
+
+export interface ExternalObservation {
+  source: string;
+  reported_time_seconds: number | null;
+  reported_distance_meters: number | null;
+  notes: string;
+}
+
+export interface SubjectiveDebrief {
+  effort_label: SimpleEffort;
+  rpe_estimated: number | null;
+  rpe_source: "effort_label_mapping" | "manual" | "not_answered";
+  pain_present: boolean;
+  pain_location: string | null;
+  pain_severity_1_to_10: number | null;
+  primary_limiter: PrimaryLimiter;
+  free_text: string;
+}
+
+export interface UxPromptPolicy {
+  max_pre_run_required_inputs: number;
+  max_post_run_required_inputs: number;
+  max_adaptive_followups: number;
+  allow_skip_all_subjective: boolean;
+  skip_requires_reason: boolean;
+}
+
+export interface CurrentPatch {
+  patch_id: string;
+  mission: string;
+  status: "active" | "inactive";
+  evaluation_window: string;
+  strategy: Record<string, string>;
+}
+
+export interface RouteLibrary {
+  routes: Array<{
+    route_id: string;
+    type: "known_course" | "sidewalk_loop" | "free_run";
+    polyline: Array<[number, number]>;
+    distance_meters: number | null;
+    loop_length_meters: number | null;
+    start_zones: Record<string, unknown>[];
+    finish_zones: Record<string, unknown>[];
+    aliases: string[];
+    calibration_status: "learned" | "needs_user_confirmation";
+    created_from_run_id: string | null;
+    confidence: Confidence;
+  }>;
 }
 
 export interface GroundedDebriefContext {
@@ -523,10 +661,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.7";
+  schema_version: "0.1.8";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.7";
+    version: "0.1.8";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -589,6 +727,13 @@ export interface ExportPayload {
   elevation_grounding: ElevationGrounding;
   motion_features: Record<string, unknown>;
   route_features: Record<string, unknown>;
+  route_direction: RouteDirectionInference;
+  run_classification: RunClassification;
+  target_inference: TargetInference;
+  route_library: RouteLibrary;
+  route_snapping: RouteSnapping;
+  measurement_reconciliation: MeasurementReconciliation;
+  external_observations: ExternalObservation[];
   inferred_run_facts: InferredRunFacts;
   targeted_followup_prompts: TargetedFollowupPrompt[];
   analysis_segments: AnalysisSegments;
@@ -596,6 +741,10 @@ export interface ExportPayload {
   short_run_diagnostic: ShortRunDiagnostic;
   artifact_model: ArtifactModel;
   data_quality_scores: DataQualityScores;
+  usability: Usability;
+  subjective_debrief: SubjectiveDebrief;
+  ux_prompt_policy: UxPromptPolicy;
+  current_patch: CurrentPatch;
   grounded_debrief_context: GroundedDebriefContext;
   coach_ready_summary: CoachReadySummary;
   time_series: {
