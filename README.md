@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.11`
+Current version: `0.1.12`
+
+## v0.1.12 focus
+
+- Adds in-run notes with elapsed time, distance, GPS position, note type, tags, and free text.
+- Supports both run observations and app feedback during the run.
+- Exports `in_run_notes` in the full JSON/MessagePack/ZIP payload and compact coach summary.
 
 ## v0.1.11 focus
 

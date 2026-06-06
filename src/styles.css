@@ -598,6 +598,55 @@ button {
   text-align: center;
 }
 
+.live-note-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #cfddd5;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.live-note-panel label {
+  display: grid;
+  gap: 6px;
+  color: #17372a;
+  font-size: 0.82rem;
+  font-weight: 900;
+}
+
+.live-note-panel textarea,
+.live-note-panel select {
+  width: 100%;
+  border: 1px solid #b8ccc2;
+  border-radius: 8px;
+  padding: 10px;
+  color: #10231b;
+  font: inherit;
+}
+
+.tag-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.tag-button {
+  min-height: 36px;
+  border: 1px solid #b8ccc2;
+  border-radius: 8px;
+  background: #f6faf8;
+  color: #17372a;
+  font-weight: 900;
+  text-transform: capitalize;
+}
+
+.tag-button.active {
+  border-color: #12683f;
+  background: #e5f5ec;
+}
+
 .metric-hero {
   display: grid;
   grid-template-columns: 1fr 1fr;

@@ -24,6 +24,7 @@ import type {
   ExportPayload,
   FinalizationDiagnostics,
   GpsPoint,
+  InRunNote,
   LifecycleEvent,
   MotionWindow,
   MotionDebug,
@@ -45,7 +46,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.11";
+const APP_VERSION = "0.1.12";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -268,6 +269,7 @@ function createBlankRun(
     gps_points: [],
     motion_windows: [],
     checkpoints: [],
+    in_run_notes: [],
     data_quality_notes: [],
     recording_lifecycle: defaultRecordingLifecycle(),
     pre_run_gps_warmup: warmup,
@@ -1163,6 +1165,34 @@ export default function App() {
     setActionMessage("Checkpoint saved.");
   };
 
+  const addInRunNote = (note: Pick<InRunNote, "note_type" | "tags" | "text">) => {
+    const trimmed = note.text.trim();
+    if (!trimmed) {
+      setActionMessage("Note text is empty.");
+      return;
+    }
+    const elapsed = getElapsedSeconds();
+    setActiveRun((run) => {
+      if (!run) {
+        return run;
+      }
+      const latestPoint = run.gps_points[run.gps_points.length - 1] ?? null;
+      const inRunNote: InRunNote = {
+        note_id: `note_${run.in_run_notes.length + 1}`,
+        timestamp_utc: new Date().toISOString(),
+        t_elapsed_seconds: round(elapsed, 2),
+        distance_meters: round(liveStats.distanceMeters, 2),
+        lat: latestPoint?.lat ?? null,
+        lon: latestPoint?.lon ?? null,
+        note_type: note.note_type,
+        tags: note.tags,
+        text: trimmed,
+      };
+      return { ...run, in_run_notes: [...run.in_run_notes, inRunNote] };
+    });
+    setActionMessage("In-run note saved.");
+  };
+
   const continueToPostRun = () => {
     setScreen("post");
   };
@@ -1722,6 +1752,7 @@ export default function App() {
           targetReached={targetReached}
           gpsStaleSeconds={gpsStaleSeconds}
           onCheckpoint={addCheckpoint}
+          onAddNote={addInRunNote}
           onStop={() => void stopRun()}
           onDiscard={discardRun}
         />
@@ -2268,6 +2299,7 @@ function LiveScreen({
   targetReached,
   gpsStaleSeconds,
   onCheckpoint,
+  onAddNote,
   onStop,
   onDiscard,
 }: {
@@ -2277,6 +2309,7 @@ function LiveScreen({
   targetReached: boolean;
   gpsStaleSeconds: number;
   onCheckpoint: () => void;
+  onAddNote: (note: Pick<InRunNote, "note_type" | "tags" | "text">) => void;
   onStop: () => void;
   onDiscard: () => void;
 }) {
@@ -2366,6 +2399,7 @@ function LiveScreen({
           <Clipboard size={18} />
           Checkpoint
         </button>
+        <LiveNoteControl onAddNote={onAddNote} />
         <button type="button" className="danger-button" onClick={onStop}>
           <Square size={18} />
           Stop run
@@ -2533,6 +2567,97 @@ function LiveMap({
           </div>
         ) : null}
       </div>
+    </section>
+  );
+}
+
+const IN_RUN_NOTE_TAGS = [
+  "breathing",
+  "legs",
+  "traffic",
+  "hill",
+  "felt_good",
+  "gps",
+  "map",
+  "export",
+  "ui_lag",
+  "app_bug",
+] as const;
+
+function LiveNoteControl({
+  onAddNote,
+}: {
+  onAddNote: (note: Pick<InRunNote, "note_type" | "tags" | "text">) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [noteType, setNoteType] = useState<InRunNote["note_type"]>("run_observation");
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [text, setText] = useState("");
+
+  const toggleTag = (tag: string) => {
+    setSelectedTags((current) =>
+      current.includes(tag) ? current.filter((value) => value !== tag) : [...current, tag],
+    );
+  };
+
+  const save = () => {
+    onAddNote({ note_type: noteType, tags: selectedTags, text });
+    setText("");
+    setSelectedTags([]);
+    setOpen(false);
+  };
+
+  if (!open) {
+    return (
+      <button type="button" className="secondary-button" onClick={() => setOpen(true)}>
+        <Clipboard size={18} />
+        Note
+      </button>
+    );
+  }
+
+  return (
+    <section className="live-note-panel">
+      <div className="paired-fields">
+        <label>
+          Type
+          <select value={noteType} onChange={(event) => setNoteType(event.target.value as InRunNote["note_type"])}>
+            <option value="run_observation">run observation</option>
+            <option value="app_feedback">app feedback</option>
+            <option value="route_note">route note</option>
+            <option value="other">other</option>
+          </select>
+        </label>
+      </div>
+      <div className="tag-grid">
+        {IN_RUN_NOTE_TAGS.map((tag) => (
+          <button
+            key={tag}
+            type="button"
+            className={selectedTags.includes(tag) ? "tag-button active" : "tag-button"}
+            onClick={() => toggleTag(tag)}
+          >
+            {tag.replace(/_/g, " ")}
+          </button>
+        ))}
+      </div>
+      <label>
+        Note
+        <textarea
+          rows={3}
+          value={text}
+          placeholder="Run note or app feedback"
+          onChange={(event) => setText(event.target.value)}
+        />
+      </label>
+      <section className="button-grid">
+        <button type="button" className="secondary-button" onClick={() => setOpen(false)}>
+          Cancel
+        </button>
+        <button type="button" className="primary-button" onClick={save} disabled={!text.trim()}>
+          Save note
+        </button>
+      </section>
     </section>
   );
 }
@@ -3344,6 +3469,7 @@ function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
     gps_points: run.gps_points ?? [],
     motion_windows: run.motion_windows ?? [],
     checkpoints: run.checkpoints ?? [],
+    in_run_notes: run.in_run_notes ?? [],
     data_quality_notes: run.data_quality_notes ?? [],
     recording_lifecycle: {
       ...defaultRecordingLifecycle(),
@@ -3458,6 +3584,7 @@ function buildCompactCoachSummary(exportPayload: ExportPayload) {
     coach_ready_summary: exportPayload.coach_ready_summary,
     patch_execution_assessment: exportPayload.patch_execution_assessment,
     route_confirmation_prompt: exportPayload.route_confirmation_prompt,
+    in_run_notes: exportPayload.in_run_notes,
     data_quality_notes: exportPayload.data_quality_notes,
   };
 }

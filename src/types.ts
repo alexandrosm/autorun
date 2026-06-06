@@ -166,6 +166,18 @@ export interface Checkpoint {
   distance_meters?: number;
 }
 
+export interface InRunNote {
+  note_id: string;
+  timestamp_utc: string;
+  t_elapsed_seconds: number;
+  distance_meters: number | null;
+  lat: number | null;
+  lon: number | null;
+  note_type: "run_observation" | "app_feedback" | "route_note" | "other";
+  tags: string[];
+  text: string;
+}
+
 export interface TargetDistanceResult {
   intended_distance_meters: number;
   target_reached: boolean;
@@ -721,6 +733,7 @@ export interface ActiveRun {
   gps_points: GpsPoint[];
   motion_windows: MotionWindow[];
   checkpoints: Checkpoint[];
+  in_run_notes: InRunNote[];
   data_quality_notes: string[];
   recording_lifecycle: RecordingLifecycle;
   pre_run_gps_warmup: PreRunGpsWarmup;
@@ -743,10 +756,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.11";
+  schema_version: "0.1.12";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.11";
+    version: "0.1.12";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -846,4 +859,5 @@ export interface ExportPayload {
   post_run: Record<string, unknown>;
   data_quality_notes: string[];
   checkpoints?: Checkpoint[];
+  in_run_notes: InRunNote[];
 }
