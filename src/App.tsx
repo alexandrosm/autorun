@@ -46,12 +46,16 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.12";
+const APP_VERSION = "0.1.13";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
 const IDB_STORE_NAME = "runs";
 const IDB_ACTIVE_RUN_KEY = "active_run";
+const IDB_HISTORY_PREFIX = "completed_run:";
+const RUN_HISTORY_INDEX_KEY = "greenlake_autoresearch_logger_run_history_index_v0_1";
+const RUN_HISTORY_PAYLOAD_PREFIX = "greenlake_autoresearch_logger_run_history_payload:";
+const MAX_RUN_HISTORY_ITEMS = 50;
 const ROUTE_MEMORY_KEY = "greenlake_autoresearch_logger_route_memory_v0_1";
 const CURRENT_PATCH_KEY = "greenlake_autoresearch_logger_current_patch_v0_1";
 const MSGPACK_MIME = "application/msgpack";
@@ -113,6 +117,33 @@ interface ExportArtifacts {
   msgpack_filename: string;
   zip_bytes: Uint8Array;
   zip_filename: string;
+}
+
+interface RunHistoryEntry {
+  history_id: string;
+  run_id: string | null;
+  filename: string;
+  created_at_utc: string;
+  start_time_utc: string | null;
+  route_name: string;
+  inferred_mode: string;
+  route_id: string | null;
+  distance_meters: number | null;
+  duration_seconds: number | null;
+  target_time_seconds: number | null;
+  schema_version: string;
+  app_version: string;
+  json_bytes: number;
+  gps_point_count: number;
+  in_run_note_count: number;
+  storage_kind: "indexeddb" | "localstorage";
+}
+
+interface RunHistoryActions {
+  onDownloadJson: (entry: RunHistoryEntry) => void;
+  onDownloadMsgpack: (entry: RunHistoryEntry) => void;
+  onCopyJson: (entry: RunHistoryEntry) => void;
+  onDelete: (entry: RunHistoryEntry) => void;
 }
 
 const defaultPreRun: PreRunState = {
@@ -308,6 +339,7 @@ export default function App() {
   const [serviceWorkerUpdateReady, setServiceWorkerUpdateReady] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
   const [pwaState, setPwaState] = useState<PwaState>(initialRun?.pwa_state ?? detectPwaState());
+  const [runHistory, setRunHistory] = useState<RunHistoryEntry[]>(() => loadRunHistoryIndex());
 
   const gpsWatchIdRef = useRef<number | null>(null);
   const gpsWatchIdsRef = useRef<Set<number>>(new Set());
@@ -1200,7 +1232,13 @@ export default function App() {
   const continueToExport = () => {
     const createdAt = new Date().toISOString();
     if (activeRun) {
-      saveRouteMemory(buildExportPayload(activeRun, createdAt));
+      const payload = buildExportPayload(activeRun, createdAt);
+      const filename = buildExportFilename(activeRun.run_metadata.start_time_utc);
+      saveRouteMemory(payload);
+      void saveCompletedRunToHistory(payload, filename).then((nextHistory) => {
+        setRunHistory(nextHistory);
+        setActionMessage("Export ready. Run saved to local history.");
+      }).catch(() => setActionMessage("Export ready. Local history save failed; download still works."));
     }
     setExportCreatedAt(createdAt);
     setScreen("export");
@@ -1321,6 +1359,67 @@ export default function App() {
     } catch {
       setActionMessage("Share canceled or unavailable. Download remains available.");
     }
+  };
+
+  const loadHistoryPayload = async (entry: RunHistoryEntry): Promise<ExportPayload | null> => {
+    const payload = await loadCompletedRunFromHistory(entry.history_id);
+    if (!payload) {
+      setActionMessage("Historic run payload is unavailable on this device.");
+      return null;
+    }
+    return payload;
+  };
+
+  const downloadHistoryJson = (entry: RunHistoryEntry) => {
+    void loadHistoryPayload(entry).then((payload) => {
+      if (!payload) {
+        return;
+      }
+      downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }), entry.filename);
+      setActionMessage("Historic JSON download started.");
+    });
+  };
+
+  const downloadHistoryMsgpack = (entry: RunHistoryEntry) => {
+    void loadHistoryPayload(entry).then((payload) => {
+      if (!payload) {
+        return;
+      }
+      downloadBlob(bytesToBlob(encodeMsgpack(payload), MSGPACK_MIME), replaceFileExtension(entry.filename, ".msgpack"));
+      setActionMessage("Historic MessagePack download started.");
+    });
+  };
+
+  const copyHistoryJson = (entry: RunHistoryEntry) => {
+    void loadHistoryPayload(entry).then(async (payload) => {
+      if (!payload) {
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+        setActionMessage("Historic JSON copied.");
+      } catch {
+        setActionMessage("Clipboard unavailable. Use historic download.");
+      }
+    });
+  };
+
+  const deleteHistoryEntry = (entry: RunHistoryEntry) => {
+    const confirmed = window.confirm("Delete this saved historic run from this device?");
+    if (!confirmed) {
+      return;
+    }
+    void deleteCompletedRunFromHistory(entry.history_id).then((nextHistory) => {
+      setRunHistory(nextHistory);
+      setActionMessage("Historic run deleted from local history.");
+    });
+  };
+
+  const historyActions: RunHistoryActions = {
+    onDownloadJson: downloadHistoryJson,
+    onDownloadMsgpack: downloadHistoryMsgpack,
+    onCopyJson: copyHistoryJson,
+    onDelete: deleteHistoryEntry,
   };
 
   const installPwa = async () => {
@@ -1732,6 +1831,8 @@ export default function App() {
           onWakeLock={() => void requestWakeLock(false)}
           onStart={handleStartPressed}
           onStartAnyway={() => beginStartCountdown(true)}
+          runHistory={runHistory}
+          historyActions={historyActions}
         />
       ) : null}
 
@@ -1794,6 +1895,8 @@ export default function App() {
           onDownloadZip={downloadZip}
           onCopyZip={() => void copyZipBase64()}
           onDownloadCoachSummary={downloadCoachSummary}
+          runHistory={runHistory}
+          historyActions={historyActions}
           onBackToPost={() => setScreen("post")}
           onDiscard={discardRun}
         />
@@ -1888,6 +1991,8 @@ function SetupScreen({
   onWakeLock,
   onStart,
   onStartAnyway,
+  runHistory,
+  historyActions,
 }: {
   preRun: PreRunState;
   permissions: PermissionState;
@@ -1905,6 +2010,8 @@ function SetupScreen({
   onWakeLock: () => void;
   onStart: () => void;
   onStartAnyway: () => void;
+  runHistory: RunHistoryEntry[];
+  historyActions: RunHistoryActions;
 }) {
   const setPain = (patch: Partial<PreRunState["pain_before_run"]>) => {
     setPreRun({
@@ -2283,6 +2390,8 @@ function SetupScreen({
         </label>
       </section>
       </details>
+
+      <RunHistoryPanel entries={runHistory} actions={historyActions} />
 
       <button type="button" className="primary-button sticky-action" onClick={onStart} disabled={!canStart}>
         <Play size={20} />
@@ -3061,6 +3170,8 @@ function ExportScreen({
   onDownloadZip,
   onCopyZip,
   onDownloadCoachSummary,
+  runHistory,
+  historyActions,
   onBackToPost,
   onDiscard,
 }: {
@@ -3076,6 +3187,8 @@ function ExportScreen({
   onDownloadZip: () => void;
   onCopyZip: () => void;
   onDownloadCoachSummary: () => void;
+  runHistory: RunHistoryEntry[];
+  historyActions: RunHistoryActions;
   onBackToPost: () => void;
   onDiscard: () => void;
 }) {
@@ -3172,6 +3285,8 @@ function ExportScreen({
 
       <textarea className="json-preview" readOnly value={exportJson} />
 
+      <RunHistoryPanel entries={runHistory} actions={historyActions} currentHistoryId={exportPayload?.run_metadata.run_id as string | undefined} />
+
       <section className="button-grid">
         <button type="button" className="secondary-button" onClick={onBackToPost}>
           Edit post-run
@@ -3180,6 +3295,68 @@ function ExportScreen({
           Clear local draft
         </button>
       </section>
+    </section>
+  );
+}
+
+function RunHistoryPanel({
+  entries,
+  actions,
+  currentHistoryId,
+}: {
+  entries: RunHistoryEntry[];
+  actions: RunHistoryActions;
+  currentHistoryId?: string;
+}) {
+  return (
+    <section className="health-panel run-history-panel">
+      <div className="health-header">
+        <strong>Local run history</strong>
+        <span>{entries.length} saved</span>
+      </div>
+
+      {entries.length === 0 ? (
+        <p className="history-empty">Completed exports will be saved on this device for later download.</p>
+      ) : (
+        <div className="history-list">
+          {entries.map((entry) => {
+            const isCurrent = entry.history_id === currentHistoryId || entry.run_id === currentHistoryId;
+            return (
+              <section className={isCurrent ? "history-item current" : "history-item"} key={entry.history_id}>
+                <div className="history-main">
+                  <strong>{formatHistoryDate(entry.created_at_utc)}</strong>
+                  <span>{entry.route_name}</span>
+                  <small>
+                    {entry.inferred_mode} · {formatNullableMeters(entry.distance_meters)} ·{" "}
+                    {formatNullableDuration(entry.duration_seconds)} · {formatBytes(entry.json_bytes)}
+                  </small>
+                  <small>
+                    {entry.gps_point_count} GPS points · {entry.in_run_note_count} notes · {entry.storage_kind}
+                  </small>
+                </div>
+                <div className="history-actions">
+                  <button type="button" className="secondary-button" onClick={() => actions.onDownloadJson(entry)}>
+                    <Download size={16} />
+                    JSON
+                  </button>
+                  <button type="button" className="secondary-button" onClick={() => actions.onDownloadMsgpack(entry)}>
+                    <Download size={16} />
+                    MsgPack
+                  </button>
+                  <button type="button" className="secondary-button" onClick={() => actions.onCopyJson(entry)}>
+                    <Clipboard size={16} />
+                    Copy
+                  </button>
+                  <button type="button" className="link-button" onClick={() => actions.onDelete(entry)}>
+                    <Trash2 size={16} />
+                    Delete
+                  </button>
+                </div>
+              </section>
+            );
+          })}
+        </div>
+      )}
     </section>
   );
 }
@@ -3445,6 +3622,173 @@ async function deleteRunFromIndexedDb(): Promise<void> {
     transaction.onabort = () => resolve();
   });
   db.close();
+}
+
+async function putRunDatabaseValue(key: string, value: unknown): Promise<boolean> {
+  const db = await openRunDatabase();
+  if (!db) {
+    return false;
+  }
+  const saved = await new Promise<boolean>((resolve) => {
+    const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+    transaction.objectStore(IDB_STORE_NAME).put(value, key);
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => resolve(false);
+    transaction.onabort = () => resolve(false);
+  });
+  db.close();
+  return saved;
+}
+
+async function getRunDatabaseValue<T>(key: string): Promise<T | null> {
+  const db = await openRunDatabase();
+  if (!db) {
+    return null;
+  }
+  const value = await new Promise<T | null>((resolve) => {
+    const transaction = db.transaction(IDB_STORE_NAME, "readonly");
+    const request = transaction.objectStore(IDB_STORE_NAME).get(key);
+    request.onsuccess = () => resolve((request.result as T | undefined) ?? null);
+    request.onerror = () => resolve(null);
+  });
+  db.close();
+  return value;
+}
+
+async function deleteRunDatabaseValue(key: string): Promise<boolean> {
+  const db = await openRunDatabase();
+  if (!db) {
+    return false;
+  }
+  const deleted = await new Promise<boolean>((resolve) => {
+    const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+    transaction.objectStore(IDB_STORE_NAME).delete(key);
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => resolve(false);
+    transaction.onabort = () => resolve(false);
+  });
+  db.close();
+  return deleted;
+}
+
+function loadRunHistoryIndex(): RunHistoryEntry[] {
+  try {
+    const raw = localStorage.getItem(RUN_HISTORY_INDEX_KEY);
+    if (!raw) {
+      return [];
+    }
+    const entries = JSON.parse(raw) as Partial<RunHistoryEntry>[];
+    if (!Array.isArray(entries)) {
+      return [];
+    }
+    return entries
+      .filter((entry): entry is RunHistoryEntry => Boolean(entry.history_id && entry.filename && entry.created_at_utc))
+      .slice(0, MAX_RUN_HISTORY_ITEMS);
+  } catch {
+    return [];
+  }
+}
+
+function saveRunHistoryIndex(entries: RunHistoryEntry[]) {
+  localStorage.setItem(RUN_HISTORY_INDEX_KEY, JSON.stringify(entries.slice(0, MAX_RUN_HISTORY_ITEMS)));
+}
+
+async function saveCompletedRunToHistory(payload: ExportPayload, filename: string): Promise<RunHistoryEntry[]> {
+  const json = JSON.stringify(payload);
+  const historyId = buildHistoryId(payload);
+  let storageKind: RunHistoryEntry["storage_kind"] = "indexeddb";
+  const savedInIndexedDb = await putRunDatabaseValue(`${IDB_HISTORY_PREFIX}${historyId}`, payload);
+  if (!savedInIndexedDb) {
+    localStorage.setItem(`${RUN_HISTORY_PAYLOAD_PREFIX}${historyId}`, json);
+    storageKind = "localstorage";
+  }
+
+  const entry = buildRunHistoryEntry(payload, filename, historyId, storageKind, new TextEncoder().encode(json).byteLength);
+  const existing = loadRunHistoryIndex();
+  const next = [entry, ...existing.filter((item) => item.history_id !== historyId)].slice(0, MAX_RUN_HISTORY_ITEMS);
+  const pruned = [entry, ...existing.filter((item) => item.history_id !== historyId)].slice(MAX_RUN_HISTORY_ITEMS);
+  saveRunHistoryIndex(next);
+  await Promise.all(pruned.map((item) => deleteCompletedRunPayload(item.history_id)));
+  return next;
+}
+
+async function loadCompletedRunFromHistory(historyId: string): Promise<ExportPayload | null> {
+  const indexedDbPayload = await getRunDatabaseValue<ExportPayload>(`${IDB_HISTORY_PREFIX}${historyId}`);
+  if (indexedDbPayload) {
+    return indexedDbPayload;
+  }
+  try {
+    const raw = localStorage.getItem(`${RUN_HISTORY_PAYLOAD_PREFIX}${historyId}`);
+    return raw ? (JSON.parse(raw) as ExportPayload) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function deleteCompletedRunFromHistory(historyId: string): Promise<RunHistoryEntry[]> {
+  await deleteCompletedRunPayload(historyId);
+  const next = loadRunHistoryIndex().filter((entry) => entry.history_id !== historyId);
+  saveRunHistoryIndex(next);
+  return next;
+}
+
+async function deleteCompletedRunPayload(historyId: string): Promise<void> {
+  await deleteRunDatabaseValue(`${IDB_HISTORY_PREFIX}${historyId}`);
+  try {
+    localStorage.removeItem(`${RUN_HISTORY_PAYLOAD_PREFIX}${historyId}`);
+  } catch {
+    // Deleting history payloads is best effort.
+  }
+}
+
+function buildHistoryId(payload: ExportPayload): string {
+  return (
+    stringFromUnknown(payload.run_metadata.run_id) ??
+    stringFromUnknown(payload.run_metadata.start_time_utc) ??
+    payload.app.created_at_utc
+  ).replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function buildRunHistoryEntry(
+  payload: ExportPayload,
+  filename: string,
+  historyId: string,
+  storageKind: RunHistoryEntry["storage_kind"],
+  jsonBytes: number,
+): RunHistoryEntry {
+  const activeSummary = payload.active_summary as Record<string, unknown>;
+  const summary = payload.summary as Record<string, unknown>;
+  const distanceMeters =
+    numberFromUnknown(payload.route_snapping.snapped_distance_meters) ??
+    numberFromUnknown(payload.route_snapped_summary.route_snapped_distance_meters) ??
+    numberFromUnknown(activeSummary.distance_meters) ??
+    numberFromUnknown(summary.distance_meters);
+  const durationSeconds =
+    numberFromUnknown(payload.coach_ready_summary.target_time_seconds) ??
+    numberFromUnknown(payload.active_target_distance_result.active_elapsed_at_target_distance_seconds) ??
+    numberFromUnknown(payload.active_short_target_result.active_elapsed_at_target_seconds) ??
+    numberFromUnknown(activeSummary.duration_seconds) ??
+    numberFromUnknown(summary.duration_seconds);
+
+  return {
+    history_id: historyId,
+    run_id: stringFromUnknown(payload.run_metadata.run_id),
+    filename,
+    created_at_utc: payload.app.created_at_utc,
+    start_time_utc: stringFromUnknown(payload.run_metadata.start_time_utc),
+    route_name: stringFromUnknown(payload.pre_run.route_name) ?? payload.run_classification.route_id ?? "unknown route",
+    inferred_mode: payload.run_classification.inferred_mode,
+    route_id: payload.run_classification.route_id,
+    distance_meters: distanceMeters,
+    duration_seconds: durationSeconds,
+    target_time_seconds: payload.coach_ready_summary.target_time_seconds,
+    schema_version: payload.schema_version,
+    app_version: payload.app.version,
+    json_bytes: jsonBytes,
+    gps_point_count: payload.time_series.gps_points.length,
+    in_run_note_count: payload.in_run_notes.length,
+    storage_kind: storageKind,
+  };
 }
 
 function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
@@ -3764,6 +4108,14 @@ function numberFromInput(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function numberFromUnknown(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function stringFromUnknown(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 function rpeFromSimpleEffort(value: SimpleEffort): number | null {
   switch (value) {
     case "easy":
@@ -3793,11 +4145,19 @@ function formatDuration(seconds: number): string {
   return `${minutes}:${pad2(secs)}`;
 }
 
+function formatNullableDuration(seconds: number | null): string {
+  return seconds === null ? "unknown time" : formatDuration(seconds);
+}
+
 function formatMeters(meters: number): string {
   if (meters >= 1000) {
     return `${(meters / 1000).toFixed(2)} km`;
   }
   return `${Math.round(meters)} m`;
+}
+
+function formatNullableMeters(meters: number | null): string {
+  return meters === null ? "unknown distance" : formatMeters(meters);
 }
 
 function formatBytes(bytes: number): string {
@@ -3808,6 +4168,19 @@ function formatBytes(bytes: number): string {
     return `${Math.round(bytes / 1024)} KB`;
   }
   return `${bytes} B`;
+}
+
+function formatHistoryDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "unknown date";
+  }
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function formatPace(secondsPerMile: number | null): string {

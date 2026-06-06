@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.12`
+Current version: `0.1.13`
+
+## v0.1.13 focus
+
+- Saves completed exports into local run history on this device.
+- Keeps a small history index in `localStorage` and full historic payloads in IndexedDB for large GPS files.
+- Adds setup/export history panels with historic JSON and MessagePack download plus JSON copy.
+- Allows deleting saved historic runs from local device storage.
 
 ## v0.1.12 focus
 

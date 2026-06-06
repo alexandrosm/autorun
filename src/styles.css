@@ -647,6 +647,78 @@ button {
   background: #e5f5ec;
 }
 
+.run-history-panel {
+  margin-top: 2px;
+}
+
+.history-empty {
+  margin: 0;
+  color: #5d6e64;
+  font-size: 0.9rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.history-list {
+  display: grid;
+  max-height: 520px;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.history-item {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #cfddd5;
+  border-radius: 8px;
+  background: #f8fbf9;
+}
+
+.history-item.current {
+  border-color: #12683f;
+  background: #eef9f3;
+}
+
+.history-main {
+  display: grid;
+  gap: 4px;
+}
+
+.history-main strong,
+.history-main span,
+.history-main small {
+  overflow-wrap: anywhere;
+}
+
+.history-main strong {
+  color: #10231b;
+  font-size: 0.98rem;
+}
+
+.history-main span {
+  color: #17372a;
+  font-weight: 900;
+}
+
+.history-main small {
+  color: #5d6e64;
+  font-size: 0.78rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.history-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.history-actions button {
+  min-height: 38px;
+  padding-inline: 8px;
+}
+
 .metric-hero {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -732,6 +804,7 @@ button {
   .warmup-panel,
   .preflight-list,
   .health-grid,
+  .history-actions,
   .metric-hero,
   .metrics-grid {
     grid-template-columns: 1fr;

@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.12-in-run-notes";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.13-run-history";
 const APP_SCOPE = self.registration.scope;
 const APP_SHELL = [APP_SCOPE];
 
