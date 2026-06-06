@@ -2,7 +2,15 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.10`
+Current version: `0.1.11`
+
+## v0.1.11 focus
+
+- Adds `active_short_target_result` so short-run diagnostics can reach their own inferred targets without looking like failed 5K attempts.
+- Adds home-block route confirmation and confirmed-route snapping metadata for future short runs.
+- Exports route-snapped short summaries/splits and richer measurement reconciliation.
+- Splits pace/distance, motion, and elevation analysis reliability.
+- Upgrades short-run coach summary with latest/prior 1500m estimates, speed reserve, and next-test recommendation.
 
 ## v0.1.10 focus
 

@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.10-one-tap-start";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.11-short-target-snapping";
 const APP_SCOPE = self.registration.scope;
 const APP_SHELL = [APP_SCOPE];
 

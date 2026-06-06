@@ -293,7 +293,12 @@ export interface FinalizationDiagnostics {
   stored_analysis_point_count: number | null;
   post_stop_callback_count: number;
   total_callbacks_seen: number | null;
-  post_stop_first_callback_classification: "post_stop_callback" | "stop_point_duplicate" | null;
+  post_stop_first_callback_classification:
+    | "post_stop_callback"
+    | "stop_point_duplicate"
+    | "duplicate_stop_point"
+    | "harmless_late_callback"
+    | null;
   gps_callback_cleanup_status: "clean" | "callbacks_after_stop" | "failed";
   cleanup_failed: boolean;
 }
@@ -428,6 +433,9 @@ export interface DataQualityScores {
   lifecycle_reliability: "low" | "medium" | "high";
   sensor_reliability: "low" | "medium" | "high";
   analysis_reliability: "low" | "medium" | "high";
+  analysis_reliability_pace_distance: "low" | "medium" | "high";
+  analysis_reliability_motion: "none" | "low" | "medium" | "high";
+  analysis_reliability_elevation: "low" | "medium" | "high";
   active_window_reliability: "low" | "medium" | "high";
   target_distance_confidence: "low" | "medium" | "high";
   pace_confidence: "low" | "medium" | "high";
@@ -442,6 +450,39 @@ export interface DataQualityScores {
   usable_for_short_pacing_calibration: boolean;
   usable_for_short_speed_reserve: boolean;
   reasons: string[];
+}
+
+export interface ActiveShortTargetResult {
+  target_distance_meters: number | null;
+  target_reached: boolean;
+  active_elapsed_at_target_seconds: number | null;
+  pace_seconds_per_km: number | null;
+  pace_seconds_per_mile: number | null;
+  confidence: "unknown" | Confidence;
+  chosen_distance_basis: "route_snapped" | "active_gps" | "artifact_filtered_gps" | "raw_gps" | null;
+  diagnostic_note: string | null;
+}
+
+export interface RouteSnappedShortSummary {
+  enabled: boolean;
+  route_id: string | null;
+  route_snapped_distance_meters: number | null;
+  route_snapped_duration_seconds: number | null;
+  route_snapped_1500m_time_seconds: number | null;
+  loop_length_meters: number | null;
+  loop_count: number | null;
+  loop_progress_meters: number | null;
+  confidence: "unknown" | Confidence;
+  notes: string[];
+}
+
+export interface RouteConfirmationPrompt {
+  id: string;
+  route_id: string;
+  prompt: string;
+  reason: string;
+  eligible: boolean;
+  default_answer: "yes" | "no";
 }
 
 export interface Usability {
@@ -506,6 +547,11 @@ export interface CoachReadySummary {
   short_run: {
     usable_for_runner_update: boolean;
     estimated_1500m_time_seconds: number | null;
+    latest_estimated_1500m_time_seconds: number | null;
+    prior_best_short_1500m_estimate_seconds: number | null;
+    delta_vs_prior_best: number | null;
+    speed_reserve_vs_sub25_5k_pace_seconds: number | null;
+    recommended_next_short_test: string | null;
     comparison_to_prior_short_runs: string | null;
     comparison_to_green_lake_baseline_pace: string | null;
     interpretation: string | null;
@@ -646,7 +692,7 @@ export interface RouteLibrary {
     start_zones: Record<string, unknown>[];
     finish_zones: Record<string, unknown>[];
     aliases: string[];
-    calibration_status: "learned" | "needs_user_confirmation";
+    calibration_status: "learned" | "needs_user_confirmation" | "confirmed";
     created_from_run_id: string | null;
     confidence: Confidence;
   }>;
@@ -697,10 +743,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.10";
+  schema_version: "0.1.11";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.10";
+    version: "0.1.11";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -749,6 +795,7 @@ export interface ExportPayload {
     thirds: SplitFeature[];
   };
   active_target_distance_result: ActiveTargetDistanceResult;
+  active_short_target_result: ActiveShortTargetResult;
   active_target_distance_splits: {
     miles: SplitFeature[];
     kilometers: SplitFeature[];
@@ -768,10 +815,17 @@ export interface ExportPayload {
   target_inference: TargetInference;
   route_library: RouteLibrary;
   route_snapping: RouteSnapping;
+  route_snapped_summary: RouteSnappedShortSummary;
+  route_snapped_splits: {
+    fixed_100m: SplitFeature[];
+    fixed_200m: SplitFeature[];
+    fixed_500m: SplitFeature[];
+  };
   measurement_reconciliation: MeasurementReconciliation;
   external_observations: ExternalObservation[];
   inferred_run_facts: InferredRunFacts;
   targeted_followup_prompts: TargetedFollowupPrompt[];
+  route_confirmation_prompt: RouteConfirmationPrompt | null;
   analysis_segments: AnalysisSegments;
   green_lake_calibration: GreenLakeCalibration;
   short_run_diagnostic: ShortRunDiagnostic;

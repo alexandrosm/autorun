@@ -1,6 +1,7 @@
 import type {
   ActiveRun,
   ActivePartialPacingFeatures,
+  ActiveShortTargetResult,
   ActiveTargetDistanceResult,
   ActivityWindow,
   AnalysisSegment,
@@ -28,6 +29,8 @@ import type {
   RouteDirection,
   RouteDirectionInference,
   RouteLibrary,
+  RouteConfirmationPrompt,
+  RouteSnappedShortSummary,
   RouteSnapping,
   RunClassification,
   ShortRunDiagnostic,
@@ -66,6 +69,14 @@ const PATCH_LIBRARY: Record<string, { description: string; thesis: string }> = {
   controlled_start_v1: {
     description: "Reduce late fade by starting controlled and aiming for steadier kilometer splits.",
     thesis: "Speed access exists; sustainable 5K pace and controlled opening effort are the current limiter.",
+  },
+  controlled_start_v2: {
+    description: "Green Lake controlled-start patch with flatter first kilometer and less late fade.",
+    thesis: "Validate whether disciplined opening pace preserves enough durability to improve the final third.",
+  },
+  extend_sustainable_pace_v1: {
+    description: "Extend short-run sustainable pace with a controlled-fast 2000m diagnostic.",
+    thesis: "Short speed reserve exists; the next diagnostic should test how far controlled-fast pace can extend.",
   },
 };
 
@@ -161,10 +172,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
 
   return {
-    schema_version: "0.1.10",
+    schema_version: "0.1.11",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.10",
+      version: "0.1.11",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -213,6 +224,7 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     target_distance_result: features.targetDistanceResult,
     target_distance_splits: features.targetDistanceSplits,
     active_target_distance_result: features.activeTargetDistanceResult,
+    active_short_target_result: features.activeShortTargetResult,
     active_target_distance_splits: features.activeTargetDistanceSplits,
     pacing_features: features.pacing,
     active_partial_pacing_features: features.activePartialPacing,
@@ -225,10 +237,13 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     target_inference: features.targetInference,
     route_library: features.routeLibrary,
     route_snapping: features.routeSnapping,
+    route_snapped_summary: features.routeSnappedSummary,
+    route_snapped_splits: features.routeSnappedSplits,
     measurement_reconciliation: features.measurementReconciliation,
     external_observations: [],
     inferred_run_facts: features.inferredRunFacts,
     targeted_followup_prompts: features.targetedFollowupPrompts,
+    route_confirmation_prompt: features.routeConfirmationPrompt,
     analysis_segments: features.analysisSegments,
     green_lake_calibration: features.greenLakeCalibration,
     short_run_diagnostic: features.shortRunDiagnostic,
@@ -324,6 +339,20 @@ function computeFeatures(run: ActiveRun) {
   const runClassification = buildRunClassification(routeTruth, run.pre_run, activeDistanceMeters, distanceMeters, points);
   const targetInference = inferTargetDistance(run.pre_run, runClassification);
   const routeSnapping = computeRouteSnapping(routeTruth, runClassification, points, activeDistanceMeters, distanceMeters);
+  const activeShortTargetResult = computeActiveShortTargetResult(
+    activeTrack,
+    targetInference,
+    runClassification,
+    routeSnapping,
+    activeInterpolation,
+  );
+  const routeSnappedSummary = buildRouteSnappedShortSummary(
+    routeSnapping,
+    activeTrack,
+    activeDurationSeconds,
+    activeShortTargetResult,
+  );
+  const routeSnappedSplits = buildRouteSnappedSplits(activeTrack, routeSnappedSummary.enabled);
   const baseRoute = computeRouteFeatures(points, routeDirection.inferred, run.pre_run.route_name);
   const route = {
     ...baseRoute,
@@ -347,6 +376,7 @@ function computeFeatures(run: ActiveRun) {
     run.recording_lifecycle,
     activityWindow,
     activeTargetDistanceResult,
+    activeShortTargetResult,
     gpsQuality,
     activeInterpolation,
     elevationGrounding,
@@ -360,6 +390,7 @@ function computeFeatures(run: ActiveRun) {
     activePartialPacing,
     analysisSegments,
     dataQualityScores,
+    activeShortTargetResult,
   );
   const usability = buildUsability(dataQualityScores, greenLakeEnabled, shortRunDiagnostic, routeTruth, activeTargetDistanceResult);
   const inferredRunFacts = computeInferredRunFacts(
@@ -390,6 +421,7 @@ function computeFeatures(run: ActiveRun) {
     interpolation,
     activeInterpolation,
     routeSnapping,
+    routeSnappedSummary,
     dataQualityScores,
   );
   const patchExecutionAssessment = buildPatchExecutionAssessment(run.pre_run, activeTargetDistanceSplits);
@@ -413,6 +445,7 @@ function computeFeatures(run: ActiveRun) {
     measurementReconciliation,
     usability,
     patchExecutionAssessment,
+    activeShortTargetResult,
   );
   const notes = buildQualityNotes(
     points,
@@ -471,6 +504,7 @@ function computeFeatures(run: ActiveRun) {
     targetDistanceResult,
     targetDistanceSplits,
     activeTargetDistanceResult,
+    activeShortTargetResult,
     activeTargetDistanceSplits,
     pacing: { ...pacing, active_window: activePacing },
     elevation,
@@ -480,11 +514,14 @@ function computeFeatures(run: ActiveRun) {
     runClassification,
     targetInference,
     routeSnapping,
+    routeSnappedSummary,
+    routeSnappedSplits,
     routeLibrary: buildRouteLibrary(routeTruth, points, distanceMeters, run.run_metadata.run_id),
     measurementReconciliation,
     motion,
     inferredRunFacts,
     targetedFollowupPrompts,
+    routeConfirmationPrompt: buildRouteConfirmationPrompt(routeTruth, routeSnapping),
     analysisSegments,
     greenLakeCalibration,
     artifactModel,
@@ -569,18 +606,22 @@ function computeFinalization(run: ActiveRun, analysisPoints: GpsPoint[]): Finali
       : run.finalization?.post_stop_gps_drift_meters ?? null;
   const stopTime = run.finalization?.stop_clicked_at_utc ? Date.parse(run.finalization.stop_clicked_at_utc) : null;
   const firstLateTime = firstLate ? Date.parse(firstLate.timestamp_utc) : null;
+  const driftMeters = drift === null ? null : round(drift, 2);
+  const harmlessSingleCallback = postStopCount === 1 && (driftMeters === null || driftMeters <= 1);
   const firstLateClassification =
     firstLate && stopPoint && firstLate.timestamp_utc === stopPoint.timestamp_utc
-      ? "stop_point_duplicate"
+      ? "duplicate_stop_point"
       : firstLate && stopTime !== null && firstLateTime !== null && firstLateTime <= stopTime
-        ? "stop_point_duplicate"
-        : firstLate || postStopCount > 0
-          ? "post_stop_callback"
-          : null;
+        ? "duplicate_stop_point"
+        : harmlessSingleCallback
+          ? "harmless_late_callback"
+          : firstLate || postStopCount > 0
+            ? "post_stop_callback"
+            : null;
   const cleanupStatus: FinalizationDiagnostics["gps_callback_cleanup_status"] =
     run.finalization?.gps_callback_cleanup_status === "failed"
       ? "failed"
-      : postStopCount > 0
+      : postStopCount > 1 || (driftMeters !== null && driftMeters > 5)
         ? "callbacks_after_stop"
         : "clean";
 
@@ -597,7 +638,7 @@ function computeFinalization(run: ActiveRun, analysisPoints: GpsPoint[]): Finali
       run.finalization?.post_stop_gps_first_timestamp_utc ?? firstLate?.timestamp_utc ?? null,
     post_stop_gps_last_timestamp_utc:
       run.finalization?.post_stop_gps_last_timestamp_utc ?? lastLate?.timestamp_utc ?? null,
-    post_stop_gps_drift_meters: drift === null ? null : round(drift, 2),
+    post_stop_gps_drift_meters: driftMeters,
     points_excluded_after_stop: Math.max(run.finalization?.points_excluded_after_stop ?? 0, latePoints.length),
     analysis_point_count: analysisPoints.length,
     raw_point_count: rawPoints.length,
@@ -1122,6 +1163,66 @@ function computeActiveTargetDistanceResult(
         : method === "recording_target_with_active_tolerance"
           ? "Active track ended within tolerance of target and recording target crossing was used."
           : null,
+  };
+}
+
+function computeActiveShortTargetResult(
+  track: TrackPoint[],
+  targetInference: TargetInference,
+  classification: RunClassification,
+  routeSnapping: RouteSnapping,
+  activeInterpolation: InterpolationFeatures,
+): ActiveShortTargetResult {
+  const targetDistance = classification.inferred_mode === "short_run_diagnostic"
+    ? targetInference.target_distance_meters
+    : null;
+  const activeDistance = track.length > 0 ? track[track.length - 1].cumulative_meters : 0;
+  const snappedDistance = routeSnapping.snapped_distance_meters ?? null;
+  const chosenBasis =
+    routeSnapping.distance_basis === "route_snapped"
+      ? "route_snapped"
+      : activeInterpolation.interpolation_confidence === "high"
+        ? "active_gps"
+        : "artifact_filtered_gps";
+  const availableDistance = chosenBasis === "route_snapped" && snappedDistance !== null ? snappedDistance : activeDistance;
+
+  if (targetDistance === null || targetDistance <= 0) {
+    return {
+      target_distance_meters: null,
+      target_reached: false,
+      active_elapsed_at_target_seconds: null,
+      pace_seconds_per_km: null,
+      pace_seconds_per_mile: null,
+      confidence: "unknown",
+      chosen_distance_basis: null,
+      diagnostic_note: "Short target was not inferred for this run.",
+    };
+  }
+
+  const targetReached = availableDistance >= targetDistance;
+  const targetState = targetReached ? stateAtDistance(track, Math.min(targetDistance, activeDistance)) : null;
+  const activeStartElapsed = track[0]?.t_elapsed_seconds ?? 0;
+  const elapsed = targetState?.elapsed === undefined ? null : Math.max(0, targetState.elapsed - activeStartElapsed);
+  const confidence: ActiveShortTargetResult["confidence"] =
+    targetReached && routeSnapping.distance_basis === "route_snapped" && routeSnapping.confidence === "high"
+      ? "high"
+      : targetReached && activeInterpolation.interpolation_confidence === "high"
+        ? "high"
+        : targetReached
+          ? "medium"
+          : "low";
+
+  return {
+    target_distance_meters: targetDistance,
+    target_reached: targetReached,
+    active_elapsed_at_target_seconds: elapsed === null ? null : round(elapsed, 2),
+    pace_seconds_per_km: elapsed === null ? null : round(elapsed / (targetDistance / METERS_PER_KM), 2),
+    pace_seconds_per_mile: elapsed === null ? null : round(elapsed / (targetDistance / METERS_PER_MILE), 2),
+    confidence,
+    chosen_distance_basis: chosenBasis,
+    diagnostic_note: targetReached
+      ? `Short target used ${chosenBasis} as the distance basis.`
+      : "Short target distance was not reached.",
   };
 }
 
@@ -1826,6 +1927,7 @@ function computeDataQualityScores(
   lifecycle: RecordingLifecycle,
   activityWindow: ActivityWindow,
   activeTargetDistanceResult: ActiveTargetDistanceResult,
+  activeShortTargetResult: ActiveShortTargetResult,
   gpsQuality: Record<string, unknown>,
   activeInterpolation: InterpolationFeatures,
   elevationGrounding: ElevationGrounding,
@@ -1864,10 +1966,16 @@ function computeDataQualityScores(
     reasons.push("More than 25% of active GPS points had poor accuracy.");
   }
 
+  const targetReachedForAnalysis =
+    activeTargetDistanceResult.target_reached || activeShortTargetResult.target_reached;
+  const effectiveTargetConfidence =
+    activeShortTargetResult.target_reached && activeShortTargetResult.confidence !== "unknown"
+      ? activeShortTargetResult.confidence
+      : activeTargetDistanceResult.target_distance_confidence;
   const targetConfidence =
-    activeTargetDistanceResult.target_reached && activeReliability === "high"
+    targetReachedForAnalysis && activeReliability === "high" && effectiveTargetConfidence === "high"
       ? "high"
-      : activeTargetDistanceResult.target_reached && activeReliability === "medium"
+      : targetReachedForAnalysis && activeReliability !== "low"
         ? "medium"
         : "low";
   const distanceConfidence =
@@ -1890,14 +1998,17 @@ function computeDataQualityScores(
       : p90Accuracy <= 10 && activeInterpolation.gaps.length === 0
         ? "high"
         : "medium";
-  const analysisReliability =
+  const paceDistanceReliability =
     targetConfidence === "high" && distanceConfidence === "high" && paceConfidence === "high"
       ? "high"
       : targetConfidence === "low" || distanceConfidence === "low" || paceConfidence === "low"
         ? "low"
         : "medium";
+  const motionAnalysisReliability = motionConfidence;
+  const elevationAnalysisReliability = elevationGrounding.elevation_confidence;
+  const analysisReliability = paceDistanceReliability;
   const usableForPacingCalibration =
-    activeTargetDistanceResult.target_reached && activeReliability !== "low" && distanceConfidence !== "low";
+    targetReachedForAnalysis && activeReliability !== "low" && distanceConfidence !== "low";
   const usableForShortPacingCalibration =
     activeDistanceMeters >= 1000 &&
     activeReliability !== "low" &&
@@ -1909,7 +2020,7 @@ function computeDataQualityScores(
   const usableForElevationAnalysis = elevationGrounding.elevation_confidence !== "low";
   const greenLakeUsable = greenLakeEnabled && usableForPacingCalibration;
 
-  if (!activeTargetDistanceResult.target_reached && !usableForShortPacingCalibration) {
+  if (!targetReachedForAnalysis && !usableForShortPacingCalibration) {
     reasons.push("Target distance was not reached in the active window.");
   }
   if (!motion.motion_usable) {
@@ -1921,6 +2032,9 @@ function computeDataQualityScores(
     lifecycle_reliability: lifecycleReliability,
     sensor_reliability: sensorReliability,
     analysis_reliability: analysisReliability,
+    analysis_reliability_pace_distance: paceDistanceReliability,
+    analysis_reliability_motion: motionAnalysisReliability,
+    analysis_reliability_elevation: elevationAnalysisReliability,
     active_window_reliability: activeReliability,
     target_distance_confidence: targetConfidence,
     pace_confidence: paceConfidence,
@@ -1944,12 +2058,17 @@ function buildShortRunDiagnostic(
   partialPacing: ActivePartialPacingFeatures,
   segments: AnalysisSegments,
   scores: DataQualityScores,
+  shortTarget: ActiveShortTargetResult,
 ): ShortRunDiagnostic {
   const enabled = activeDistanceMeters >= 800 && activeDistanceMeters <= 3000;
   const activePaceSecondsPerMile =
     activeDistanceMeters > 0 ? round(activeDurationSeconds / (activeDistanceMeters / METERS_PER_MILE), 2) : null;
   const estimated1500 =
-    activeDistanceMeters > 0 ? round(activeDurationSeconds * (1500 / activeDistanceMeters), 2) : null;
+    shortTarget.target_distance_meters === 1500 && shortTarget.active_elapsed_at_target_seconds !== null
+      ? shortTarget.active_elapsed_at_target_seconds
+      : activeDistanceMeters > 0
+        ? round(activeDurationSeconds * (1500 / activeDistanceMeters), 2)
+        : null;
   const estimatedMile =
     activeDistanceMeters > 0 ? round(activeDurationSeconds * (METERS_PER_MILE / activeDistanceMeters), 2) : null;
   const limitations: string[] = [];
@@ -2096,6 +2215,28 @@ function buildTargetedFollowups(
     });
   }
   return prompts.slice(0, 1);
+}
+
+function buildRouteConfirmationPrompt(
+  routeTruth: ReturnType<typeof classifyRoute>,
+  routeSnapping: RouteSnapping,
+): RouteConfirmationPrompt | null {
+  const alreadyConfirmed = routeTruth.routeId ? loadStoredRouteMemory(routeTruth.routeId)?.calibration_status === "confirmed" : false;
+  const projectionOk =
+    routeSnapping.route_id === "home_block_short_loop_v1" &&
+    routeSnapping.p90_projection_error_meters !== null &&
+    routeSnapping.p90_projection_error_meters <= 20;
+  if (alreadyConfirmed || routeSnapping.route_id !== "home_block_short_loop_v1" || !projectionOk) {
+    return null;
+  }
+  return {
+    id: "confirm_home_block_short_route",
+    route_id: "home_block_short_loop_v1",
+    prompt: "Use this as your confirmed home-block short route?",
+    reason: "The route was classified as home-block short route and projection errors were low.",
+    eligible: true,
+    default_answer: "yes",
+  };
 }
 
 function buildGreenLakeCalibration(
@@ -2274,37 +2415,50 @@ function computeRouteSnapping(
 ): RouteSnapping {
   const greenLakeSnapped = routeTruth.greenLakeEnabled && classification.route_confidence === "high" && activeDistanceMeters >= 4990;
   const routeId = classification.route_id;
-  const storedRoutePolyline = routeId ? loadStoredRoutePolyline(routeId) : null;
+  const storedRoute = routeId ? loadStoredRouteMemory(routeId) : null;
+  const storedRoutePolyline = storedRoute?.polyline ?? null;
   const routePolyline = storedRoutePolyline ?? (points.length >= 2 ? simplifyPolyline(points) : []);
+  const routeConfirmed = storedRoute?.calibration_status === "confirmed";
+  const homeBlockSnapped = Boolean(
+    routeId === "home_block_short_loop_v1" &&
+      routeConfirmed &&
+      storedRoutePolyline &&
+      activeDistanceMeters >= 800,
+  );
   const projectionBasis = storedRoutePolyline ? "stored_route_fingerprint" : "current_route_fingerprint";
   const projection = routePolyline.length >= 2 ? computeProjectionDiagnostics(points, routePolyline) : null;
   const projectionStatsAvailable = projection !== null && projection.errorCount > 0;
   const p90Projection = projection?.p90_projection_error_meters ?? null;
+  const lowProjectionError = projectionStatsAvailable && p90Projection !== null && p90Projection <= 20;
   const highConfidenceSnap =
-    greenLakeSnapped &&
-    projectionStatsAvailable &&
-    p90Projection !== null &&
-    p90Projection <= 20;
+    (greenLakeSnapped || homeBlockSnapped) &&
+    lowProjectionError;
   const snapConfidence: RouteSnapping["confidence"] = highConfidenceSnap
     ? "high"
-    : greenLakeSnapped || classification.route_confidence === "high"
+    : greenLakeSnapped || homeBlockSnapped || classification.route_confidence === "high"
       ? "medium"
       : "low";
+  const snappedDistance = greenLakeSnapped
+    ? 5000
+    : homeBlockSnapped && storedRoute?.loop_length_meters
+      ? estimateRouteSnappedDistance(activeDistanceMeters, storedRoute.loop_length_meters)
+      : null;
+  const snappingEnabled = greenLakeSnapped || homeBlockSnapped;
   return {
-    enabled: greenLakeSnapped,
+    enabled: snappingEnabled,
     route_id: routeId,
-    route_prior_strength: classification.route_confidence === "high" ? "high" : classification.route_confidence === "medium" ? "medium" : "none",
+    route_prior_strength: homeBlockSnapped || greenLakeSnapped ? "high" : classification.route_confidence === "medium" ? "medium" : "none",
     raw_gps_distance_meters: points.length > 0 ? round(recordedDistanceMeters, 2) : null,
     artifact_filtered_gps_distance_meters: points.length > 0 ? round(activeDistanceMeters, 2) : null,
-    snapped_distance_meters: greenLakeSnapped ? 5000 : null,
-    distance_basis: greenLakeSnapped ? "route_snapped" : "artifact_filtered_gps",
+    snapped_distance_meters: snappedDistance === null ? null : round(snappedDistance, 2),
+    distance_basis: snappingEnabled ? "route_snapped" : "artifact_filtered_gps",
     median_projection_error_meters: projection?.median_projection_error_meters ?? null,
     p90_projection_error_meters: projection?.p90_projection_error_meters ?? null,
     max_projection_error_meters: projection?.max_projection_error_meters ?? null,
     projection_error_by_segment: projection?.projection_error_by_segment ?? [],
     off_route_event_count: projection?.off_route_event_count ?? 0,
-    route_progress_meters: greenLakeSnapped ? 5000 : activeDistanceMeters > 0 ? round(activeDistanceMeters, 2) : null,
-    loop_count: inferLoopCount(points, activeDistanceMeters),
+    route_progress_meters: snappedDistance !== null ? round(snappedDistance, 2) : activeDistanceMeters > 0 ? round(activeDistanceMeters, 2) : null,
+    loop_count: storedRoute?.loop_length_meters ? Math.floor(activeDistanceMeters / storedRoute.loop_length_meters) : inferLoopCount(points, activeDistanceMeters),
     confidence: snapConfidence,
     notes: greenLakeSnapped
       ? [
@@ -2313,8 +2467,24 @@ function computeRouteSnapping(
             ? `Projection-error stats were computed against ${projectionBasis}.`
             : "Projection-error stats were unavailable, so route-snap confidence was capped below high.",
         ]
-      : ["Route snapping retained artifact-filtered GPS distance until a confirmed route polyline is available."],
+      : homeBlockSnapped
+        ? [
+            "Confirmed home-block route snapping used the stored route fingerprint.",
+            projectionStatsAvailable
+              ? `Projection-error stats were computed against ${projectionBasis}.`
+              : "Projection-error stats were unavailable, so route-snap confidence was capped below high.",
+          ]
+        : ["Route snapping retained artifact-filtered GPS distance until a confirmed route polyline is available."],
   };
+}
+
+function estimateRouteSnappedDistance(activeDistanceMeters: number, loopLengthMeters: number): number {
+  if (loopLengthMeters <= 0) {
+    return activeDistanceMeters;
+  }
+  const loopCount = Math.floor(activeDistanceMeters / loopLengthMeters);
+  const progress = activeDistanceMeters - loopCount * loopLengthMeters;
+  return loopCount * loopLengthMeters + progress;
 }
 
 function inferLoopCount(points: GpsPoint[], activeDistanceMeters: number): number | null {
@@ -2340,6 +2510,10 @@ function buildRouteLibrary(
   if (!routeTruth.routeId || points.length < 2) {
     return { routes: [] };
   }
+  const storedRoute = loadStoredRouteMemory(routeTruth.routeId);
+  const calibrationStatus = routeTruth.greenLakeEnabled
+    ? "learned"
+    : storedRoute?.calibration_status ?? "needs_user_confirmation";
   return {
     routes: [
       {
@@ -2347,19 +2521,24 @@ function buildRouteLibrary(
         type: routeTruth.greenLakeEnabled ? "known_course" : "sidewalk_loop",
         polyline: simplifyPolyline(points),
         distance_meters: routeTruth.greenLakeEnabled ? 5000 : round(distanceMeters, 2),
-        loop_length_meters: routeTruth.greenLakeEnabled ? null : null,
-        start_zones: [],
-        finish_zones: [],
+        loop_length_meters: routeTruth.greenLakeEnabled ? null : storedRoute?.loop_length_meters ?? round(distanceMeters, 2),
+        start_zones: buildCrossingZones(points[0] ?? null),
+        finish_zones: buildCrossingZones(points[points.length - 1] ?? null),
         aliases: routeTruth.greenLakeEnabled ? ["Green Lake calibrated 5K"] : ["Home block short route"],
-        calibration_status: routeTruth.greenLakeEnabled ? "learned" : "needs_user_confirmation",
+        calibration_status: calibrationStatus,
         created_from_run_id: runId,
-        confidence: routeTruth.greenLakeEnabled ? "medium" : "low",
+        confidence: routeTruth.greenLakeEnabled ? "medium" : calibrationStatus === "confirmed" ? "high" : "low",
       },
     ],
   };
 }
 
-function loadStoredRoutePolyline(routeId: string): Array<[number, number]> | null {
+function loadStoredRouteMemory(routeId: string): {
+  polyline: Array<[number, number]> | null;
+  calibration_status: "learned" | "needs_user_confirmation" | "confirmed" | null;
+  loop_length_meters: number | null;
+  best_short_1500m_estimate_seconds: number | null;
+} | null {
   try {
     const raw = localStorage.getItem(ROUTE_MEMORY_KEY_FOR_MATH);
     if (!raw) {
@@ -2367,26 +2546,61 @@ function loadStoredRoutePolyline(routeId: string): Array<[number, number]> | nul
     }
     const routeMemory = JSON.parse(raw) as Record<
       string,
-      { course_fingerprint?: { polyline_simplified?: unknown } }
+      {
+        course_fingerprint?: { polyline_simplified?: unknown };
+        calibration_status?: unknown;
+        loop_length_meters?: unknown;
+        best_short_1500m_estimate_seconds?: unknown;
+      }
     >;
-    const polyline = routeMemory[routeId]?.course_fingerprint?.polyline_simplified;
-    if (!Array.isArray(polyline)) {
+    const memory = routeMemory[routeId];
+    if (!memory) {
       return null;
     }
-    const parsed = polyline
-      .map((pair): [number, number] | null => {
-        if (!Array.isArray(pair) || pair.length < 2) {
-          return null;
-        }
-        const lat = Number(pair[0]);
-        const lon = Number(pair[1]);
-        return Number.isFinite(lat) && Number.isFinite(lon) ? [lat, lon] : null;
-      })
-      .filter((pair): pair is [number, number] => pair !== null);
-    return parsed.length >= 2 ? parsed : null;
+    const polyline = memory.course_fingerprint?.polyline_simplified;
+    const parsed = Array.isArray(polyline)
+      ? polyline
+          .map((pair): [number, number] | null => {
+            if (!Array.isArray(pair) || pair.length < 2) {
+              return null;
+            }
+            const lat = Number(pair[0]);
+            const lon = Number(pair[1]);
+            return Number.isFinite(lat) && Number.isFinite(lon) ? [lat, lon] : null;
+          })
+          .filter((pair): pair is [number, number] => pair !== null)
+      : [];
+    const calibrationStatus =
+      memory.calibration_status === "confirmed" ||
+      memory.calibration_status === "learned" ||
+      memory.calibration_status === "needs_user_confirmation"
+        ? memory.calibration_status
+        : null;
+    const loopLength = Number(memory.loop_length_meters);
+    const bestShort = Number(memory.best_short_1500m_estimate_seconds);
+    return {
+      polyline: parsed.length >= 2 ? parsed : null,
+      calibration_status: calibrationStatus,
+      loop_length_meters: Number.isFinite(loopLength) && loopLength > 0 ? loopLength : null,
+      best_short_1500m_estimate_seconds: Number.isFinite(bestShort) && bestShort > 0 ? bestShort : null,
+    };
   } catch {
     return null;
   }
+}
+
+function buildCrossingZones(point: GpsPoint | null): Record<string, unknown>[] {
+  if (!point) {
+    return [];
+  }
+  return [
+    {
+      lat: round(point.lat, 6),
+      lon: round(point.lon, 6),
+      radius_meters: 25,
+      source: "run_endpoint",
+    },
+  ];
 }
 
 function computeProjectionDiagnostics(points: GpsPoint[], polyline: Array<[number, number]>) {
@@ -2479,6 +2693,7 @@ function buildMeasurementReconciliation(
   interpolation: InterpolationFeatures,
   activeInterpolation: InterpolationFeatures,
   routeSnapping: RouteSnapping,
+  routeSnappedSummary: RouteSnappedShortSummary,
   scores: DataQualityScores,
 ): MeasurementReconciliation {
   const chosenBasis =
@@ -2491,7 +2706,7 @@ function buildMeasurementReconciliation(
     distance_estimates: {
       raw_gps: interpolation.raw_recorded_distance_meters,
       artifact_filtered_gps: activeInterpolation.raw_recorded_distance_meters,
-      route_snapped: routeSnapping.snapped_distance_meters,
+      route_snapped: routeSnapping.snapped_distance_meters ?? routeSnappedSummary.route_snapped_distance_meters,
       provider_speed_integral: null,
       external_app: null,
     },
@@ -2505,6 +2720,69 @@ function buildMeasurementReconciliation(
     notes: routeSnapping.distance_basis === "route_snapped"
       ? ["Route-snapped distance is the preferred basis for this export."]
       : ["Artifact-filtered active GPS remains the preferred basis until route snapping is confirmed."],
+  };
+}
+
+function buildRouteSnappedShortSummary(
+  routeSnapping: RouteSnapping,
+  activeTrack: TrackPoint[],
+  activeDurationSeconds: number,
+  shortTarget: ActiveShortTargetResult,
+): RouteSnappedShortSummary {
+  const enabled =
+    routeSnapping.enabled &&
+    routeSnapping.route_id === "home_block_short_loop_v1" &&
+    routeSnapping.distance_basis === "route_snapped";
+  const routeDistance = routeSnapping.snapped_distance_meters ?? null;
+  const routeMemory = routeSnapping.route_id ? loadStoredRouteMemory(routeSnapping.route_id) : null;
+  const loopLength = routeMemory?.loop_length_meters ?? null;
+  const loopCount =
+    loopLength !== null && routeDistance !== null && loopLength > 0
+      ? Math.floor(routeDistance / loopLength)
+      : routeSnapping.loop_count;
+  const loopProgress =
+    loopLength !== null && routeDistance !== null && loopLength > 0
+      ? round(routeDistance - Math.floor(routeDistance / loopLength) * loopLength, 2)
+      : null;
+  const target1500 = shortTarget.target_distance_meters === 1500
+    ? shortTarget.active_elapsed_at_target_seconds
+    : activeTrack.length > 1 && (routeDistance ?? 0) >= 1500
+      ? (() => {
+          const targetState = stateAtDistance(activeTrack, 1500);
+          const activeStart = activeTrack[0]?.t_elapsed_seconds ?? 0;
+          return targetState ? round(Math.max(0, targetState.elapsed - activeStart), 2) : null;
+        })()
+      : null;
+
+  return {
+    enabled,
+    route_id: routeSnapping.route_id,
+    route_snapped_distance_meters: enabled ? routeDistance : null,
+    route_snapped_duration_seconds: enabled ? round(activeDurationSeconds, 2) : null,
+    route_snapped_1500m_time_seconds: enabled ? target1500 : null,
+    loop_length_meters: loopLength,
+    loop_count: loopCount,
+    loop_progress_meters: loopProgress,
+    confidence: enabled ? routeSnapping.confidence : "unknown",
+    notes: enabled
+      ? ["Confirmed short-route snapping is available for this run."]
+      : ["Short-route snapping is disabled until the home-block route is confirmed."],
+  };
+}
+
+function buildRouteSnappedSplits(activeTrack: TrackPoint[], enabled: boolean) {
+  if (!enabled) {
+    return {
+      fixed_100m: [],
+      fixed_200m: [],
+      fixed_500m: [],
+    };
+  }
+  const distance = activeTrack.length > 0 ? activeTrack[activeTrack.length - 1].cumulative_meters : 0;
+  return {
+    fixed_100m: buildRepeatingSplitsToDistance(activeTrack, 100, "route_snapped_100m", distance),
+    fixed_200m: buildRepeatingSplitsToDistance(activeTrack, 200, "route_snapped_200m", distance),
+    fixed_500m: buildRepeatingSplitsToDistance(activeTrack, 500, "route_snapped_500m", distance),
   };
 }
 
@@ -2668,6 +2946,7 @@ function buildCoachReadySummary(
   reconciliation: MeasurementReconciliation,
   usability: Usability,
   patchExecutionAssessment: PatchExecutionAssessment,
+  activeShortTargetResult: ActiveShortTargetResult,
 ): CoachReadySummary {
   const targetTime = activeTargetDistanceResult.active_elapsed_at_target_distance_seconds;
   const firstPace = asNumber(activePacing.first_third_pace_seconds_per_mile);
@@ -2681,10 +2960,22 @@ function buildCoachReadySummary(
     pacingPattern = finalPace - firstPace > 20 ? "positive_split" : Math.abs(finalPace - firstPace) <= 20 ? "even" : "negative_split";
   }
   const subjectiveCostAvailable = subjectiveDebriefComplete(postRun);
+  const isShortDiagnostic = classification.inferred_mode === "short_run_diagnostic";
+  const priorBestShort = loadStoredRouteMemory("home_block_short_loop_v1")?.best_short_1500m_estimate_seconds ?? null;
+  const latestShortEstimate =
+    activeShortTargetResult.target_distance_meters === 1500 && activeShortTargetResult.active_elapsed_at_target_seconds !== null
+      ? activeShortTargetResult.active_elapsed_at_target_seconds
+      : shortRun.estimated_1500m_time_seconds;
+  const speedReserveVsSub25 =
+    latestShortEstimate === null ? null : round(latestShortEstimate - 450, 2);
   const recommendedPatch =
-    pacingPattern === "positive_split" && lateFade !== null && lateFade > 15 ? "controlled_start_v1" : null;
+    isShortDiagnostic
+      ? "extend_sustainable_pace_v1"
+      : pacingPattern === "positive_split" && lateFade !== null && lateFade > 15
+        ? "controlled_start_v2"
+        : null;
   const shortRecommendedPatch =
-    shortRun.enabled && partialPacing.early_fast_then_fade_detected ? "controlled_start_v1" : recommendedPatch;
+    shortRun.enabled ? "extend_sustainable_pace_v1" : recommendedPatch;
 
   return {
     run_type: classification.inferred_mode,
@@ -2710,21 +3001,34 @@ function buildCoachReadySummary(
     usable_for_runner_update: usability.usable_for_coach_update,
     usable_for_next_strategy_update: scores.usable_for_pacing_calibration && recommendedPatch !== null,
     next_best_test:
-      recommendedPatch === "controlled_start_v1" || patchExecutionAssessment.followed_patch === false
+      recommendedPatch === "controlled_start_v2" || patchExecutionAssessment.followed_patch === false
         ? "controlled_start_green_lake_5k"
         : shortRun.short_run_usable
-          ? "controlled_even_short_diagnostic"
+          ? "2000m_controlled_fast_short_diagnostic"
           : null,
     short_run: {
       usable_for_runner_update: shortRun.short_run_usable,
       estimated_1500m_time_seconds: shortRun.estimated_1500m_time_seconds,
-      comparison_to_prior_short_runs: shortRun.enabled ? "Compare against prior local short-run diagnostics by route_id when available." : null,
+      latest_estimated_1500m_time_seconds: latestShortEstimate,
+      prior_best_short_1500m_estimate_seconds: priorBestShort,
+      delta_vs_prior_best:
+        latestShortEstimate !== null && priorBestShort !== null ? round(latestShortEstimate - priorBestShort, 2) : null,
+      speed_reserve_vs_sub25_5k_pace_seconds: speedReserveVsSub25,
+      recommended_next_short_test: shortRun.short_run_usable ? "2000m controlled-fast" : null,
+      comparison_to_prior_short_runs:
+        priorBestShort !== null && latestShortEstimate !== null
+          ? `Latest 1500m estimate is ${round(latestShortEstimate - priorBestShort, 2)}s versus prior best.`
+          : shortRun.enabled
+            ? "No prior best short-run estimate is available yet."
+            : null,
       comparison_to_green_lake_baseline_pace:
         shortRun.active_pace_seconds_per_mile !== null
           ? "Short-run pace can be compared with the current Green Lake baseline pace, but should not be extrapolated directly to 5K."
           : null,
       interpretation:
-        shortRun.enabled && partialPacing.early_fast_then_fade_detected
+        latestShortEstimate !== null && latestShortEstimate < 450
+          ? "Short-run speed reserve exceeds sub-25 5K pace."
+          : shortRun.enabled && partialPacing.early_fast_then_fade_detected
           ? "Short run shows fast start followed by pacing drift; useful as speed-reserve and pacing-drift evidence."
           : shortRun.enabled
             ? "Short run is usable for short-distance pacing diagnostics."

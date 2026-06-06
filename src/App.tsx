@@ -45,7 +45,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.10";
+const APP_VERSION = "0.1.11";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -1194,6 +1194,15 @@ export default function App() {
     );
   };
 
+  const confirmHomeBlockRoute = () => {
+    if (!activeRun) {
+      return;
+    }
+    const payload = buildExportPayload(activeRun, new Date().toISOString());
+    saveRouteMemory(payload, { confirmRoute: true });
+    setActionMessage("Home-block short route confirmed for future route snapping.");
+  };
+
   const downloadJson = () => {
     if (!exportJson) {
       return;
@@ -1735,6 +1744,7 @@ export default function App() {
           postRun={activeRun.post_run}
           updatePostRun={updatePostRun}
           updatePostRunPain={updatePostRunPain}
+          onConfirmRoute={confirmHomeBlockRoute}
           onExport={continueToExport}
         />
       ) : null}
@@ -2621,12 +2631,14 @@ function PostRunScreen({
   postRun,
   updatePostRun,
   updatePostRunPain,
+  onConfirmRoute,
   onExport,
 }: {
   run: ActiveRun;
   postRun: PostRunState;
   updatePostRun: (patch: Partial<PostRunState>) => void;
   updatePostRunPain: (patch: Partial<PostRunState["pain_after_run"]>) => void;
+  onConfirmRoute: () => void;
   onExport: () => void;
 }) {
   const exportPayload = buildExportPayload(run);
@@ -2656,6 +2668,16 @@ function PostRunScreen({
               <small>{prompt.reason}</small>
             </div>
           ))}
+          {exportPayload.route_confirmation_prompt ? (
+            <div className="preflight-item warn">
+              <span>ROUTE</span>
+              <strong>{exportPayload.route_confirmation_prompt.prompt}</strong>
+              <small>{exportPayload.route_confirmation_prompt.reason}</small>
+              <button type="button" className="secondary-button full-width-button" onClick={onConfirmRoute}>
+                Confirm route
+              </button>
+            </div>
+          ) : null}
         </div>
       </section>
 
@@ -3336,7 +3358,7 @@ function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
   };
 }
 
-function saveRouteMemory(exportPayload: ExportPayload) {
+function saveRouteMemory(exportPayload: ExportPayload, options: { confirmRoute?: boolean } = {}) {
   const routeId = exportPayload.route_features.route_id;
   if (typeof routeId !== "string" || routeId.length === 0) {
     return;
@@ -3344,7 +3366,20 @@ function saveRouteMemory(exportPayload: ExportPayload) {
   try {
     const raw = localStorage.getItem(ROUTE_MEMORY_KEY);
     const current = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    const existing = (current[routeId] ?? {}) as Record<string, unknown>;
+    const routeLibraryEntry = exportPayload.route_library.routes.find((route) => route.route_id === routeId);
+    const latestShortEstimate = exportPayload.coach_ready_summary.short_run.latest_estimated_1500m_time_seconds;
+    const priorBest = Number(existing.best_short_1500m_estimate_seconds);
+    const bestShort =
+      latestShortEstimate === null
+        ? Number.isFinite(priorBest)
+          ? priorBest
+          : null
+        : Number.isFinite(priorBest)
+          ? Math.min(priorBest, latestShortEstimate)
+          : latestShortEstimate;
     current[routeId] = {
+      ...existing,
       route_id: routeId,
       route_type: exportPayload.route_features.route_type ?? null,
       route_name: exportPayload.pre_run.route_name ?? null,
@@ -3353,6 +3388,16 @@ function saveRouteMemory(exportPayload: ExportPayload) {
       active_distance_meters: exportPayload.active_summary.distance_meters ?? null,
       bounding_box: exportPayload.route_features.bounding_box ?? null,
       course_fingerprint: exportPayload.green_lake_calibration.course_fingerprint,
+      calibration_status: options.confirmRoute
+        ? "confirmed"
+        : existing.calibration_status ?? routeLibraryEntry?.calibration_status ?? null,
+      loop_length_meters:
+        routeId === "home_block_short_loop_v1"
+          ? routeLibraryEntry?.loop_length_meters ?? exportPayload.active_summary.distance_meters ?? null
+          : routeLibraryEntry?.loop_length_meters ?? null,
+      start_zones: routeLibraryEntry?.start_zones ?? existing.start_zones ?? [],
+      finish_zones: routeLibraryEntry?.finish_zones ?? existing.finish_zones ?? [],
+      best_short_1500m_estimate_seconds: bestShort,
     };
     localStorage.setItem(ROUTE_MEMORY_KEY, JSON.stringify(current));
   } catch {
@@ -3400,7 +3445,9 @@ function buildCompactCoachSummary(exportPayload: ExportPayload) {
     run_classification: exportPayload.run_classification,
     route_direction: exportPayload.route_direction,
     route_snapping: exportPayload.route_snapping,
+    route_snapped_summary: exportPayload.route_snapped_summary,
     active_target_distance_result: exportPayload.active_target_distance_result,
+    active_short_target_result: exportPayload.active_short_target_result,
     active_target_distance_splits: {
       kilometers: exportPayload.active_target_distance_splits.kilometers,
       fixed_500m: exportPayload.active_target_distance_splits.fixed_500m,
@@ -3410,6 +3457,7 @@ function buildCompactCoachSummary(exportPayload: ExportPayload) {
     subjective_debrief: exportPayload.subjective_debrief,
     coach_ready_summary: exportPayload.coach_ready_summary,
     patch_execution_assessment: exportPayload.patch_execution_assessment,
+    route_confirmation_prompt: exportPayload.route_confirmation_prompt,
     data_quality_notes: exportPayload.data_quality_notes,
   };
 }
