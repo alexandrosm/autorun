@@ -50,7 +50,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.17";
+const APP_VERSION = "0.1.18";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -334,7 +334,7 @@ export default function App() {
   const [permissions, setPermissions] = useState<PermissionState>(initialRun?.permissions ?? defaultPermissions);
   const [activeRun, setActiveRun] = useState<ActiveRun | null>(initialRun);
   const [screen, setScreen] = useState<Screen>(
-    initialRun ? "recovery" : "setup",
+    initialRun ? "recovery" : "home",
   );
   const [elapsedSeconds, setElapsedSeconds] = useState(initialRun?.elapsed_offset_seconds ?? 0);
   const [exportCreatedAt, setExportCreatedAt] = useState(new Date().toISOString());
@@ -1140,7 +1140,7 @@ export default function App() {
 
   const resumeRecoveredRun = () => {
     if (!activeRun) {
-      setScreen("setup");
+      setScreen("home");
       return;
     }
     const offset = activeRun.elapsed_offset_seconds ?? elapsedSeconds;
@@ -1168,7 +1168,7 @@ export default function App() {
 
   const finalizeRecoveredRun = () => {
     if (!activeRun) {
-      setScreen("setup");
+      setScreen("home");
       return;
     }
     const now = new Date();
@@ -1237,7 +1237,7 @@ export default function App() {
     motionEventsSeenRef.current = 0;
     startWeatherFetchStartedRef.current = false;
     targetReachedNotifiedRef.current = false;
-    setScreen("setup");
+    setScreen("home");
   };
 
   const addCheckpoint = () => {
@@ -2048,6 +2048,16 @@ export default function App() {
         </button>
       ) : null}
 
+      {screen === "home" ? (
+        <HomeScreen
+          runHistory={runHistory}
+          historyActions={historyActions}
+          labEndpoint={labEndpoint}
+          onLabEndpointChange={handleLabEndpointChange}
+          onStartNew={() => setScreen("setup")}
+        />
+      ) : null}
+
       {screen === "setup" ? (
         <SetupScreen
           preRun={preRun}
@@ -2066,10 +2076,7 @@ export default function App() {
           onWakeLock={() => void requestWakeLock(false)}
           onStart={handleStartPressed}
           onStartAnyway={() => beginStartCountdown(true)}
-          runHistory={runHistory}
-          historyActions={historyActions}
-          labEndpoint={labEndpoint}
-          onLabEndpointChange={handleLabEndpointChange}
+          onBack={() => setScreen("home")}
         />
       ) : null}
 
@@ -2211,6 +2218,51 @@ function RecoveryScreen({
   );
 }
 
+function HomeScreen({
+  runHistory,
+  historyActions,
+  labEndpoint,
+  onLabEndpointChange,
+  onStartNew,
+}: {
+  runHistory: RunHistoryEntry[];
+  historyActions: RunHistoryActions;
+  labEndpoint: string;
+  onLabEndpointChange: (value: string) => void;
+  onStartNew: () => void;
+}) {
+  return (
+    <section className="screen-stack">
+      <button type="button" className="primary-button" onClick={onStartNew}>
+        <Play size={20} />
+        Start a new run
+      </button>
+
+      <RunHistoryPanel entries={runHistory} actions={historyActions} />
+
+      <details className="preflight-panel" open={labEndpoint.trim().length === 0}>
+        <summary>{labEndpoint.trim() ? "Lab pairing" : "Pair with the lab"}</summary>
+        <label>
+          Lab endpoint URL
+          <input
+            value={labEndpoint}
+            inputMode="url"
+            placeholder="http://192.168.1.11:8787"
+            onChange={(event) => onLabEndpointChange(event.target.value)}
+          />
+        </label>
+        <p className="filename">
+          {labEndpoint.trim()
+            ? labEndpoint.trim().startsWith("http://")
+              ? 'Paired. On home WiFi, tap "Sync to lab" above to hand runs over.'
+              : "Paired over https: runs upload automatically whenever the lab answers."
+            : "Easiest way: on the lab computer open the bridge's /pair page and scan its QR with this phone's camera."}
+        </p>
+      </details>
+    </section>
+  );
+}
+
 function SetupScreen({
   preRun,
   permissions,
@@ -2228,10 +2280,7 @@ function SetupScreen({
   onWakeLock,
   onStart,
   onStartAnyway,
-  runHistory,
-  historyActions,
-  labEndpoint,
-  onLabEndpointChange,
+  onBack,
 }: {
   preRun: PreRunState;
   permissions: PermissionState;
@@ -2249,10 +2298,7 @@ function SetupScreen({
   onWakeLock: () => void;
   onStart: () => void;
   onStartAnyway: () => void;
-  runHistory: RunHistoryEntry[];
-  historyActions: RunHistoryActions;
-  labEndpoint: string;
-  onLabEndpointChange: (value: string) => void;
+  onBack: () => void;
 }) {
   const setPain = (patch: Partial<PreRunState["pain_before_run"]>) => {
     setPreRun({
@@ -2632,27 +2678,9 @@ function SetupScreen({
       </section>
       </details>
 
-      <details className="preflight-panel">
-        <summary>Lab sync</summary>
-        <label>
-          Lab endpoint URL
-          <input
-            value={labEndpoint}
-            inputMode="url"
-            placeholder="http://192.168.1.11:8787"
-            onChange={(event) => onLabEndpointChange(event.target.value)}
-          />
-        </label>
-        <p className="filename">
-          {labEndpoint.trim()
-            ? labEndpoint.trim().startsWith("http://")
-              ? 'Plain-http lab: runs are handed over through a popup when you tap "Sync to lab" on the home WiFi.'
-              : "https lab: saved runs upload automatically whenever the lab answers."
-            : "Set the lab bridge address. http:// syncs via a tap-to-sync popup; https:// syncs automatically in the background."}
-        </p>
-      </details>
-
-      <RunHistoryPanel entries={runHistory} actions={historyActions} />
+      <button type="button" className="link-button" onClick={onBack}>
+        Back to runs
+      </button>
 
       <button type="button" className="primary-button sticky-action" onClick={onStart} disabled={!canStart}>
         <Play size={20} />
@@ -4839,6 +4867,8 @@ function weatherLabel(value: WeatherStatusText): string {
 
 function screenLabel(screen: Screen): string {
   switch (screen) {
+    case "home":
+      return "home";
     case "setup":
       return "pre-run";
     case "recovery":

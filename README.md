@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.17`
+Current version: `0.1.18`
+
+## v0.1.18 focus
+
+- The app now starts on a home screen: run history list (with lab sync), a "Start a new run" button into pre-run setup, and the lab pairing panel.
+- Pre-run setup is slimmer (history and pairing moved home) and gains a "Back to runs" link; GPS auto-arm still waits for the setup screen.
+- Discarding or finishing flows returns to the home screen.
 
 ## v0.1.17 focus
 

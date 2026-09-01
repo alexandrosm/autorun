@@ -1,4 +1,4 @@
-export type Screen = "setup" | "recovery" | "live" | "stop" | "post" | "export";
+export type Screen = "home" | "setup" | "recovery" | "live" | "stop" | "post" | "export";
 export type RunStatus = "idle" | "armed" | "running" | "stopping" | "stopped" | "discarded";
 
 export type PermissionStatusText = "unknown" | "ready" | "denied" | "unavailable";
@@ -756,10 +756,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.17";
+  schema_version: "0.1.18";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.17";
+    version: "0.1.18";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
