@@ -51,7 +51,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.23";
+const APP_VERSION = "0.1.24";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -73,10 +73,11 @@ const GPS_READY_FIX_AGE_SECONDS = 5;
 const START_GPS_TIMEOUT_SECONDS = 15;
 const START_COUNTDOWN_SECONDS = 3;
 const CONTROLLED_START_PATCH_ID = "controlled_start_v1";
+// Recalibrated 2026-09-01 for ~26:30 fitness (was 5:35-5:50 for the June ~28min runner).
 const CONTROLLED_START_BANDS = [
-  { km: 1, label: "Km 1", minSecondsPerKm: 335, maxSecondsPerKm: 340, text: "5:35-5:40" },
-  { km: 2, label: "Km 2", minSecondsPerKm: 335, maxSecondsPerKm: 345, text: "5:35-5:45" },
-  { km: 3, label: "Km 3", minSecondsPerKm: 340, maxSecondsPerKm: 350, text: "5:40-5:50" },
+  { km: 1, label: "Km 1", minSecondsPerKm: 315, maxSecondsPerKm: 325, text: "5:15-5:25" },
+  { km: 2, label: "Km 2", minSecondsPerKm: 310, maxSecondsPerKm: 320, text: "5:10-5:20" },
+  { km: 3, label: "Km 3", minSecondsPerKm: 310, maxSecondsPerKm: 322, text: "5:10-5:22" },
   { km: 4, label: "Km 4", minSecondsPerKm: null, maxSecondsPerKm: null, text: "hold steady" },
   { km: 5, label: "Km 5", minSecondsPerKm: null, maxSecondsPerKm: null, text: "squeeze only if stable" },
 ] as const;

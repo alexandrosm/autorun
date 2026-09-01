@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.23-streamlined-home";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.24-band-recalibration";
 const APP_SCOPE = self.registration.scope;
 const APP_SHELL = [APP_SCOPE];
 

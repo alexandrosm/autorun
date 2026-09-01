@@ -2,7 +2,12 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.23`
+Current version: `0.1.24`
+
+## v0.1.24 focus
+
+- Recalibrates controlled-start bands for ~26:30 fitness (km1 5:15-5:25, km2 5:10-5:20, km3 5:10-5:22); June exports carry their original bands immutably.
+- Patch library notes the recalibration date so exports are self-documenting.
 
 ## v0.1.23 focus
 

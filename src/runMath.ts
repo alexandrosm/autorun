@@ -54,10 +54,11 @@ const SUSPICIOUS_GRADE_PERCENT = 20;
 const TARGET_DISTANCE_TOLERANCE_METERS = 5;
 const SEGMENT_ARTIFACT_FRACTION_THRESHOLD = 0.1;
 const ROUTE_MEMORY_KEY_FOR_MATH = "greenlake_autoresearch_logger_route_memory_v0_1";
+// Recalibrated 2026-09-01 for ~26:30 fitness; keep in lockstep with App CONTROLLED_START_BANDS.
 const CONTROLLED_START_BANDS_FOR_MATH = [
-  { minSecondsPerKm: 335, maxSecondsPerKm: 340 },
-  { minSecondsPerKm: 335, maxSecondsPerKm: 345 },
-  { minSecondsPerKm: 340, maxSecondsPerKm: 350 },
+  { minSecondsPerKm: 315, maxSecondsPerKm: 325 },
+  { minSecondsPerKm: 310, maxSecondsPerKm: 320 },
+  { minSecondsPerKm: 310, maxSecondsPerKm: 322 },
   { minSecondsPerKm: null, maxSecondsPerKm: null },
   { minSecondsPerKm: null, maxSecondsPerKm: null },
 ] as const;
@@ -68,7 +69,8 @@ const PATCH_LIBRARY: Record<string, { description: string; thesis: string }> = {
     thesis: "Unknown: distinguish pacing discipline, late-run durability, fatigue, weather sensitivity, and route execution.",
   },
   controlled_start_v1: {
-    description: "Reduce late fade by starting controlled and aiming for steadier kilometer splits.",
+    description:
+      "Reduce late fade by starting controlled and aiming for steadier kilometer splits. Bands recalibrated 2026-09-01 to 5:15-5:25 opening for ~26:30 fitness (June exports used 5:35-5:50 bands).",
     thesis: "Speed access exists; sustainable 5K pace and controlled opening effort are the current limiter.",
   },
   controlled_start_v2: {
@@ -171,12 +173,11 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const features = computeFeatures(run);
   const weatherFetchSuccess = Boolean(run.weather.start_weather.fetched_at_utc || run.weather.finish_weather.fetched_at_utc);
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
-
   return {
-    schema_version: "0.1.23",
+    schema_version: "0.1.24",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.23",
+      version: "0.1.24",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -3313,9 +3314,9 @@ function buildCurrentPatch(patchId: string): CurrentPatch {
     strategy:
       patchId === "controlled_start_v1"
         ? {
-            km1: "5:35-5:40",
-            km2: "5:35-5:45",
-            km3: "5:40-5:50",
+            km1: "5:15-5:25",
+            km2: "5:10-5:20",
+            km3: "5:10-5:22",
             km4: "hold steady",
             km5: "squeeze only if stable",
           }
