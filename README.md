@@ -2,7 +2,12 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.18`
+Current version: `0.1.19`
+
+## v0.1.19 focus
+
+- Adds an in-app QR scanner (camera) for lab pairing: BarcodeDetector when available, lazy-loaded jsQR fallback; accepts pairing links or bare endpoint QRs. Scanning inside the app provisions the installed PWA directly.
+- Rebuilds run history as a table (date, distance, time, lab column); tapping a row expands details and actions.
 
 ## v0.1.18 focus
 

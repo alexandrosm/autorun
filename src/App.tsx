@@ -1,5 +1,6 @@
 import {
   Activity,
+  Camera,
   Clipboard,
   Download,
   Map as MapIcon,
@@ -14,7 +15,7 @@ import {
 import { encode as encodeMsgpack } from "@msgpack/msgpack";
 import { strToU8, zipSync } from "fflate";
 import L from "leaflet";
-import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import "leaflet/dist/leaflet.css";
 import { buildExportPayload, computeLiveStats, createGpsPointFromPosition } from "./runMath";
@@ -50,7 +51,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.18";
+const APP_VERSION = "0.1.19";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -2231,6 +2232,22 @@ function HomeScreen({
   onLabEndpointChange: (value: string) => void;
   onStartNew: () => void;
 }) {
+  const [scanning, setScanning] = useState(false);
+  const [scanMessage, setScanMessage] = useState("");
+  const handleScanResult = useCallback(
+    (text: string) => {
+      const endpoint = extractLabEndpoint(text);
+      if (!endpoint) {
+        return false;
+      }
+      onLabEndpointChange(endpoint);
+      setScanMessage(`Paired with ${endpoint}.`);
+      setScanning(false);
+      return true;
+    },
+    [onLabEndpointChange],
+  );
+
   return (
     <section className="screen-stack">
       <button type="button" className="primary-button" onClick={onStartNew}>
@@ -2242,6 +2259,10 @@ function HomeScreen({
 
       <details className="preflight-panel" open={labEndpoint.trim().length === 0}>
         <summary>{labEndpoint.trim() ? "Lab pairing" : "Pair with the lab"}</summary>
+        <button type="button" className="secondary-button" onClick={() => setScanning(true)}>
+          <Camera size={18} />
+          Scan lab QR
+        </button>
         <label>
           Lab endpoint URL
           <input
@@ -2252,14 +2273,145 @@ function HomeScreen({
           />
         </label>
         <p className="filename">
-          {labEndpoint.trim()
-            ? labEndpoint.trim().startsWith("http://")
-              ? 'Paired. On home WiFi, tap "Sync to lab" above to hand runs over.'
-              : "Paired over https: runs upload automatically whenever the lab answers."
-            : "Easiest way: on the lab computer open the bridge's /pair page and scan its QR with this phone's camera."}
+          {scanMessage ||
+            (labEndpoint.trim()
+              ? labEndpoint.trim().startsWith("http://")
+                ? 'Paired. On home WiFi, tap "Sync to lab" above to hand runs over.'
+                : "Paired over https: runs upload automatically whenever the lab answers."
+              : "Tap Scan lab QR and point at the QR on the lab computer's /pair page.")}
         </p>
       </details>
+
+      {scanning ? <QrScanner onResult={handleScanResult} onClose={() => setScanning(false)} /> : null}
     </section>
+  );
+}
+
+function extractLabEndpoint(text: string): string {
+  try {
+    const url = new URL(text.trim());
+    const lab = url.searchParams.get("lab");
+    if (lab) {
+      return normalizeLabEndpoint(lab);
+    }
+    if ((url.protocol === "http:" || url.protocol === "https:") && url.host !== window.location.host) {
+      return normalizeLabEndpoint(url.origin);
+    }
+  } catch {
+    // Not a URL; not a pairing code.
+  }
+  return "";
+}
+
+interface QrDetectorLike {
+  detect: (source: CanvasImageSource) => Promise<Array<{ rawValue: string }>>;
+}
+
+declare global {
+  interface Window {
+    // Shape Detection API; present on Android Chrome, absent from lib.dom.
+    BarcodeDetector?: new (options: { formats: string[] }) => QrDetectorLike;
+  }
+}
+
+function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean; onClose: () => void }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+    let timerId = 0;
+    let stopped = false;
+    let detector: QrDetectorLike | null = null;
+    let decodeFallback: ((data: Uint8ClampedArray, width: number, height: number) => { data: string } | null) | null =
+      null;
+    const canvas = document.createElement("canvas");
+
+    const deliver = (value: string) => {
+      if (onResult(value)) {
+        stopped = true;
+      }
+    };
+
+    const scan = async () => {
+      if (stopped) {
+        return;
+      }
+      const video = videoRef.current;
+      if (video && video.readyState >= 2 && video.videoWidth > 0) {
+        try {
+          if (detector) {
+            const results = await detector.detect(video);
+            const value = results[0]?.rawValue;
+            if (value) {
+              deliver(value);
+            }
+          } else if (decodeFallback) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const context = canvas.getContext("2d");
+            if (context) {
+              context.drawImage(video, 0, 0);
+              const image = context.getImageData(0, 0, canvas.width, canvas.height);
+              const result = decodeFallback(image.data, image.width, image.height);
+              if (result?.data) {
+                deliver(result.data);
+              }
+            }
+          }
+        } catch {
+          // Detection hiccups are normal while focusing; keep scanning.
+        }
+      }
+      if (!stopped) {
+        timerId = window.setTimeout(() => void scan(), 150);
+      }
+    };
+
+    void (async () => {
+      try {
+        const DetectorCtor = window.BarcodeDetector;
+        if (DetectorCtor) {
+          detector = new DetectorCtor({ formats: ["qr_code"] });
+        } else {
+          // Dynamic on purpose: jsQR is a fallback for browsers without BarcodeDetector;
+          // a static import would put ~40KB into the main bundle every phone must load.
+          const module = await import("jsqr");
+          decodeFallback = (data, width, height) => module.default(data, width, height);
+        }
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        if (stopped) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        const video = videoRef.current;
+        if (video) {
+          video.srcObject = stream;
+          await video.play();
+        }
+        void scan();
+      } catch (err) {
+        setError(err instanceof Error && err.name === "NotAllowedError"
+          ? "Camera permission was denied. Allow camera access and try again."
+          : "Camera unavailable on this device/browser.");
+      }
+    })();
+
+    return () => {
+      stopped = true;
+      window.clearTimeout(timerId);
+      stream?.getTracks().forEach((track) => track.stop());
+    };
+  }, [onResult]);
+
+  return (
+    <div className="scanner-overlay">
+      <video ref={videoRef} className="scanner-video" muted playsInline />
+      <p>{error || "Point the camera at the lab pairing QR."}</p>
+      <button type="button" className="secondary-button" onClick={onClose}>
+        Cancel
+      </button>
+    </div>
   );
 }
 
@@ -3637,6 +3789,7 @@ function RunHistoryPanel({
   actions: RunHistoryActions;
   currentHistoryId?: string;
 }) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   return (
     <section className="health-panel run-history-panel">
       <div className="health-header">
@@ -3660,45 +3813,67 @@ function RunHistoryPanel({
       {entries.length === 0 ? (
         <p className="history-empty">Completed exports will be saved on this device for later download.</p>
       ) : (
-        <div className="history-list">
-          {entries.map((entry) => {
-            const isCurrent = entry.history_id === currentHistoryId || entry.run_id === currentHistoryId;
-            return (
-              <section className={isCurrent ? "history-item current" : "history-item"} key={entry.history_id}>
-                <div className="history-main">
-                  <strong>{formatHistoryDate(entry.created_at_utc)}</strong>
-                  <span>{entry.route_name}</span>
-                  <small>
-                    {entry.inferred_mode} · {formatNullableMeters(entry.distance_meters)} ·{" "}
-                    {formatNullableDuration(entry.duration_seconds)} · {formatBytes(entry.json_bytes)}
-                  </small>
-                  <small>
-                    {entry.gps_point_count} GPS points · {entry.in_run_note_count} notes · {entry.storage_kind}
-                    {actions.labConfigured ? ` · ${entry.synced_at_utc ? "in lab" : "not in lab"}` : ""}
-                  </small>
-                </div>
-                <div className="history-actions">
-                  <button type="button" className="secondary-button" onClick={() => actions.onDownloadJson(entry)}>
-                    <Download size={16} />
-                    JSON
-                  </button>
-                  <button type="button" className="secondary-button" onClick={() => actions.onDownloadMsgpack(entry)}>
-                    <Download size={16} />
-                    MsgPack
-                  </button>
-                  <button type="button" className="secondary-button" onClick={() => actions.onCopyJson(entry)}>
-                    <Clipboard size={16} />
-                    Copy
-                  </button>
-                  <button type="button" className="link-button" onClick={() => actions.onDelete(entry)}>
-                    <Trash2 size={16} />
-                    Delete
-                  </button>
-                </div>
-              </section>
-            );
-          })}
-        </div>
+        <table className="history-table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Distance</th>
+              <th>Time</th>
+              {actions.labConfigured ? <th>Lab</th> : null}
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map((entry) => {
+              const isCurrent = entry.history_id === currentHistoryId || entry.run_id === currentHistoryId;
+              const isExpanded = expandedId === entry.history_id;
+              return (
+                <Fragment key={entry.history_id}>
+                  <tr
+                    className={[isCurrent ? "current" : "", isExpanded ? "expanded" : ""].join(" ").trim() || undefined}
+                    onClick={() => setExpandedId(isExpanded ? null : entry.history_id)}
+                  >
+                    <td>{formatHistoryDate(entry.created_at_utc)}</td>
+                    <td>{formatNullableMeters(entry.distance_meters)}</td>
+                    <td>{formatNullableDuration(entry.duration_seconds)}</td>
+                    {actions.labConfigured ? <td>{entry.synced_at_utc ? "✓" : "—"}</td> : null}
+                  </tr>
+                  {isExpanded ? (
+                    <tr className="history-detail-row">
+                      <td colSpan={actions.labConfigured ? 4 : 3}>
+                        <small>
+                          {entry.route_name} · {entry.inferred_mode} · {entry.gps_point_count} GPS points ·{" "}
+                          {entry.in_run_note_count} notes · {formatBytes(entry.json_bytes)} · {entry.storage_kind}
+                        </small>
+                        <div className="history-actions">
+                          <button type="button" className="secondary-button" onClick={() => actions.onDownloadJson(entry)}>
+                            <Download size={16} />
+                            JSON
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => actions.onDownloadMsgpack(entry)}
+                          >
+                            <Download size={16} />
+                            MsgPack
+                          </button>
+                          <button type="button" className="secondary-button" onClick={() => actions.onCopyJson(entry)}>
+                            <Clipboard size={16} />
+                            Copy
+                          </button>
+                          <button type="button" className="link-button" onClick={() => actions.onDelete(entry)}>
+                            <Trash2 size={16} />
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : null}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
       )}
     </section>
   );
