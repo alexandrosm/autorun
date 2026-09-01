@@ -14,7 +14,8 @@ import {
 import { encode as encodeMsgpack } from "@msgpack/msgpack";
 import { strToU8, zipSync } from "fflate";
 import L from "leaflet";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import "leaflet/dist/leaflet.css";
 import { buildExportPayload, computeLiveStats, createGpsPointFromPosition } from "./runMath";
 import type { LiveStats } from "./runMath";
@@ -49,7 +50,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.16";
+const APP_VERSION = "0.1.17";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -1296,6 +1297,14 @@ export default function App() {
       saveRouteMemory(payload);
       void saveCompletedRunToHistory(payload, filename).then((nextHistory) => {
         setRunHistory(nextHistory);
+        // The run now lives in history: the crash-recovery draft is obsolete.
+        recoverySuppressedRef.current = true;
+        try {
+          localStorage.removeItem(STORAGE_KEY);
+        } catch {
+          // Draft cleanup is best effort.
+        }
+        void deleteRunFromIndexedDb();
         setActionMessage("Export ready. Run saved to local history.");
         void syncRunsToLab();
       }).catch(() => setActionMessage("Export ready. Local history save failed; download still works."));
@@ -1726,12 +1735,40 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Heal stale drafts: a draft whose run is already in history (or that cannot
+    // be recovered at all) must never re-enter the recovery state on boot.
+    let storedRaw: Partial<ActiveRun> | null = null;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      storedRaw = raw ? (JSON.parse(raw) as Partial<ActiveRun>) : null;
+    } catch {
+      storedRaw = null;
+    }
+    if (!storedRaw) {
+      return;
+    }
+    const normalized = normalizeStoredRun(storedRaw);
+    if (!normalized || runAlreadyExported(normalized)) {
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+      } catch {
+        // Draft cleanup is best effort.
+      }
+      void deleteRunFromIndexedDb();
+    }
+  }, []);
+
+  useEffect(() => {
     if (activeRun || recoverySuppressedRef.current) {
       return;
     }
     let canceled = false;
     void loadRunFromIndexedDb().then((storedRun) => {
       if (canceled || !storedRun) {
+        return;
+      }
+      if (runAlreadyExported(storedRun)) {
+        void deleteRunFromIndexedDb();
         return;
       }
       setActiveRun(storedRun);
@@ -1941,7 +1978,7 @@ export default function App() {
   }, [appendLifecycleEvent, getElapsedSeconds, permissions.wake_lock_available, reconcileElapsedClock, requestWakeLock, screen]);
 
   useEffect(() => {
-    if (!activeRun) {
+    if (!activeRun || screen === "export") {
       return;
     }
     const persistDraft = () => {
@@ -3826,13 +3863,21 @@ function applyRunModeDefaults(preRun: PreRunState, mode: RunMode): PreRunState {
   };
 }
 
+function runAlreadyExported(run: ActiveRun): boolean {
+  return loadRunHistoryIndex().some((entry) => entry.run_id === run.run_metadata.run_id);
+}
+
 function loadStoredRun(): ActiveRun | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
       return null;
     }
-    return normalizeStoredRun(JSON.parse(raw) as Partial<ActiveRun>);
+    const run = normalizeStoredRun(JSON.parse(raw) as Partial<ActiveRun>);
+    if (!run || runAlreadyExported(run)) {
+      return null;
+    }
+    return run;
   } catch {
     return null;
   }
@@ -4847,4 +4892,46 @@ function buildExportFilename(startTimeUtc: string): string {
   return `greenlake_run_user_001_${get("year")}-${get("month")}-${get("day")}T${get("hour")}${get(
     "minute",
   )}${get("second")}.json`;
+}
+
+export class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error === null) {
+      return this.props.children;
+    }
+    return (
+      <main className="app-shell">
+        <section className="result-panel">
+          <h2>The app hit an unexpected error.</h2>
+          <p className="filename">{String(this.state.error)}</p>
+          <p>Saved run history is safe. Discarding the draft only removes the in-progress run snapshot.</p>
+          <div className="button-grid vertical">
+            <button type="button" className="primary-button" onClick={() => window.location.reload()}>
+              Reload
+            </button>
+            <button
+              type="button"
+              className="danger-button"
+              onClick={() => {
+                try {
+                  localStorage.removeItem(STORAGE_KEY);
+                } catch {
+                  // Draft cleanup is best effort.
+                }
+                void deleteRunFromIndexedDb().then(() => window.location.reload());
+              }}
+            >
+              Discard saved draft and reload
+            </button>
+          </div>
+        </section>
+      </main>
+    );
+  }
 }

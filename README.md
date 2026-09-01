@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.16`
+Current version: `0.1.17`
+
+## v0.1.17 focus
+
+- Fixes the recovery-screen loop: exporting a run is now a terminal state that deletes the crash-recovery draft, so the app no longer boots into "resume/finalize/discard" for runs already saved to history.
+- Boot now self-heals stale drafts: a draft matching an already-exported run (or one too corrupt to recover) is silently removed from localStorage and IndexedDB.
+- The draft persister no longer runs on the export screen.
+- Adds an app-level error boundary with "Reload" and "Discard saved draft and reload" so no crash can wedge the app; run history is never touched by the reset.
 
 ## v0.1.16 focus
 
