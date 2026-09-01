@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.15`
+Current version: `0.1.16`
+
+## v0.1.16 focus
+
+- Adds a zero-setup popup transport for plain-http lab bridges: mixed content blocks https-app fetches to LAN http, but top-level navigation and window `postMessage` are exempt.
+- "Sync to lab" opens the bridge's `/web/lab-receiver.html` in a popup; runs cross via `postMessage` (origin-checked both ways) and the receiver POSTs them same-origin to `/api/runs`.
+- `http://` endpoints use the tap-to-sync popup; `https://` endpoints keep fully automatic background sync; schemeless input now defaults to `http://`.
+- No TLS, no CA install, and no new firewall rule needed for the popup path.
 
 ## v0.1.15 focus
 

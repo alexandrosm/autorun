@@ -49,7 +49,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.15";
+const APP_VERSION = "0.1.16";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -1489,26 +1489,60 @@ export default function App() {
     if (!endpoint || labSyncBusyRef.current) {
       return;
     }
+    const popupTransport = endpoint.startsWith("http://") && window.location.protocol === "https:";
+    const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
+    if (popupTransport && !announce) {
+      // Popups need a user gesture; background flushes just report what's waiting.
+      setLabSync(
+        pending.length === 0
+          ? { status: "ok", detail: "All saved runs are in the lab." }
+          : {
+              status: "idle",
+              detail: `${pending.length} run${pending.length === 1 ? "" : "s"} waiting — tap "Sync to lab".`,
+            },
+      );
+      return;
+    }
     labSyncBusyRef.current = true;
     setLabSync({ status: "syncing", detail: "Contacting lab…" });
     try {
-      if (!(await probeLabEndpoint(endpoint))) {
-        setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
-        if (announce) {
-          setActionMessage("Lab is not reachable from this network.");
-        }
-        return;
-      }
-      const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
       let sent = 0;
       let failed = 0;
-      for (const entry of pending) {
-        const payload = await loadCompletedRunFromHistory(entry.history_id);
-        if (payload && (await uploadRunToLab(endpoint, payload))) {
-          sent += 1;
-          markRunSynced(entry.history_id);
-        } else {
-          failed += 1;
+      if (popupTransport) {
+        const result = await syncRunsViaPopup(endpoint, pending);
+        if (!result) {
+          setLabSync({ status: "offline", detail: "Popup was blocked. Allow popups for this app to sync." });
+          if (announce) {
+            setActionMessage("Popup was blocked. Allow popups for this app to sync.");
+          }
+          return;
+        }
+        sent = result.sent;
+        failed = result.failed;
+        if (pending.length > 0 && sent === 0) {
+          setLabSync({ status: "offline", detail: "Lab receiver did not answer. Is the bridge running?" });
+          if (announce) {
+            setActionMessage("Lab receiver did not answer. Is the bridge running?");
+          }
+          setRunHistory(loadRunHistoryIndex());
+          return;
+        }
+      } else {
+        if (!(await probeLabEndpoint(endpoint))) {
+          setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
+          if (announce) {
+            setActionMessage("Lab is not reachable from this network.");
+          }
+          return;
+        }
+        for (const entry of pending) {
+          const payload = await loadCompletedRunFromHistory(entry.history_id);
+          if (payload && (await uploadRunToLab(endpoint, payload))) {
+            sent += 1;
+            markRunSynced(entry.history_id);
+          } else {
+            failed += 1;
+          }
         }
       }
       setRunHistory(loadRunHistoryIndex());
@@ -2564,18 +2598,20 @@ function SetupScreen({
       <details className="preflight-panel">
         <summary>Lab sync</summary>
         <label>
-          Lab endpoint (https URL)
+          Lab endpoint URL
           <input
             value={labEndpoint}
             inputMode="url"
-            placeholder="https://lab.example.duckdns.org:8788"
+            placeholder="http://192.168.1.11:8787"
             onChange={(event) => onLabEndpointChange(event.target.value)}
           />
         </label>
         <p className="filename">
           {labEndpoint.trim()
-            ? "Saved runs upload automatically whenever the lab answers."
-            : "Set the lab bridge https address to sync runs automatically."}
+            ? labEndpoint.trim().startsWith("http://")
+              ? 'Plain-http lab: runs are handed over through a popup when you tap "Sync to lab" on the home WiFi.'
+              : "https lab: saved runs upload automatically whenever the lab answers."
+            : "Set the lab bridge address. http:// syncs via a tap-to-sync popup; https:// syncs automatically in the background."}
         </p>
       </details>
 
@@ -3992,7 +4028,7 @@ function normalizeLabEndpoint(value: string): string {
   if (!trimmed) {
     return "";
   }
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
 }
 
 async function probeLabEndpoint(endpoint: string): Promise<boolean> {
@@ -4028,6 +4064,72 @@ function markRunSynced(historyId: string) {
     saveRunHistoryIndex(entries);
   } catch {
     // Sync markers are best effort; unsynced runs retry next flush.
+  }
+}
+
+async function syncRunsViaPopup(
+  endpoint: string,
+  pending: RunHistoryEntry[],
+): Promise<{ sent: number; failed: number } | null> {
+  const receiver = window.open(`${endpoint}/web/lab-receiver.html`, "lab-receiver");
+  if (!receiver) {
+    return null;
+  }
+  const targetOrigin = new URL(endpoint).origin;
+  let sent = 0;
+  let failed = 0;
+  const acks: Record<string, (ok: boolean) => void> = {};
+  let readyResolve: (() => void) | null = null;
+  const onMessage = (event: MessageEvent) => {
+    if (event.origin !== targetOrigin || !event.data || typeof event.data !== "object") {
+      return;
+    }
+    const data = event.data as { type?: string; id?: string; ok?: boolean };
+    if (data.type === "lab-receiver-ready") {
+      readyResolve?.();
+    } else if (data.type === "run-ack" && typeof data.id === "string") {
+      acks[data.id]?.(Boolean(data.ok));
+    }
+  };
+  window.addEventListener("message", onMessage);
+  try {
+    const ready = await new Promise<boolean>((resolve) => {
+      const timer = window.setTimeout(() => resolve(false), 8000);
+      readyResolve = () => {
+        window.clearTimeout(timer);
+        resolve(true);
+      };
+    });
+    if (!ready) {
+      receiver.close();
+      return { sent: 0, failed: pending.length };
+    }
+    for (const entry of pending) {
+      const payload = await loadCompletedRunFromHistory(entry.history_id);
+      if (!payload) {
+        failed += 1;
+        continue;
+      }
+      const ok = await new Promise<boolean>((resolve) => {
+        const timer = window.setTimeout(() => resolve(false), 20000);
+        acks[entry.history_id] = (value) => {
+          window.clearTimeout(timer);
+          resolve(value);
+        };
+        receiver.postMessage({ type: "run", id: entry.history_id, payload }, targetOrigin);
+      });
+      delete acks[entry.history_id];
+      if (ok) {
+        sent += 1;
+        markRunSynced(entry.history_id);
+      } else {
+        failed += 1;
+      }
+    }
+    receiver.postMessage({ type: "done" }, targetOrigin);
+    return { sent, failed };
+  } finally {
+    window.removeEventListener("message", onMessage);
   }
 }
 
