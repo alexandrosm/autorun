@@ -659,6 +659,18 @@ button {
   line-height: 1.35;
 }
 
+.history-sync-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.history-sync-row button {
+  min-height: 38px;
+  padding-inline: 12px;
+}
+
 .history-list {
   display: grid;
   max-height: 520px;

@@ -2,7 +2,15 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.14`
+Current version: `0.1.15`
+
+## v0.1.15 focus
+
+- Adds lab sync: the app discovers a LAN lab bridge over https and uploads saved runs automatically.
+- Configurable lab endpoint (Setup > Lab sync, or open the app once with `?lab=<https-url>`); endpoint is stored on-device.
+- Outbox model: every saved run tracks `synced_at_utc`; unsynced runs flush on app open, after each export, and via the history panel's "Sync to lab" button.
+- Uploads POST the full export JSON to `<endpoint>/api/runs`; the realm bridge stores it under `<realm>/runs/` and emits a `run_uploaded` event for the lab session.
+- Requires the bridge's https listener (Let's Encrypt via DNS-01 on a LAN-pointing hostname); browsers block plain-http LAN calls from this https app.
 
 ## v0.1.14 focus
 

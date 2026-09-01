@@ -49,7 +49,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.14";
+const APP_VERSION = "0.1.15";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -61,6 +61,7 @@ const RUN_HISTORY_PAYLOAD_PREFIX = "greenlake_autoresearch_logger_run_history_pa
 const MAX_RUN_HISTORY_ITEMS = 50;
 const ROUTE_MEMORY_KEY = "greenlake_autoresearch_logger_route_memory_v0_1";
 const CURRENT_PATCH_KEY = "greenlake_autoresearch_logger_current_patch_v0_1";
+const LAB_SYNC_KEY = "greenlake_autoresearch_logger_lab_sync_v0_1";
 const MSGPACK_MIME = "application/msgpack";
 const ZIP_MIME = "application/zip";
 const MOTION_WINDOW_SECONDS = 5;
@@ -140,6 +141,12 @@ interface RunHistoryEntry {
   gps_point_count: number;
   in_run_note_count: number;
   storage_kind: "indexeddb" | "localstorage";
+  synced_at_utc?: string | null;
+}
+
+interface LabSyncStatus {
+  status: "idle" | "syncing" | "ok" | "offline";
+  detail: string;
 }
 
 interface RunHistoryActions {
@@ -147,6 +154,9 @@ interface RunHistoryActions {
   onDownloadMsgpack: (entry: RunHistoryEntry) => void;
   onCopyJson: (entry: RunHistoryEntry) => void;
   onDelete: (entry: RunHistoryEntry) => void;
+  onSyncToLab: () => void;
+  labConfigured: boolean;
+  labSync: LabSyncStatus;
 }
 
 const defaultPreRun: PreRunState = {
@@ -1287,6 +1297,7 @@ export default function App() {
       void saveCompletedRunToHistory(payload, filename).then((nextHistory) => {
         setRunHistory(nextHistory);
         setActionMessage("Export ready. Run saved to local history.");
+        void syncRunsToLab();
       }).catch(() => setActionMessage("Export ready. Local history save failed; download still works."));
     }
     setExportCreatedAt(createdAt);
@@ -1464,11 +1475,79 @@ export default function App() {
     });
   };
 
+  const [labEndpoint, setLabEndpoint] = useState(() => loadLabSyncSettings().endpoint);
+  const [labSync, setLabSync] = useState<LabSyncStatus>({ status: "idle", detail: "" });
+  const labSyncBusyRef = useRef(false);
+
+  const handleLabEndpointChange = useCallback((value: string) => {
+    setLabEndpoint(value);
+    saveLabSyncSettings({ endpoint: value });
+  }, []);
+
+  const syncRunsToLab = useCallback(async (announce = false) => {
+    const endpoint = normalizeLabEndpoint(loadLabSyncSettings().endpoint);
+    if (!endpoint || labSyncBusyRef.current) {
+      return;
+    }
+    labSyncBusyRef.current = true;
+    setLabSync({ status: "syncing", detail: "Contacting lab…" });
+    try {
+      if (!(await probeLabEndpoint(endpoint))) {
+        setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
+        if (announce) {
+          setActionMessage("Lab is not reachable from this network.");
+        }
+        return;
+      }
+      const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
+      let sent = 0;
+      let failed = 0;
+      for (const entry of pending) {
+        const payload = await loadCompletedRunFromHistory(entry.history_id);
+        if (payload && (await uploadRunToLab(endpoint, payload))) {
+          sent += 1;
+          markRunSynced(entry.history_id);
+        } else {
+          failed += 1;
+        }
+      }
+      setRunHistory(loadRunHistoryIndex());
+      const detail =
+        pending.length === 0
+          ? "All saved runs are in the lab."
+          : `Sent ${sent} of ${pending.length} run${pending.length === 1 ? "" : "s"} to the lab.`;
+      setLabSync({ status: failed > 0 ? "offline" : "ok", detail });
+      if (announce) {
+        setActionMessage(detail);
+      }
+    } finally {
+      labSyncBusyRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    const lab = new URLSearchParams(window.location.search).get("lab");
+    if (lab) {
+      const normalized = normalizeLabEndpoint(lab);
+      saveLabSyncSettings({ endpoint: normalized });
+      setLabEndpoint(normalized);
+      setActionMessage("Lab sync endpoint saved from link.");
+    }
+    if (loadLabSyncSettings().endpoint) {
+      void syncRunsToLab();
+    }
+  }, [syncRunsToLab]);
+
   const historyActions: RunHistoryActions = {
     onDownloadJson: downloadHistoryJson,
     onDownloadMsgpack: downloadHistoryMsgpack,
     onCopyJson: copyHistoryJson,
     onDelete: deleteHistoryEntry,
+    onSyncToLab: () => {
+      void syncRunsToLab(true);
+    },
+    labConfigured: labEndpoint.trim().length > 0,
+    labSync,
   };
 
   const installPwa = async () => {
@@ -1918,6 +1997,8 @@ export default function App() {
           onStartAnyway={() => beginStartCountdown(true)}
           runHistory={runHistory}
           historyActions={historyActions}
+          labEndpoint={labEndpoint}
+          onLabEndpointChange={handleLabEndpointChange}
         />
       ) : null}
 
@@ -2078,6 +2159,8 @@ function SetupScreen({
   onStartAnyway,
   runHistory,
   historyActions,
+  labEndpoint,
+  onLabEndpointChange,
 }: {
   preRun: PreRunState;
   permissions: PermissionState;
@@ -2097,6 +2180,8 @@ function SetupScreen({
   onStartAnyway: () => void;
   runHistory: RunHistoryEntry[];
   historyActions: RunHistoryActions;
+  labEndpoint: string;
+  onLabEndpointChange: (value: string) => void;
 }) {
   const setPain = (patch: Partial<PreRunState["pain_before_run"]>) => {
     setPreRun({
@@ -2474,6 +2559,24 @@ function SetupScreen({
           />
         </label>
       </section>
+      </details>
+
+      <details className="preflight-panel">
+        <summary>Lab sync</summary>
+        <label>
+          Lab endpoint (https URL)
+          <input
+            value={labEndpoint}
+            inputMode="url"
+            placeholder="https://lab.example.duckdns.org:8788"
+            onChange={(event) => onLabEndpointChange(event.target.value)}
+          />
+        </label>
+        <p className="filename">
+          {labEndpoint.trim()
+            ? "Saved runs upload automatically whenever the lab answers."
+            : "Set the lab bridge https address to sync runs automatically."}
+        </p>
       </details>
 
       <RunHistoryPanel entries={runHistory} actions={historyActions} />
@@ -3437,8 +3540,21 @@ function RunHistoryPanel({
     <section className="health-panel run-history-panel">
       <div className="health-header">
         <strong>Local run history</strong>
-        <span>{entries.length} saved</span>
+        <span>
+          {entries.length} saved
+          {actions.labConfigured ? ` · ${entries.filter((entry) => entry.synced_at_utc).length} in lab` : ""}
+        </span>
       </div>
+
+      {actions.labConfigured ? (
+        <div className="history-sync-row">
+          <button type="button" className="secondary-button" onClick={actions.onSyncToLab}>
+            <RefreshCw size={16} />
+            Sync to lab
+          </button>
+          <small>{actions.labSync.status === "syncing" ? "Syncing…" : actions.labSync.detail}</small>
+        </div>
+      ) : null}
 
       {entries.length === 0 ? (
         <p className="history-empty">Completed exports will be saved on this device for later download.</p>
@@ -3457,6 +3573,7 @@ function RunHistoryPanel({
                   </small>
                   <small>
                     {entry.gps_point_count} GPS points · {entry.in_run_note_count} notes · {entry.storage_kind}
+                    {actions.labConfigured ? ` · ${entry.synced_at_utc ? "in lab" : "not in lab"}` : ""}
                   </small>
                 </div>
                 <div className="history-actions">
@@ -3846,6 +3963,72 @@ function loadRunHistoryIndex(): RunHistoryEntry[] {
 
 function saveRunHistoryIndex(entries: RunHistoryEntry[]) {
   localStorage.setItem(RUN_HISTORY_INDEX_KEY, JSON.stringify(entries.slice(0, MAX_RUN_HISTORY_ITEMS)));
+}
+
+interface LabSyncSettings {
+  endpoint: string;
+}
+
+function loadLabSyncSettings(): LabSyncSettings {
+  try {
+    const raw = localStorage.getItem(LAB_SYNC_KEY);
+    const parsed = raw ? (JSON.parse(raw) as Partial<LabSyncSettings>) : {};
+    return { endpoint: typeof parsed.endpoint === "string" ? parsed.endpoint : "" };
+  } catch {
+    return { endpoint: "" };
+  }
+}
+
+function saveLabSyncSettings(settings: LabSyncSettings) {
+  try {
+    localStorage.setItem(LAB_SYNC_KEY, JSON.stringify(settings));
+  } catch {
+    // Lab sync settings are best effort.
+  }
+}
+
+function normalizeLabEndpoint(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    return "";
+  }
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+async function probeLabEndpoint(endpoint: string): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 4000);
+    const response = await fetch(`${endpoint}/api/runs/ping`, { signal: controller.signal });
+    window.clearTimeout(timeoutId);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function uploadRunToLab(endpoint: string, payload: ExportPayload): Promise<boolean> {
+  try {
+    const response = await fetch(`${endpoint}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+function markRunSynced(historyId: string) {
+  const entries = loadRunHistoryIndex().map((entry) =>
+    entry.history_id === historyId ? { ...entry, synced_at_utc: new Date().toISOString() } : entry,
+  );
+  try {
+    saveRunHistoryIndex(entries);
+  } catch {
+    // Sync markers are best effort; unsynced runs retry next flush.
+  }
 }
 
 async function saveCompletedRunToHistory(payload: ExportPayload, filename: string): Promise<RunHistoryEntry[]> {
