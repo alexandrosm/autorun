@@ -13,7 +13,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { encode as encodeMsgpack } from "@msgpack/msgpack";
-import { strToU8, zipSync } from "fflate";
+import { deflateSync, strToU8, zipSync } from "fflate";
 import L from "leaflet";
 import { Component, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -51,7 +51,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.21";
+const APP_VERSION = "0.1.22";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -1500,92 +1500,92 @@ export default function App() {
     if (!endpoint || labSyncBusyRef.current) {
       return;
     }
-    const handoverTransport = endpoint.startsWith("http://") && window.location.protocol === "https:";
-    const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
-    if (handoverTransport) {
-      if (!announce) {
-        // Handover navigates away; background flushes just report what's waiting.
-        setLabSync(
-          pending.length === 0
-            ? { status: "ok", detail: "All saved runs are in the lab." }
-            : {
-                status: "idle",
-                detail: `${pending.length} run${pending.length === 1 ? "" : "s"} waiting — tap "Sync to lab".`,
-              },
-        );
-        return;
-      }
-      if (pending.length === 0) {
-        setLabSync({ status: "ok", detail: "All saved runs are in the lab." });
-        setActionMessage("All saved runs are in the lab.");
-        return;
-      }
-      labSyncBusyRef.current = true;
-      setLabSync({ status: "syncing", detail: `Packing ${pending.length} run${pending.length === 1 ? "" : "s"}…` });
-      try {
-        const handover = await packRunsForLabHandover(endpoint, pending);
-        if (!handover) {
-          setLabSync({ status: "offline", detail: "Could not load the pending runs from storage." });
-          setActionMessage("Could not load the pending runs from storage.");
-          return;
-        }
-        setLabSync({ status: "syncing", detail: "Opening the lab page…" });
-        // If this navigation commits, the page unloads and nothing below matters.
-        const watchdog = window.setTimeout(() => {
-          setLabSync({
-            status: "offline",
-            detail: "The lab page didn't open automatically. Tap \"Open lab page\" to finish syncing.",
-            handoverUrl: handover.url,
-          });
-        }, 4000);
-        window.addEventListener("pagehide", () => window.clearTimeout(watchdog), { once: true });
-        window.location.assign(handover.url);
-      } catch (error) {
-        setLabSync({ status: "offline", detail: `Sync failed: ${error instanceof Error ? error.message : String(error)}` });
-      } finally {
-        labSyncBusyRef.current = false;
-      }
-      return;
-    }
     labSyncBusyRef.current = true;
-    setLabSync({ status: "syncing", detail: "Contacting lab…" });
     try {
-      let sent = 0;
-      let failed = 0;
-      if (!(await probeLabEndpoint(endpoint))) {
+      const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
+      setLabSync({ status: "syncing", detail: "Contacting lab…" });
+      if (await probeLabEndpoint(endpoint)) {
+        // Direct connection available (same-scheme, localhost, or a granted
+        // local-network-access permission): upload in place, no navigation.
+        let sent = 0;
+        let failed = 0;
+        for (const entry of pending) {
+          const payload = await loadCompletedRunFromHistory(entry.history_id);
+          if (payload && (await uploadRunToLab(endpoint, payload))) {
+            sent += 1;
+            markRunSynced(entry.history_id);
+          } else {
+            failed += 1;
+          }
+        }
+        setRunHistory(loadRunHistoryIndex());
+        const detail =
+          pending.length === 0
+            ? "All saved runs are in the lab."
+            : `Sent ${sent} of ${pending.length} run${pending.length === 1 ? "" : "s"} to the lab.`;
+        setLabSync({ status: failed > 0 ? "offline" : "ok", detail });
+        if (announce) {
+          setActionMessage(detail);
+        }
+        return;
+      }
+      const handoverPossible = endpoint.startsWith("http://") && window.location.protocol === "https:";
+      if (!handoverPossible) {
         setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
         if (announce) {
           setActionMessage("Lab is not reachable from this network.");
         }
         return;
       }
-      for (const entry of pending) {
-        const payload = await loadCompletedRunFromHistory(entry.history_id);
-        if (payload && (await uploadRunToLab(endpoint, payload))) {
-          sent += 1;
-          markRunSynced(entry.history_id);
-        } else {
-          failed += 1;
+      if (pending.length === 0) {
+        setLabSync({ status: "ok", detail: "All saved runs are in the lab." });
+        if (announce) {
+          setActionMessage("All saved runs are in the lab.");
         }
+        return;
       }
-      setRunHistory(loadRunHistoryIndex());
-      const detail =
-        pending.length === 0
-          ? "All saved runs are in the lab."
-          : `Sent ${sent} of ${pending.length} run${pending.length === 1 ? "" : "s"} to the lab.`;
-      setLabSync({ status: failed > 0 ? "offline" : "ok", detail });
-      if (announce) {
-        setActionMessage(detail);
+      if (!announce) {
+        // Handover navigates away; background flushes just report what's waiting.
+        setLabSync({
+          status: "idle",
+          detail: `${pending.length} run${pending.length === 1 ? "" : "s"} waiting — tap "Sync to lab".`,
+        });
+        return;
       }
+      setLabSync({ status: "syncing", detail: `Packing ${pending.length} run${pending.length === 1 ? "" : "s"}…` });
+      const handover = await packRunsForLabHandover(endpoint, pending);
+      if (!handover) {
+        setLabSync({
+          status: "offline",
+          detail: "Pending runs are too large for the handover link. Grant local network access when Chrome asks, then retry.",
+        });
+        return;
+      }
+      setLabSync({
+        status: "syncing",
+        detail: `Opening the lab page with ${handover.count} run${handover.count === 1 ? "" : "s"}…`,
+      });
+      // If this navigation commits, the page unloads and nothing below matters.
+      const watchdog = window.setTimeout(() => {
+        setLabSync({
+          status: "offline",
+          detail: "The lab page didn't open automatically. Tap \"Open lab page\" to finish syncing.",
+          handoverUrl: handover.url,
+        });
+      }, 4000);
+      window.addEventListener("pagehide", () => window.clearTimeout(watchdog), { once: true });
+      window.location.assign(handover.url);
+    } catch (error) {
+      setLabSync({ status: "offline", detail: `Sync failed: ${error instanceof Error ? error.message : String(error)}` });
     } finally {
       labSyncBusyRef.current = false;
     }
   }, []);
 
   useEffect(() => {
-    if (window.name.startsWith(LAB_HANDOVER_RESULT_PREFIX)) {
+    if (window.location.hash.startsWith("#labsync=")) {
       try {
-        const result = JSON.parse(window.name.slice(LAB_HANDOVER_RESULT_PREFIX.length)) as {
+        const result = JSON.parse(base64UrlToUtf8(window.location.hash.slice("#labsync=".length))) as {
           acks?: Array<{ id?: string; ok?: boolean }>;
         };
         const acks = Array.isArray(result.acks) ? result.acks : [];
@@ -1605,10 +1605,7 @@ export default function App() {
       } catch {
         // Malformed result; runs stay pending and retry on the next sync.
       }
-      window.name = "";
-    } else if (window.name.startsWith(LAB_HANDOVER_PREFIX)) {
-      // A handover that never reached the lab page (navigation failed or user went back).
-      window.name = "";
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
     }
     const lab = new URLSearchParams(window.location.search).get("lab");
     if (lab) {
@@ -1621,6 +1618,17 @@ export default function App() {
       void syncRunsToLab();
     }
   }, [syncRunsToLab]);
+
+  useEffect(() => {
+    const refreshOnReturn = () => {
+      if (document.visibilityState === "visible" && !activeRunRef.current) {
+        // A lab-page round trip in another surface may have marked runs synced.
+        setRunHistory(loadRunHistoryIndex());
+      }
+    };
+    document.addEventListener("visibilitychange", refreshOnReturn);
+    return () => document.removeEventListener("visibilitychange", refreshOnReturn);
+  }, []);
 
   const historyActions: RunHistoryActions = {
     onDownloadJson: downloadHistoryJson,
@@ -4360,32 +4368,54 @@ function markRunSynced(historyId: string) {
   }
 }
 
-const LAB_HANDOVER_PREFIX = "greenlake-labsync:";
-const LAB_HANDOVER_RESULT_PREFIX = "greenlake-labsync-result:";
-const LAB_HANDOVER_BUDGET_BYTES = 4_000_000;
+const LAB_HANDOVER_FRAGMENT_BUDGET = 350_000;
+const LAB_HANDOVER_FRAGMENT_MAX = 700_000;
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlToUtf8(encoded: string): string {
+  const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
 
 async function packRunsForLabHandover(
   endpoint: string,
   pending: RunHistoryEntry[],
-): Promise<{ url: string } | null> {
+): Promise<{ url: string; count: number } | null> {
+  // The payload rides the URL fragment: unlike window.name it survives every
+  // navigation context (installed-PWA Custom Tabs clear window.name).
+  const returnTo = `${window.location.origin}${window.location.pathname}`;
   const runs: Array<{ id: string; payload: ExportPayload }> = [];
-  let budget = 0;
+  let encoded = "";
   for (const entry of pending) {
-    if (runs.length > 0 && budget + entry.json_bytes > LAB_HANDOVER_BUDGET_BYTES) {
+    const payload = await loadCompletedRunFromHistory(entry.history_id);
+    if (!payload) {
+      continue;
+    }
+    const candidate = [...runs, { id: entry.history_id, payload }];
+    const packed = bytesToBase64Url(
+      deflateSync(strToU8(JSON.stringify({ v: 1, returnTo, runs: candidate }))),
+    );
+    if (packed.length > LAB_HANDOVER_FRAGMENT_BUDGET && runs.length > 0) {
       break; // Remaining runs ride the next handover trip.
     }
-    const payload = await loadCompletedRunFromHistory(entry.history_id);
-    if (payload) {
-      runs.push({ id: entry.history_id, payload });
-      budget += entry.json_bytes;
+    if (packed.length > LAB_HANDOVER_FRAGMENT_MAX) {
+      continue; // This single run is too large even alone; skip it.
     }
+    runs.push(candidate[candidate.length - 1]);
+    encoded = packed;
   }
-  if (runs.length === 0) {
+  if (runs.length === 0 || !encoded) {
     return null;
   }
-  const returnTo = `${window.location.origin}${window.location.pathname}`;
-  window.name = LAB_HANDOVER_PREFIX + JSON.stringify({ v: 1, returnTo, runs });
-  return { url: `${endpoint}/web/lab-receiver.html` };
+  return { url: `${endpoint}/web/lab-receiver.html#lab=v1.${encoded}`, count: runs.length };
 }
 
 async function saveCompletedRunToHistory(payload: ExportPayload, filename: string): Promise<RunHistoryEntry[]> {

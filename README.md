@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.21`
+Current version: `0.1.22`
+
+## v0.1.22 focus
+
+- Sync now tries a direct connection first (works wherever Chrome grants local network access) and only falls back to the lab-page handover.
+- The handover payload moved from `window.name` to a compressed URL fragment: installed-PWA Custom Tabs clear `window.name`, but the link itself survives every context. Acks return as a fragment too.
+- Batches are compressed (deflate) and budgeted to ~350 KB of link per trip; remaining runs ride the next tap. The app refreshes sync badges when you return to it.
 
 ## v0.1.21 focus
 
