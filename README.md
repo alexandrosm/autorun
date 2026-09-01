@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.19`
+Current version: `0.1.20`
+
+## v0.1.20 focus
+
+- Replaces the popup sync transport with a same-window handover: `window.name` carries the pending runs to the lab receiver page and carries acks back. Works from installed PWAs and Custom Tabs where `window.opener`/`postMessage` do not survive.
+- The lab receiver page now shows per-run progress (size, stored/failed, progress bar) before returning to the app.
+- Handover batches are budgeted to ~4 MB per trip; remaining runs ride the next sync.
 
 ## v0.1.19 focus
 

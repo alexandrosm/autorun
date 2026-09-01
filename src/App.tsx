@@ -51,7 +51,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.19";
+const APP_VERSION = "0.1.20";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -1499,18 +1499,34 @@ export default function App() {
     if (!endpoint || labSyncBusyRef.current) {
       return;
     }
-    const popupTransport = endpoint.startsWith("http://") && window.location.protocol === "https:";
+    const handoverTransport = endpoint.startsWith("http://") && window.location.protocol === "https:";
     const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
-    if (popupTransport && !announce) {
-      // Popups need a user gesture; background flushes just report what's waiting.
-      setLabSync(
-        pending.length === 0
-          ? { status: "ok", detail: "All saved runs are in the lab." }
-          : {
-              status: "idle",
-              detail: `${pending.length} run${pending.length === 1 ? "" : "s"} waiting — tap "Sync to lab".`,
-            },
-      );
+    if (handoverTransport) {
+      if (!announce) {
+        // Handover navigates away; background flushes just report what's waiting.
+        setLabSync(
+          pending.length === 0
+            ? { status: "ok", detail: "All saved runs are in the lab." }
+            : {
+                status: "idle",
+                detail: `${pending.length} run${pending.length === 1 ? "" : "s"} waiting — tap "Sync to lab".`,
+              },
+        );
+        return;
+      }
+      if (pending.length === 0) {
+        setLabSync({ status: "ok", detail: "All saved runs are in the lab." });
+        setActionMessage("All saved runs are in the lab.");
+        return;
+      }
+      labSyncBusyRef.current = true;
+      setLabSync({ status: "syncing", detail: "Handing runs to the lab page…" });
+      try {
+        await handOverRunsViaLabPage(endpoint, pending);
+        // If navigation started, this page is being torn down; nothing more to do.
+      } finally {
+        labSyncBusyRef.current = false;
+      }
       return;
     }
     labSyncBusyRef.current = true;
@@ -1518,41 +1534,20 @@ export default function App() {
     try {
       let sent = 0;
       let failed = 0;
-      if (popupTransport) {
-        const result = await syncRunsViaPopup(endpoint, pending);
-        if (!result) {
-          setLabSync({ status: "offline", detail: "Popup was blocked. Allow popups for this app to sync." });
-          if (announce) {
-            setActionMessage("Popup was blocked. Allow popups for this app to sync.");
-          }
-          return;
+      if (!(await probeLabEndpoint(endpoint))) {
+        setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
+        if (announce) {
+          setActionMessage("Lab is not reachable from this network.");
         }
-        sent = result.sent;
-        failed = result.failed;
-        if (pending.length > 0 && sent === 0) {
-          setLabSync({ status: "offline", detail: "Lab receiver did not answer. Is the bridge running?" });
-          if (announce) {
-            setActionMessage("Lab receiver did not answer. Is the bridge running?");
-          }
-          setRunHistory(loadRunHistoryIndex());
-          return;
-        }
-      } else {
-        if (!(await probeLabEndpoint(endpoint))) {
-          setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
-          if (announce) {
-            setActionMessage("Lab is not reachable from this network.");
-          }
-          return;
-        }
-        for (const entry of pending) {
-          const payload = await loadCompletedRunFromHistory(entry.history_id);
-          if (payload && (await uploadRunToLab(endpoint, payload))) {
-            sent += 1;
-            markRunSynced(entry.history_id);
-          } else {
-            failed += 1;
-          }
+        return;
+      }
+      for (const entry of pending) {
+        const payload = await loadCompletedRunFromHistory(entry.history_id);
+        if (payload && (await uploadRunToLab(endpoint, payload))) {
+          sent += 1;
+          markRunSynced(entry.history_id);
+        } else {
+          failed += 1;
         }
       }
       setRunHistory(loadRunHistoryIndex());
@@ -1570,6 +1565,33 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (window.name.startsWith(LAB_HANDOVER_RESULT_PREFIX)) {
+      try {
+        const result = JSON.parse(window.name.slice(LAB_HANDOVER_RESULT_PREFIX.length)) as {
+          acks?: Array<{ id?: string; ok?: boolean }>;
+        };
+        const acks = Array.isArray(result.acks) ? result.acks : [];
+        let stored = 0;
+        for (const ack of acks) {
+          if (ack.ok && typeof ack.id === "string") {
+            markRunSynced(ack.id);
+            stored += 1;
+          }
+        }
+        setRunHistory(loadRunHistoryIndex());
+        if (acks.length > 0) {
+          const detail = `Lab stored ${stored} of ${acks.length} run${acks.length === 1 ? "" : "s"}.`;
+          setLabSync({ status: stored === acks.length ? "ok" : "offline", detail });
+          setActionMessage(detail);
+        }
+      } catch {
+        // Malformed result; runs stay pending and retry on the next sync.
+      }
+      window.name = "";
+    } else if (window.name.startsWith(LAB_HANDOVER_PREFIX)) {
+      // A handover that never reached the lab page (navigation failed or user went back).
+      window.name = "";
+    }
     const lab = new URLSearchParams(window.location.search).get("lab");
     if (lab) {
       const normalized = normalizeLabEndpoint(lab);
@@ -2276,7 +2298,7 @@ function HomeScreen({
           {scanMessage ||
             (labEndpoint.trim()
               ? labEndpoint.trim().startsWith("http://")
-                ? 'Paired. On home WiFi, tap "Sync to lab" above to hand runs over.'
+                ? 'Paired. On home WiFi, tap "Sync to lab" — the app visits the lab page, stores runs with progress shown, and returns.'
                 : "Paired over https: runs upload automatically whenever the lab answers."
               : "Tap Scan lab QR and point at the QR on the lab computer's /pair page.")}
         </p>
@@ -4315,70 +4337,29 @@ function markRunSynced(historyId: string) {
   }
 }
 
-async function syncRunsViaPopup(
-  endpoint: string,
-  pending: RunHistoryEntry[],
-): Promise<{ sent: number; failed: number } | null> {
-  const receiver = window.open(`${endpoint}/web/lab-receiver.html`, "lab-receiver");
-  if (!receiver) {
-    return null;
+const LAB_HANDOVER_PREFIX = "greenlake-labsync:";
+const LAB_HANDOVER_RESULT_PREFIX = "greenlake-labsync-result:";
+const LAB_HANDOVER_BUDGET_BYTES = 4_000_000;
+
+async function handOverRunsViaLabPage(endpoint: string, pending: RunHistoryEntry[]): Promise<void> {
+  const runs: Array<{ id: string; payload: ExportPayload }> = [];
+  let budget = 0;
+  for (const entry of pending) {
+    if (runs.length > 0 && budget + entry.json_bytes > LAB_HANDOVER_BUDGET_BYTES) {
+      break; // Remaining runs ride the next handover trip.
+    }
+    const payload = await loadCompletedRunFromHistory(entry.history_id);
+    if (payload) {
+      runs.push({ id: entry.history_id, payload });
+      budget += entry.json_bytes;
+    }
   }
-  const targetOrigin = new URL(endpoint).origin;
-  let sent = 0;
-  let failed = 0;
-  const acks: Record<string, (ok: boolean) => void> = {};
-  let readyResolve: (() => void) | null = null;
-  const onMessage = (event: MessageEvent) => {
-    if (event.origin !== targetOrigin || !event.data || typeof event.data !== "object") {
-      return;
-    }
-    const data = event.data as { type?: string; id?: string; ok?: boolean };
-    if (data.type === "lab-receiver-ready") {
-      readyResolve?.();
-    } else if (data.type === "run-ack" && typeof data.id === "string") {
-      acks[data.id]?.(Boolean(data.ok));
-    }
-  };
-  window.addEventListener("message", onMessage);
-  try {
-    const ready = await new Promise<boolean>((resolve) => {
-      const timer = window.setTimeout(() => resolve(false), 8000);
-      readyResolve = () => {
-        window.clearTimeout(timer);
-        resolve(true);
-      };
-    });
-    if (!ready) {
-      receiver.close();
-      return { sent: 0, failed: pending.length };
-    }
-    for (const entry of pending) {
-      const payload = await loadCompletedRunFromHistory(entry.history_id);
-      if (!payload) {
-        failed += 1;
-        continue;
-      }
-      const ok = await new Promise<boolean>((resolve) => {
-        const timer = window.setTimeout(() => resolve(false), 20000);
-        acks[entry.history_id] = (value) => {
-          window.clearTimeout(timer);
-          resolve(value);
-        };
-        receiver.postMessage({ type: "run", id: entry.history_id, payload }, targetOrigin);
-      });
-      delete acks[entry.history_id];
-      if (ok) {
-        sent += 1;
-        markRunSynced(entry.history_id);
-      } else {
-        failed += 1;
-      }
-    }
-    receiver.postMessage({ type: "done" }, targetOrigin);
-    return { sent, failed };
-  } finally {
-    window.removeEventListener("message", onMessage);
+  if (runs.length === 0) {
+    return;
   }
+  const returnTo = `${window.location.origin}${window.location.pathname}`;
+  window.name = LAB_HANDOVER_PREFIX + JSON.stringify({ v: 1, returnTo, runs });
+  window.location.href = `${endpoint}/web/lab-receiver.html`;
 }
 
 async function saveCompletedRunToHistory(payload: ExportPayload, filename: string): Promise<RunHistoryEntry[]> {

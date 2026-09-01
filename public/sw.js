@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.19-scanner-table";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.20-handover-sync";
 const APP_SCOPE = self.registration.scope;
 const APP_SHELL = [APP_SCOPE];
 
