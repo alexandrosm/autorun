@@ -121,7 +121,7 @@ export interface MotionWindow {
   rotation_alpha_std: number | null;
   rotation_beta_std: number | null;
   rotation_gamma_std: number | null;
-  estimated_motion_frequency_hz_optional: number | null;
+  estimated_motion_sample_rate_hz_optional: number | null;
   rotation_rate_magnitude_mean: number | null;
   rotation_rate_magnitude_std: number | null;
 }
@@ -307,7 +307,6 @@ export interface FinalizationDiagnostics {
   total_callbacks_seen: number | null;
   post_stop_first_callback_classification:
     | "post_stop_callback"
-    | "stop_point_duplicate"
     | "duplicate_stop_point"
     | "harmless_late_callback"
     | null;
@@ -433,6 +432,7 @@ export interface ArtifactModel {
   raw_segment_count: number | null;
   segments_used_for_distance: number | null;
   segments_excluded_impossible_speed: number | null;
+  segments_excluded_gps_jump: number | null;
   segments_excluded_tiny_dt: number | null;
   segments_excluded_low_accuracy: number | null;
   rolling_speed_p95_mps: number | null;
@@ -502,7 +502,7 @@ export interface Usability {
   usable_for_fitness_baseline: boolean;
   usable_for_short_run_diagnostic: boolean;
   usable_for_motion_analysis: boolean;
-  usable_for_elevation_analysis: boolean | "low_confidence";
+  usable_for_elevation_analysis: true | "low_confidence";
   usable_for_route_learning: boolean;
   usable_for_coach_update: boolean;
   reasons: string[];
@@ -585,7 +585,7 @@ export interface PatchExecutionAssessment {
       max: number | null;
     };
   }>;
-  followed_patch: boolean;
+  followed_patch: boolean | null;
   evaluated_as: "record_mode_result" | "controlled_start_calibration" | "not_evaluated";
   reason: string;
 }
@@ -756,10 +756,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.13";
+  schema_version: "0.1.14";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.13";
+    version: "0.1.14";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -858,6 +858,6 @@ export interface ExportPayload {
   };
   post_run: Record<string, unknown>;
   data_quality_notes: string[];
-  checkpoints?: Checkpoint[];
+  checkpoints: Checkpoint[];
   in_run_notes: InRunNote[];
 }

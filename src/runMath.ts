@@ -33,6 +33,7 @@ import type {
   RouteSnappedShortSummary,
   RouteSnapping,
   RunClassification,
+  RunMode,
   ShortRunDiagnostic,
   SplitFeature,
   SubjectiveDebrief,
@@ -172,10 +173,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
 
   return {
-    schema_version: "0.1.13",
+    schema_version: "0.1.14",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.13",
+      version: "0.1.14",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -268,7 +269,15 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   };
 }
 
-export function computeLiveStats(points: GpsPoint[], elapsedSeconds: number) {
+export interface LiveStats {
+  distanceMeters: number;
+  distanceMiles: number;
+  averagePaceSecondsPerMile: number | null;
+  currentPaceSecondsPerMile: number | null;
+  lastAccuracy: number | null;
+}
+
+export function computeLiveStats(points: GpsPoint[], elapsedSeconds: number): LiveStats {
   const track = buildTrack(points);
   const distanceMeters = track.length > 0 ? track[track.length - 1].cumulative_meters : 0;
   const averagePaceSecondsPerMile =
@@ -458,8 +467,8 @@ function computeFeatures(run: ActiveRun) {
     recordingReliability,
   );
   const activeDistanceConfidence =
-    dataQualityScores.distance_confidence === "high" && activeInterpolation.interpolation_confidence === "high"
-      ? "high"
+    dataQualityScores.distance_confidence === "high" && activeInterpolation.interpolation_confidence !== "high"
+      ? "medium"
       : dataQualityScores.distance_confidence;
 
   return {
@@ -471,7 +480,8 @@ function computeFeatures(run: ActiveRun) {
       distance_meters: finiteOrNull(round(distanceMeters, 2)),
       raw_recorded_distance_meters: interpolation.raw_recorded_distance_meters,
       interpolated_distance_estimate_meters: interpolation.interpolated_distance_estimate_meters,
-      distance_confidence: recordingReliability === "high" && interpolation.interpolation_confidence === "high" ? "high" : recordingReliability,
+      distance_confidence:
+        recordingReliability === "high" && interpolation.interpolation_confidence !== "high" ? "medium" : recordingReliability,
       distance_miles: finiteOrNull(round(distanceMiles, 4)),
       average_pace_seconds_per_mile:
         distanceMiles > 0 ? finiteOrNull(round(durationSeconds / distanceMiles, 2)) : null,
@@ -597,7 +607,8 @@ function getAnalysisPoints(run: ActiveRun): GpsPoint[] {
 function computeFinalization(run: ActiveRun, analysisPoints: GpsPoint[]): FinalizationDiagnostics {
   const rawPoints = run.gps_points;
   const stopPoint = run.finalization?.stop_point ?? analysisPoints[analysisPoints.length - 1] ?? null;
-  const latePoints = rawPoints.filter((point) => !analysisPoints.includes(point));
+  const analysisSet = new Set(analysisPoints);
+  const latePoints = rawPoints.filter((point) => !analysisSet.has(point));
   const firstLate = latePoints[0] ?? null;
   const lastLate = latePoints[latePoints.length - 1] ?? null;
   const postStopCount = Math.max(run.finalization?.post_stop_gps_callback_count ?? 0, latePoints.length);
@@ -645,7 +656,7 @@ function computeFinalization(run: ActiveRun, analysisPoints: GpsPoint[]): Finali
     raw_point_count: rawPoints.length,
     stored_analysis_point_count: analysisPoints.length,
     post_stop_callback_count: postStopCount,
-    total_callbacks_seen: rawPoints.length + postStopCount,
+    total_callbacks_seen: rawPoints.length + Math.max(0, postStopCount - latePoints.length),
     post_stop_first_callback_classification: firstLateClassification,
     gps_callback_cleanup_status: cleanupStatus,
     cleanup_failed: cleanupStatus !== "clean",
@@ -742,10 +753,10 @@ function computeActivityWindow(points: GpsPoint[], run: ActiveRun, track: TrackP
 
   return {
     recording_start_elapsed_seconds: 0,
-    inferred_activity_start_elapsed_seconds: activityStart === null ? null : round(activityStart, 2),
+    inferred_activity_start_elapsed_seconds: activityStart === null ? null : round(activityStart, 3),
     inferred_activity_start_confidence: confidence,
     idle_preamble_seconds: idlePreamble === null ? null : round(idlePreamble, 2),
-    inferred_activity_end_elapsed_seconds: activeEnd === null ? null : round(activeEnd, 2),
+    inferred_activity_end_elapsed_seconds: activeEnd === null ? null : round(activeEnd, 3),
     active_duration_seconds:
       activityStart !== null && activeEnd !== null ? round(Math.max(0, activeEnd - activityStart), 2) : null,
     active_distance_meters: activeDistance === null ? null : round(activeDistance, 2),
@@ -760,10 +771,7 @@ function getWindowPoints(points: GpsPoint[], startElapsed: number, endElapsed: n
   const selected = points.filter(
     (point) => point.t_elapsed_seconds >= startElapsed && point.t_elapsed_seconds <= endElapsed,
   );
-  if (selected.length >= 2) {
-    return selected;
-  }
-  return points.length > 0 ? points : [];
+  return selected;
 }
 
 function plausibleSpeedForPoint(point: GpsPoint): number | null {
@@ -1128,6 +1136,9 @@ function computeActiveTargetDistanceResult(
     method = activeWithinTolerance
       ? "recording_target_with_active_tolerance"
       : "recording_target_minus_activity_start";
+  } else if (activeWithinTolerance && track.length > 0) {
+    recordingElapsed = track[track.length - 1].t_elapsed_seconds;
+    method = "recording_target_with_active_tolerance";
   }
 
   const activeElapsed = recordingElapsed === null ? null : Math.max(0, recordingElapsed - activeStartElapsed);
@@ -1227,7 +1238,16 @@ function computeActiveShortTargetResult(
   };
 }
 
-function buildActiveTargetDistanceSplits(track: TrackPoint[], intendedDistanceMeters: number) {
+interface ActiveTargetSplits {
+  miles: SplitFeature[];
+  kilometers: SplitFeature[];
+  thirds: SplitFeature[];
+  fixed_100m: SplitFeature[];
+  fixed_200m: SplitFeature[];
+  fixed_500m: SplitFeature[];
+}
+
+function buildActiveTargetDistanceSplits(track: TrackPoint[], intendedDistanceMeters: number): ActiveTargetSplits {
   const base = buildTargetDistanceSplits(track, intendedDistanceMeters);
   const recordedDistance = track.length > 0 ? track[track.length - 1].cumulative_meters : 0;
   const cappedDistance = Math.min(recordedDistance, intendedDistanceMeters);
@@ -1320,6 +1340,20 @@ function stateAtDistance(track: TrackPoint[], distanceMeters: number): TrackStat
   return null;
 }
 
+function rangeOverlapFraction(
+  segmentStart: number,
+  segmentEnd: number,
+  startMeters: number,
+  endMeters: number,
+): number {
+  const span = segmentEnd - segmentStart;
+  if (span <= 0) {
+    return segmentStart >= startMeters && segmentStart < endMeters ? 1 : 0;
+  }
+  const overlap = Math.min(segmentEnd, endMeters) - Math.max(segmentStart, startMeters);
+  return overlap > 0 ? Math.min(1, overlap / span) : 0;
+}
+
 function elevationInRange(track: TrackPoint[], startMeters: number, endMeters: number) {
   let gain = 0;
   let loss = 0;
@@ -1327,11 +1361,7 @@ function elevationInRange(track: TrackPoint[], startMeters: number, endMeters: n
   for (let i = 1; i < track.length; i += 1) {
     const previous = track[i - 1];
     const current = track[i];
-    const segmentStart = previous.cumulative_meters;
-    const segmentEnd = current.cumulative_meters;
     if (
-      segmentEnd <= startMeters ||
-      segmentStart >= endMeters ||
       previous.altitude_meters === null ||
       current.altitude_meters === null ||
       isExcludedSegment(current) ||
@@ -1339,7 +1369,11 @@ function elevationInRange(track: TrackPoint[], startMeters: number, endMeters: n
     ) {
       continue;
     }
-    const delta = current.altitude_meters - previous.altitude_meters;
+    const fraction = rangeOverlapFraction(previous.cumulative_meters, current.cumulative_meters, startMeters, endMeters);
+    if (fraction <= 0) {
+      continue;
+    }
+    const delta = (current.altitude_meters - previous.altitude_meters) * fraction;
     if (delta > 0) {
       gain += delta;
     } else {
@@ -1413,13 +1447,24 @@ function buildFixedTimeSegments(track: TrackPoint[], seconds: number, activeStar
       `30s_${String(index).padStart(3, "0")}`,
       activeStartElapsed,
     );
+    const windowDuration = windowEnd - windowStart;
+    const windowDistance =
+      startDistance !== null && endDistance !== null ? Math.max(0, endDistance - startDistance) : null;
     segments.push({
       ...segment,
       start_recording_elapsed_seconds: round(windowStart, 2),
       end_recording_elapsed_seconds: round(windowEnd, 2),
       start_active_elapsed_seconds: round(Math.max(0, windowStart - activeStartElapsed), 2),
       end_active_elapsed_seconds: round(Math.max(0, windowEnd - activeStartElapsed), 2),
-      duration_seconds: round(windowEnd - windowStart, 2),
+      duration_seconds: round(windowDuration, 2),
+      pace_seconds_per_mile:
+        windowDistance !== null && windowDistance > 0 && windowDuration > 0
+          ? round(windowDuration / (windowDistance / METERS_PER_MILE), 2)
+          : null,
+      pace_seconds_per_km:
+        windowDistance !== null && windowDistance > 0 && windowDuration > 0
+          ? round(windowDuration / (windowDistance / METERS_PER_KM), 2)
+          : null,
     });
     windowStart = windowEnd;
     index += 1;
@@ -1482,16 +1527,19 @@ function artifactStatsInRange(
   for (let i = 1; i < track.length; i += 1) {
     const previous = track[i - 1];
     const current = track[i];
-    const segmentStart = previous.cumulative_meters;
-    const segmentEnd = current.cumulative_meters;
-    if (segmentEnd <= startMeters || segmentStart >= endMeters) {
+    if (!(current.impossible_speed || current.possible_gps_jump || current.tiny_dt_segment)) {
       continue;
     }
-    if (current.impossible_speed || current.possible_gps_jump || current.tiny_dt_segment) {
+    const fraction = rangeOverlapFraction(previous.cumulative_meters, current.cumulative_meters, startMeters, endMeters);
+    if (fraction <= 0) {
+      continue;
+    }
+    const midpoint = (previous.cumulative_meters + current.cumulative_meters) / 2;
+    if (midpoint >= startMeters && midpoint < endMeters) {
       pointCount += 1;
-      if (current.impossible_speed || current.possible_gps_jump) {
-        distanceMeters += haversineMeters(previous, current);
-      }
+    }
+    if (current.impossible_speed || current.possible_gps_jump) {
+      distanceMeters += haversineMeters(previous, current) * fraction;
     }
   }
   return {
@@ -1582,9 +1630,15 @@ function computeActivePartialPacingFeatures(
   const first500 = fixed500[0]?.pace_seconds_per_mile ?? null;
   const second500 = fixed500[1]?.pace_seconds_per_mile ?? null;
   const finalPartial = fixed500[fixed500.length - 1]?.pace_seconds_per_mile ?? null;
-  const validPaces = fixed500.map((segment) => segment.pace_seconds_per_mile).filter(isNumber);
-  const firstPace = validPaces[0] ?? null;
-  const lastPace = validPaces[validPaces.length - 1] ?? null;
+  const substantialPaces = fixed500
+    .filter((segment) => {
+      const length = (segment.end_distance_meters ?? 0) - (segment.start_distance_meters ?? 0);
+      return length >= 250;
+    })
+    .map((segment) => segment.pace_seconds_per_mile)
+    .filter(isNumber);
+  const firstPace = substantialPaces[0] ?? null;
+  const lastPace = substantialPaces[substantialPaces.length - 1] ?? null;
   const fade = firstPace !== null && lastPace !== null ? round(Math.max(0, lastPace - firstPace), 2) : null;
   const trend =
     firstPace === null || lastPace === null
@@ -1595,7 +1649,7 @@ function computeActivePartialPacingFeatures(
           ? "speeding_up"
           : "steady";
   const distance = activeTrack.length > 0 ? activeTrack[activeTrack.length - 1].cumulative_meters : 0;
-  const confidence = distance >= 1000 && validPaces.length >= 2 ? "high" : distance >= 800 ? "medium" : "low";
+  const confidence = distance >= 1000 && substantialPaces.length >= 2 ? "high" : distance >= 800 ? "medium" : "low";
 
   return {
     actual_distance_thirds: actualThirds,
@@ -1647,8 +1701,16 @@ function buildHalfSplitPace(track: TrackPoint[], halfIndex: 0 | 1): number | nul
 function computeRouteFeatures(points: GpsPoint[], routeDirection: string, routeName: string) {
   const first = points[0] ?? null;
   const last = points[points.length - 1] ?? null;
-  const latitudes = points.map((point) => point.lat);
-  const longitudes = points.map((point) => point.lon);
+  let minLat: number | null = null;
+  let maxLat: number | null = null;
+  let minLon: number | null = null;
+  let maxLon: number | null = null;
+  for (const point of points) {
+    minLat = minLat === null || point.lat < minLat ? point.lat : minLat;
+    maxLat = maxLat === null || point.lat > maxLat ? point.lat : maxLat;
+    minLon = minLon === null || point.lon < minLon ? point.lon : minLon;
+    maxLon = maxLon === null || point.lon > maxLon ? point.lon : maxLon;
+  }
 
   return {
     start_lat: first?.lat ?? null,
@@ -1657,10 +1719,10 @@ function computeRouteFeatures(points: GpsPoint[], routeDirection: string, routeN
     finish_lon: last?.lon ?? null,
     start_finish_distance_meters: first && last ? round(haversineMeters(first, last), 2) : null,
     bounding_box: {
-      min_lat: latitudes.length > 0 ? Math.min(...latitudes) : null,
-      max_lat: latitudes.length > 0 ? Math.max(...latitudes) : null,
-      min_lon: longitudes.length > 0 ? Math.min(...longitudes) : null,
-      max_lon: longitudes.length > 0 ? Math.max(...longitudes) : null,
+      min_lat: minLat,
+      max_lat: maxLat,
+      min_lon: minLon,
+      max_lon: maxLon,
     },
     route_direction: routeDirection,
     route_name: routeName,
@@ -1719,16 +1781,22 @@ function computeArtifactModel(points: GpsPoint[]): ArtifactModel {
   const segmentPoints = points.slice(1);
   const plausibleSpeeds = segmentPoints.map(plausibleSpeedForPoint).filter(isNumber);
   const impossible = segmentPoints.filter((point) => point.impossible_speed).length;
+  const gpsJump = segmentPoints.filter((point) => point.possible_gps_jump).length;
   const tinyDt = segmentPoints.filter((point) => point.tiny_dt_segment).length;
   const lowAccuracy = segmentPoints.filter(
     (point) =>
       point.horizontal_accuracy_meters !== null &&
       point.horizontal_accuracy_meters > POOR_ACCURACY_THRESHOLD_METERS,
   ).length;
-  const used = segmentPoints.length - impossible - tinyDt;
+  const excludedForDistance = segmentPoints.filter(
+    (point) => point.impossible_speed || point.possible_gps_jump,
+  ).length;
   const notes: string[] = [];
   if (impossible > 0) {
     notes.push("Impossible-speed segments were excluded from distance, pace, elevation-grade, and max-speed calculations.");
+  }
+  if (gpsJump > 0) {
+    notes.push("Possible GPS-jump segments were excluded from distance calculations.");
   }
   if (tinyDt > 0) {
     notes.push("Sub-0.5s GPS intervals were ignored for acceleration artifact flags.");
@@ -1736,15 +1804,22 @@ function computeArtifactModel(points: GpsPoint[]): ArtifactModel {
   if (lowAccuracy > 0) {
     notes.push("Low-accuracy segments were retained with flags unless also impossible-speed artifacts.");
   }
+  let maxSpeed: number | null = null;
+  for (const speed of plausibleSpeeds) {
+    if (maxSpeed === null || speed > maxSpeed) {
+      maxSpeed = speed;
+    }
+  }
 
   return {
     raw_segment_count: segmentPoints.length,
-    segments_used_for_distance: Math.max(0, used),
+    segments_used_for_distance: segmentPoints.length - excludedForDistance,
     segments_excluded_impossible_speed: impossible,
+    segments_excluded_gps_jump: gpsJump,
     segments_excluded_tiny_dt: tinyDt,
     segments_excluded_low_accuracy: lowAccuracy,
     rolling_speed_p95_mps: roundOrNull(percentile(plausibleSpeeds, 0.95), 3),
-    max_display_speed_mps: plausibleSpeeds.length > 0 ? round(Math.max(...plausibleSpeeds), 3) : null,
+    max_display_speed_mps: maxSpeed === null ? null : round(maxSpeed, 3),
     artifact_notes: notes,
   };
 }
@@ -1985,7 +2060,8 @@ function computeDataQualityScores(
       : activeReliability === "low"
         ? "low"
         : "medium";
-  const paceConfidence = targetConfidence === "high" && distanceConfidence === "high" ? "high" : distanceConfidence;
+  const paceConfidence =
+    distanceConfidence === "high" && targetConfidence !== "high" ? "medium" : distanceConfidence;
   const motionConfidence = motion.motion_usable ? "medium" : "none";
   const lifecycleReliability =
     activeGapOver10 > 0 || activeInterpolation.missing_gps_time_seconds > 30
@@ -2067,17 +2143,21 @@ function buildShortRunDiagnostic(
   const estimated1500 =
     shortTarget.target_distance_meters === 1500 && shortTarget.active_elapsed_at_target_seconds !== null
       ? shortTarget.active_elapsed_at_target_seconds
-      : activeDistanceMeters > 0
+      : enabled && activeDistanceMeters > 0
         ? round(activeDurationSeconds * (1500 / activeDistanceMeters), 2)
         : null;
   const estimatedMile =
-    activeDistanceMeters > 0 ? round(activeDurationSeconds * (METERS_PER_MILE / activeDistanceMeters), 2) : null;
+    enabled && activeDistanceMeters > 0
+      ? round(activeDurationSeconds * (METERS_PER_MILE / activeDistanceMeters), 2)
+      : null;
   const limitations: string[] = [];
   if (!enabled) {
     limitations.push("Active distance was outside the 800-3000m short-run diagnostic range.");
   }
   if (!scores.usable_for_short_pacing_calibration) {
-    limitations.push("Short-run pacing calibration usability was not met.");
+    limitations.push(
+      "Short-run pacing calibration requires at least 1000m active distance, non-low reliability, and no GPS gaps over 10s.",
+    );
   }
   if (scores.motion_confidence === "none") {
     limitations.push("Motion signal was not usable; short-run interpretation is GPS-only.");
@@ -2219,22 +2299,27 @@ function buildTargetedFollowups(
 }
 
 function buildRouteConfirmationPrompt(
-  routeTruth: ReturnType<typeof classifyRoute>,
+  routeTruth: RouteTruth,
   routeSnapping: RouteSnapping,
 ): RouteConfirmationPrompt | null {
-  const alreadyConfirmed = routeTruth.routeId ? loadStoredRouteMemory(routeTruth.routeId)?.calibration_status === "confirmed" : false;
-  const projectionOk =
-    routeSnapping.route_id === "home_block_short_loop_v1" &&
-    routeSnapping.p90_projection_error_meters !== null &&
-    routeSnapping.p90_projection_error_meters <= 20;
-  if (alreadyConfirmed || routeSnapping.route_id !== "home_block_short_loop_v1" || !projectionOk) {
+  if (routeSnapping.route_id !== "home_block_short_loop_v1") {
+    return null;
+  }
+  const alreadyConfirmed = routeTruth.routeId
+    ? loadStoredRouteMemory(routeTruth.routeId)?.calibration_status === "confirmed"
+    : false;
+  const projectionAvailable = routeSnapping.p90_projection_error_meters !== null;
+  const projectionOk = !projectionAvailable || (routeSnapping.p90_projection_error_meters ?? 0) <= 35;
+  if (alreadyConfirmed || !projectionOk) {
     return null;
   }
   return {
     id: "confirm_home_block_short_route",
     route_id: "home_block_short_loop_v1",
     prompt: "Use this as your confirmed home-block short route?",
-    reason: "The route was classified as home-block short route and projection errors were low.",
+    reason: projectionAvailable
+      ? "The route was classified as home-block short route and projection errors against the stored fingerprint were low."
+      : "The route was classified as home-block short route; confirming stores this run as its first fingerprint.",
     eligible: true,
     default_answer: "yes",
   };
@@ -2267,12 +2352,22 @@ function buildGreenLakeCalibration(
   };
 }
 
+interface RouteTruth {
+  greenLakeEnabled: boolean;
+  routeType: "green_lake_calibration" | "home_block_or_short_route" | RunMode;
+  routeId: string | null;
+  saveForFutureMatching: boolean;
+  nearGreenLake: boolean;
+  shortCue: boolean;
+  notes: string[];
+}
+
 function classifyRoute(
   preRun: PreRunState,
   activeDistanceMeters: number,
   recordedDistanceMeters: number,
   points: GpsPoint[],
-) {
+): RouteTruth {
   const routeText = `${preRun.route_name} ${preRun.free_text}`.toLowerCase();
   const shortCue = /\b(home block|short run|test run|block|sidewalk|short diagnostic)\b/.test(routeText);
   const greenLakeName = preRun.route_name.toLowerCase().includes("green lake");
@@ -2314,7 +2409,7 @@ function classifyRoute(
 }
 
 function buildRunClassification(
-  routeTruth: ReturnType<typeof classifyRoute>,
+  routeTruth: RouteTruth,
   preRun: PreRunState,
   activeDistanceMeters: number,
   recordedDistanceMeters: number,
@@ -2339,6 +2434,18 @@ function buildRunClassification(
       manual_overrides: manualOverrides,
     };
   }
+  if (preRun.mode === "instrumentation_validation") {
+    reasons.push("User selected instrumentation validation mode.");
+    return {
+      inferred_mode: "instrumentation_validation",
+      inferred_route_type: "instrumentation_validation",
+      route_id: null,
+      route_confidence: "medium",
+      mode_confidence: "high",
+      reasons,
+      manual_overrides: manualOverrides,
+    };
+  }
   if (routeTruth.shortCue || smallLoop || (activeDistanceMeters >= 800 && activeDistanceMeters <= 3000 && recordedDistanceMeters < 3200)) {
     reasons.push(smallLoop ? "Start/finish proximity and active distance indicate a short loop route." : "Active distance fits short-run diagnostic range.");
     return {
@@ -2351,8 +2458,8 @@ function buildRunClassification(
       manual_overrides: manualOverrides,
     };
   }
-  if (preRun.mode === "instrumentation_validation" || (preRun.intended_distance_meters <= 500 && recordedDistanceMeters <= 700)) {
-    reasons.push("Short target and/or selected validation mode indicate instrumentation validation.");
+  if (preRun.intended_distance_meters <= 500 && recordedDistanceMeters <= 700) {
+    reasons.push("Very short target and recorded distance indicate instrumentation validation.");
     return {
       inferred_mode: "instrumentation_validation",
       inferred_route_type: "instrumentation_validation",
@@ -2408,7 +2515,7 @@ function inferTargetDistance(preRun: PreRunState, classification: RunClassificat
 }
 
 function computeRouteSnapping(
-  routeTruth: ReturnType<typeof classifyRoute>,
+  routeTruth: RouteTruth,
   classification: RunClassification,
   points: GpsPoint[],
   activeDistanceMeters: number,
@@ -2418,37 +2525,40 @@ function computeRouteSnapping(
   const routeId = classification.route_id;
   const storedRoute = routeId ? loadStoredRouteMemory(routeId) : null;
   const storedRoutePolyline = storedRoute?.polyline ?? null;
-  const routePolyline = storedRoutePolyline ?? (points.length >= 2 ? simplifyPolyline(points) : []);
   const routeConfirmed = storedRoute?.calibration_status === "confirmed";
-  const homeBlockSnapped = Boolean(
+  const projection =
+    storedRoutePolyline && storedRoutePolyline.length >= 2
+      ? computeProjectionDiagnostics(points, storedRoutePolyline)
+      : null;
+  const projectionStatsAvailable = projection !== null && projection.errorCount > 0;
+  const p90Projection = projection?.p90_projection_error_meters ?? null;
+  const onStoredRoute = projectionStatsAvailable && p90Projection !== null && p90Projection <= 35;
+  const lowProjectionError = onStoredRoute && p90Projection !== null && p90Projection <= 20;
+  const homeBlockEligible = Boolean(
     routeId === "home_block_short_loop_v1" &&
       routeConfirmed &&
       storedRoutePolyline &&
-      activeDistanceMeters >= 800,
+      activeDistanceMeters >= 800 &&
+      onStoredRoute,
   );
-  const projectionBasis = storedRoutePolyline ? "stored_route_fingerprint" : "current_route_fingerprint";
-  const projection = routePolyline.length >= 2 ? computeProjectionDiagnostics(points, routePolyline) : null;
-  const projectionStatsAvailable = projection !== null && projection.errorCount > 0;
-  const p90Projection = projection?.p90_projection_error_meters ?? null;
-  const lowProjectionError = projectionStatsAvailable && p90Projection !== null && p90Projection <= 20;
-  const highConfidenceSnap =
-    (greenLakeSnapped || homeBlockSnapped) &&
-    lowProjectionError;
-  const snapConfidence: RouteSnapping["confidence"] = highConfidenceSnap
-    ? "high"
-    : greenLakeSnapped || homeBlockSnapped || classification.route_confidence === "high"
-      ? "medium"
-      : "low";
   const snappedDistance = greenLakeSnapped
     ? 5000
-    : homeBlockSnapped && storedRoute?.loop_length_meters
+    : homeBlockEligible && storedRoute?.loop_length_meters
       ? estimateRouteSnappedDistance(activeDistanceMeters, storedRoute.loop_length_meters)
       : null;
+  const homeBlockSnapped = homeBlockEligible && snappedDistance !== null;
   const snappingEnabled = greenLakeSnapped || homeBlockSnapped;
+  const highConfidenceSnap = snappingEnabled && lowProjectionError;
+  const snapConfidence: RouteSnapping["confidence"] = highConfidenceSnap
+    ? "high"
+    : snappingEnabled || classification.route_confidence === "high"
+      ? "medium"
+      : "low";
+  const loopLength = storedRoute?.loop_length_meters ?? null;
   return {
     enabled: snappingEnabled,
     route_id: routeId,
-    route_prior_strength: homeBlockSnapped || greenLakeSnapped ? "high" : classification.route_confidence === "medium" ? "medium" : "none",
+    route_prior_strength: snappingEnabled ? "high" : classification.route_confidence === "medium" ? "medium" : "none",
     raw_gps_distance_meters: points.length > 0 ? round(recordedDistanceMeters, 2) : null,
     artifact_filtered_gps_distance_meters: points.length > 0 ? round(activeDistanceMeters, 2) : null,
     snapped_distance_meters: snappedDistance === null ? null : round(snappedDistance, 2),
@@ -2459,51 +2569,44 @@ function computeRouteSnapping(
     projection_error_by_segment: projection?.projection_error_by_segment ?? [],
     off_route_event_count: projection?.off_route_event_count ?? 0,
     route_progress_meters: snappedDistance !== null ? round(snappedDistance, 2) : activeDistanceMeters > 0 ? round(activeDistanceMeters, 2) : null,
-    loop_count: storedRoute?.loop_length_meters ? Math.floor(activeDistanceMeters / storedRoute.loop_length_meters) : inferLoopCount(points, activeDistanceMeters),
+    loop_count: greenLakeSnapped
+      ? 1
+      : homeBlockEligible && loopLength !== null && loopLength > 0
+        ? Math.max(1, Math.round(activeDistanceMeters / loopLength))
+        : null,
     confidence: snapConfidence,
     notes: greenLakeSnapped
       ? [
           "Known-route snapping used Green Lake 5K prior distance because route confidence was high.",
           projectionStatsAvailable
-            ? `Projection-error stats were computed against ${projectionBasis}.`
-            : "Projection-error stats were unavailable, so route-snap confidence was capped below high.",
+            ? "Projection-error stats were computed against the stored route fingerprint."
+            : "No stored route fingerprint was available, so route-snap confidence was capped below high.",
         ]
       : homeBlockSnapped
         ? [
             "Confirmed home-block route snapping used the stored route fingerprint.",
-            projectionStatsAvailable
-              ? `Projection-error stats were computed against ${projectionBasis}.`
-              : "Projection-error stats were unavailable, so route-snap confidence was capped below high.",
+            "Projection-error stats were computed against the stored route fingerprint.",
           ]
-        : ["Route snapping retained artifact-filtered GPS distance until a confirmed route polyline is available."],
+        : homeBlockEligible
+          ? ["Active distance was not close to a whole number of stored loops, so artifact-filtered GPS distance was retained."]
+          : routeId === "home_block_short_loop_v1" && routeConfirmed && storedRoutePolyline && !onStoredRoute
+            ? ["Projection error against the stored route fingerprint was too high, so route snapping was disabled."]
+            : ["Route snapping retained artifact-filtered GPS distance until a confirmed route polyline is available."],
   };
 }
 
-function estimateRouteSnappedDistance(activeDistanceMeters: number, loopLengthMeters: number): number {
-  if (loopLengthMeters <= 0) {
-    return activeDistanceMeters;
-  }
-  const loopCount = Math.floor(activeDistanceMeters / loopLengthMeters);
-  const progress = activeDistanceMeters - loopCount * loopLengthMeters;
-  return loopCount * loopLengthMeters + progress;
-}
-
-function inferLoopCount(points: GpsPoint[], activeDistanceMeters: number): number | null {
-  if (points.length < 20 || activeDistanceMeters < 500) {
+function estimateRouteSnappedDistance(activeDistanceMeters: number, loopLengthMeters: number): number | null {
+  if (loopLengthMeters <= 0 || activeDistanceMeters <= 0) {
     return null;
   }
-  const startFinish = haversineMeters(points[0], points[points.length - 1]);
-  if (startFinish > 150) {
-    return null;
-  }
-  if (activeDistanceMeters >= 800 && activeDistanceMeters <= 3000) {
-    return 1;
-  }
-  return null;
+  const wholeLoops = Math.max(1, Math.round(activeDistanceMeters / loopLengthMeters));
+  const snapped = wholeLoops * loopLengthMeters;
+  const tolerance = Math.max(30, loopLengthMeters * 0.07);
+  return Math.abs(activeDistanceMeters - snapped) <= tolerance ? snapped : null;
 }
 
 function buildRouteLibrary(
-  routeTruth: ReturnType<typeof classifyRoute>,
+  routeTruth: RouteTruth,
   points: GpsPoint[],
   distanceMeters: number,
   runId: string,
@@ -2629,7 +2732,10 @@ function computeProjectionDiagnostics(points: GpsPoint[], polyline: Array<[numbe
     const end = Math.min(totalDistance, start + segmentSize);
     const segmentErrors = track
       .map((point, pointIndex) => ({ point, error: errors[pointIndex] }))
-      .filter(({ point, error }) => point.cumulative_meters >= start && point.cumulative_meters <= end && isNumber(error))
+      .filter(
+        ({ point, error }) =>
+          point.cumulative_meters >= start && (point.cumulative_meters < end || end === totalDistance) && isNumber(error),
+      )
       .map(({ error }) => error);
     projection_error_by_segment.push({
       segment_id: `projection_${index}`,
@@ -2637,7 +2743,8 @@ function computeProjectionDiagnostics(points: GpsPoint[], polyline: Array<[numbe
       end_distance_meters: round(end, 2),
       median_projection_error_meters: roundOrNull(median(segmentErrors), 2),
       p90_projection_error_meters: roundOrNull(percentile(segmentErrors, 0.9), 2),
-      max_projection_error_meters: segmentErrors.length > 0 ? round(Math.max(...segmentErrors), 2) : null,
+      max_projection_error_meters:
+        segmentErrors.length > 0 ? round(segmentErrors.reduce((a, b) => (b > a ? b : a), 0), 2) : null,
     });
   }
 
@@ -2645,7 +2752,7 @@ function computeProjectionDiagnostics(points: GpsPoint[], polyline: Array<[numbe
     errorCount: validErrors.length,
     median_projection_error_meters: roundOrNull(median(validErrors), 2),
     p90_projection_error_meters: roundOrNull(percentile(validErrors, 0.9), 2),
-    max_projection_error_meters: round(Math.max(...validErrors), 2),
+    max_projection_error_meters: round(validErrors.reduce((a, b) => (b > a ? b : a), 0), 2),
     off_route_event_count: validErrors.filter((error) => error > 35).length,
     projection_error_by_segment,
   };
@@ -2737,23 +2844,27 @@ function buildRouteSnappedShortSummary(
   const routeDistance = routeSnapping.snapped_distance_meters ?? null;
   const routeMemory = routeSnapping.route_id ? loadStoredRouteMemory(routeSnapping.route_id) : null;
   const loopLength = routeMemory?.loop_length_meters ?? null;
-  const loopCount =
+  const wholeLoops =
     loopLength !== null && routeDistance !== null && loopLength > 0
-      ? Math.floor(routeDistance / loopLength)
-      : routeSnapping.loop_count;
-  const loopProgress =
-    loopLength !== null && routeDistance !== null && loopLength > 0
-      ? round(routeDistance - Math.floor(routeDistance / loopLength) * loopLength, 2)
+      ? Math.floor(routeDistance / loopLength + 1e-6)
       : null;
-  const target1500 = shortTarget.target_distance_meters === 1500
-    ? shortTarget.active_elapsed_at_target_seconds
-    : activeTrack.length > 1 && (routeDistance ?? 0) >= 1500
+  const loopCount = wholeLoops !== null ? Math.max(1, wholeLoops) : routeSnapping.loop_count;
+  const loopProgress =
+    wholeLoops !== null && routeDistance !== null && loopLength !== null
+      ? round(Math.max(0, routeDistance - wholeLoops * loopLength), 2)
+      : null;
+  const trackFallback1500 =
+    activeTrack.length > 1 && (routeDistance ?? 0) >= 1500
       ? (() => {
           const targetState = stateAtDistance(activeTrack, 1500);
           const activeStart = activeTrack[0]?.t_elapsed_seconds ?? 0;
           return targetState ? round(Math.max(0, targetState.elapsed - activeStart), 2) : null;
         })()
       : null;
+  const target1500 =
+    shortTarget.target_distance_meters === 1500 && shortTarget.active_elapsed_at_target_seconds !== null
+      ? shortTarget.active_elapsed_at_target_seconds
+      : trackFallback1500;
 
   return {
     enabled,
@@ -2791,7 +2902,7 @@ function buildUsability(
   scores: DataQualityScores,
   greenLakeEnabled: boolean,
   shortRun: ShortRunDiagnostic,
-  routeTruth: ReturnType<typeof classifyRoute>,
+  routeTruth: RouteTruth,
   activeTargetDistanceResult: ActiveTargetDistanceResult,
 ): Usability {
   const usableForPacing = scores.usable_for_pacing_calibration || shortRun.short_run_usable;
@@ -2822,8 +2933,11 @@ function buildGroundedDebriefContext(
     objectiveFacts.push(`Inferred ${Math.round(activityWindow.idle_preamble_seconds)}s idle preamble before active running.`);
   }
   if (activeTargetDistanceResult.target_reached) {
+    const targetElapsed = activeTargetDistanceResult.active_elapsed_at_target_distance_seconds;
     objectiveFacts.push(
-      `Target ${Math.round(activeTargetDistanceResult.intended_distance_meters)}m reached at active_elapsed_at_target_distance_seconds = ${activeTargetDistanceResult.active_elapsed_at_target_distance_seconds}.`,
+      targetElapsed !== null
+        ? `Target ${Math.round(activeTargetDistanceResult.intended_distance_meters)}m reached at active_elapsed_at_target_distance_seconds = ${targetElapsed}.`
+        : `Target ${Math.round(activeTargetDistanceResult.intended_distance_meters)}m was reached, but time at target could not be derived.`,
     );
   } else {
     objectiveFacts.push(`Target ${Math.round(activeTargetDistanceResult.intended_distance_meters)}m was not reached in active analysis.`);
@@ -2863,11 +2977,12 @@ function buildGroundedDebriefContext(
 
 function buildPatchExecutionAssessment(
   preRun: PreRunState,
-  activeTargetSplits: ReturnType<typeof buildActiveTargetDistanceSplits>,
+  activeTargetSplits: ActiveTargetSplits,
 ): PatchExecutionAssessment {
+  const isControlledStart = preRun.active_patch_id === "controlled_start_v1";
   const intendedStrategy = buildCurrentPatch(preRun.active_patch_id).strategy;
   const actualSplits = activeTargetSplits.kilometers.slice(0, 5).map((split, index) => {
-    const band = CONTROLLED_START_BANDS_FOR_MATH[index] ?? null;
+    const band = isControlledStart ? CONTROLLED_START_BANDS_FOR_MATH[index] ?? null : null;
     const paceSecondsPerKm =
       split.duration_seconds !== null && split.distance_meters !== null && split.distance_meters > 0
         ? round(split.duration_seconds / (split.distance_meters / METERS_PER_KM), 2)
@@ -2898,32 +3013,35 @@ function buildPatchExecutionAssessment(
     };
   });
 
-  if (preRun.active_patch_id !== "controlled_start_v1") {
+  if (!isControlledStart) {
     return {
       patch_id: preRun.active_patch_id,
       intended_strategy: intendedStrategy,
       actual_splits: actualSplits,
-      followed_patch: false,
+      followed_patch: null,
       evaluated_as: "not_evaluated",
       reason: "No structured execution assessment is defined for this patch.",
     };
   }
 
   const km1 = actualSplits[0] ?? null;
+  const km1Known =
+    km1 !== null && (km1.status === "in_band" || km1.status === "too_fast" || km1.status === "too_slow");
   const followedKm1 = km1?.status === "in_band";
-  const evaluatedAs =
-    preRun.mode === "green_lake_5k_calibration" ? "controlled_start_calibration" : "record_mode_result";
-  const followedPatch = evaluatedAs === "controlled_start_calibration" && followedKm1;
-  const reason =
-    preRun.mode === "record_mode"
-      ? "Run was record_mode; controlled_start_v1 is attached as current patch but this does not count as a clean patch test."
-      : !followedKm1 && km1?.status === "too_fast"
+  const isCalibration = preRun.mode === "green_lake_5k_calibration";
+  const evaluatedAs: PatchExecutionAssessment["evaluated_as"] = isCalibration
+    ? "controlled_start_calibration"
+    : "record_mode_result";
+  const followedPatch = isCalibration && km1Known ? followedKm1 : null;
+  const reason = !km1Known
+    ? "Insufficient split data to evaluate controlled_start_v1."
+    : !isCalibration
+      ? "Run was not a Green Lake calibration, so controlled_start_v1 execution was recorded but not scored."
+      : km1?.status === "too_fast"
         ? "Km 1 was faster than the controlled-start target band."
-        : !followedKm1 && km1?.status === "too_slow"
+        : km1?.status === "too_slow"
           ? "Km 1 was slower than the controlled-start target band."
-          : followedPatch
-            ? "Opening kilometer matched the controlled-start target band."
-            : "Insufficient split data to evaluate controlled_start_v1.";
+          : "Opening kilometer matched the controlled-start target band.";
 
   return {
     patch_id: preRun.active_patch_id,
@@ -3250,7 +3368,9 @@ function exportPermissions(permissions: PermissionState, weatherFetchSuccess: bo
     wake_lock_available: permissions.wake_lock_available,
     wake_lock_used: permissions.wake_lock_used,
     wake_lock_error_message: permissions.wake_lock_error_message,
+    wake_lock_status: permissions.wake_lock_status,
     weather_fetch_success: weatherFetchSuccess,
+    weather_status: permissions.weather_status,
     pwa_display_mode_standalone: pwaState.display_mode_standalone,
     service_worker_controller: pwaState.service_worker_controller,
     storage_persisted: pwaState.storage_persisted,

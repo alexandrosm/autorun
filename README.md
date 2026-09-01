@@ -2,7 +2,19 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.13`
+Current version: `0.1.14`
+
+## v0.1.14 focus
+
+- Review and hardening release: fixes export math, route snapping, and persistence bugs found in a full code review.
+- Route snapping now snaps to whole stored loops with tolerance and validates projection only against stored fingerprints; confidence and `distance_basis` no longer overstate provenance.
+- Fixes split/segment elevation and artifact double-counting at boundaries, 30s-segment pace consistency, fade detection on short partial segments, and dead confidence demotions.
+- Explicit instrumentation-validation mode now wins over short-run text cues; patch execution uses a tri-state `followed_patch` and only applies controlled-start bands to `controlled_start_v1`.
+- Crash-proofs recovery of corrupt drafts, deep-merges stored `pre_run`, repairs route-memory best-1500m corruption, and hardens IndexedDB helpers against hangs and connection leaks.
+- Draft persistence now saves on a steady interval during runs (was starved by state churn), survives localStorage quota errors, and reconciles elapsed time after page suspension.
+- Stops GPS watch re-arming mid-stop, double-stop races, warmup re-arm dead-ends, and displaced wake-lock sentinels; map follow-lock no longer disengages on programmatic zoom.
+- Adds interruption / started-too-fast / final-third post-run capture, `segments_excluded_gps_jump`, wake-lock and weather status in exports; renames the motion sample-rate field honestly (`estimated_motion_sample_rate_hz_optional`); fixes `9:60` pace formatting.
+- Updates dependencies (vite 8.2.2, postcss 8.5.26, nanoid 3.3.18) clearing all `npm audit` findings; service-worker update now reloads after the new worker takes control.
 
 ## v0.1.13 focus
 

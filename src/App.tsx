@@ -17,6 +17,7 @@ import L from "leaflet";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "leaflet/dist/leaflet.css";
 import { buildExportPayload, computeLiveStats, createGpsPointFromPosition } from "./runMath";
+import type { LiveStats } from "./runMath";
 import type {
   ActiveRun,
   BreathingRecoveredAfter,
@@ -25,6 +26,7 @@ import type {
   FinalizationDiagnostics,
   GpsPoint,
   InRunNote,
+  Interruption,
   LifecycleEvent,
   MotionWindow,
   MotionDebug,
@@ -42,11 +44,12 @@ import type {
   SimpleEffort,
   SorenessLevel,
   WeatherStatusText,
+  YesNoUnsure,
 } from "./types";
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.13";
+const APP_VERSION = "0.1.14";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -72,7 +75,7 @@ const CONTROLLED_START_BANDS = [
   { km: 2, label: "Km 2", minSecondsPerKm: 335, maxSecondsPerKm: 345, text: "5:35-5:45" },
   { km: 3, label: "Km 3", minSecondsPerKm: 340, maxSecondsPerKm: 350, text: "5:40-5:50" },
   { km: 4, label: "Km 4", minSecondsPerKm: null, maxSecondsPerKm: null, text: "hold steady" },
-  { km: 5, label: "Km 5", minSecondsPerKm: null, maxSecondsPerKm: null, text: "squeeze if stable" },
+  { km: 5, label: "Km 5", minSecondsPerKm: null, maxSecondsPerKm: null, text: "squeeze only if stable" },
 ] as const;
 const RUN_MODE_OPTIONS: Array<{ value: RunMode; label: string }> = [
   { value: "short_run_diagnostic", label: "short run diagnostic" },
@@ -364,7 +367,10 @@ export default function App() {
   const startWeatherRetryTimeoutRef = useRef<number | null>(null);
   const recoverySuppressedRef = useRef(false);
   const countdownIntervalRef = useRef<number | null>(null);
+  const startRunRef = useRef<() => void>(() => {});
   const startGpsTimeoutRef = useRef<number | null>(null);
+  const lastTickWallRef = useRef<number | null>(null);
+  const lastTickPerfRef = useRef<number | null>(null);
 
   const liveStats = useMemo(
     () => computeLiveStats(activeRun?.gps_points ?? [], elapsedSeconds),
@@ -405,11 +411,12 @@ export default function App() {
   }, []);
 
   const updatePermissions = useCallback((patch: Partial<PermissionState>) => {
-    setPermissions((current) => {
-      const next = { ...current, ...patch };
-      setActiveRun((run) => (run ? { ...run, permissions: next } : run));
-      return next;
-    });
+    const patchChanges = (target: PermissionState) =>
+      (Object.keys(patch) as Array<keyof PermissionState>).some((key) => target[key] !== patch[key]);
+    setPermissions((current) => (patchChanges(current) ? { ...current, ...patch } : current));
+    setActiveRun((run) =>
+      run && patchChanges(run.permissions) ? { ...run, permissions: { ...run.permissions, ...patch } } : run,
+    );
   }, []);
 
   const appendQualityNote = useCallback((note: string) => {
@@ -420,6 +427,22 @@ export default function App() {
       return { ...run, data_quality_notes: [...run.data_quality_notes, note] };
     });
   }, []);
+
+  const reconcileElapsedClock = useCallback(() => {
+    if (runStartPerfRef.current === null || lastTickWallRef.current === null || lastTickPerfRef.current === null) {
+      return;
+    }
+    const missingSeconds =
+      (Date.now() - lastTickWallRef.current - (performance.now() - lastTickPerfRef.current)) / 1000;
+    if (missingSeconds > 1) {
+      runStartPerfRef.current -= missingSeconds * 1000;
+      lastTickWallRef.current = Date.now();
+      lastTickPerfRef.current = performance.now();
+      appendQualityNote(
+        `Recovered ${round(missingSeconds, 1)}s of suspended-clock time into elapsed after page resume.`,
+      );
+    }
+  }, [appendQualityNote]);
 
   const appendLifecycleEvent = useCallback(
     <K extends keyof RecordingLifecycle>(key: K, event: RecordingLifecycle[K][number]) => {
@@ -517,12 +540,17 @@ export default function App() {
         }));
       },
       (error) => {
-        updatePermissions({
-          geolocation_permission: error.code === error.PERMISSION_DENIED ? "denied" : "unavailable",
-        });
-        setWarmupStatus((current) => ({ ...current, active: false }));
+        if (error.code === error.PERMISSION_DENIED) {
+          stopWarmupWatch();
+          updatePermissions({ geolocation_permission: "denied" });
+          if (!silent) {
+            setActionMessage("GPS denied.");
+          }
+          return;
+        }
+        updatePermissions({ geolocation_permission: "unavailable" });
         if (!silent) {
-          setActionMessage(error.code === error.PERMISSION_DENIED ? "GPS denied." : "GPS warmup unavailable.");
+          setActionMessage("GPS warmup is still waiting for a usable fix.");
         }
       },
       {
@@ -531,7 +559,7 @@ export default function App() {
         timeout: 10000,
       },
     );
-  }, [updatePermissions]);
+  }, [stopWarmupWatch, updatePermissions]);
 
   const fetchWeatherForRun = useCallback(
     async (kind: "start" | "finish", lat: number, lon: number, retryAttempt = 0) => {
@@ -712,7 +740,15 @@ export default function App() {
           status: "requested",
         });
         const lock = await navigator.wakeLock.request("screen");
+        const previous = wakeLockRef.current;
         wakeLockRef.current = lock;
+        if (previous && previous !== lock && !previous.released) {
+          try {
+            await previous.release();
+          } catch {
+            // The displaced sentinel may already be released by the browser.
+          }
+        }
         lock.addEventListener("release", () => {
           appendLifecycleEvent("wake_lock_events", {
             event: "wake_lock_released",
@@ -720,7 +756,9 @@ export default function App() {
             t_elapsed_seconds: runStartPerfRef.current === null ? null : round(getElapsedSeconds(), 2),
             status: "released",
           });
-          updatePermissions({ wake_lock_status: "inactive" });
+          if (wakeLockRef.current === lock || wakeLockRef.current === null) {
+            updatePermissions({ wake_lock_status: "inactive" });
+          }
         });
         updatePermissions({
           wake_lock_available: true,
@@ -787,11 +825,16 @@ export default function App() {
       }
       return;
     }
-    if (
-      permissions.device_motion_permission === "ready" ||
-      permissions.device_motion_permission === "denied" ||
-      permissions.device_motion_permission === "unavailable"
-    ) {
+    if (permissions.device_motion_permission === "ready") {
+      if (!silent) {
+        setActionMessage("Motion already enabled.");
+      }
+      return;
+    }
+    if (permissions.device_motion_permission === "denied" || permissions.device_motion_permission === "unavailable") {
+      if (!silent) {
+        setActionMessage("Motion permission was denied or unavailable. Reset site permissions in the browser to retry.");
+      }
       return;
     }
 
@@ -897,6 +940,8 @@ export default function App() {
     warmupStatus.latestPoint,
   ]);
 
+  startRunRef.current = startRun;
+
   const beginStartCountdown = useCallback(
     (startAnyway = false) => {
       clearStartTimers();
@@ -910,13 +955,13 @@ export default function App() {
         if (nextSecond <= 0) {
           clearStartTimers();
           setCountdownSeconds(null);
-          startRun();
+          startRunRef.current();
           return;
         }
         setCountdownSeconds(nextSecond);
       }, 1000);
     },
-    [clearStartTimers, startRun],
+    [clearStartTimers],
   );
 
   const handleStartPressed = useCallback(() => {
@@ -953,6 +998,9 @@ export default function App() {
   ]);
 
   const stopRun = async () => {
+    if (!activeRunRef.current || activeRunRef.current.status !== "running") {
+      return;
+    }
     const elapsed = getElapsedSeconds();
     const stopClickedAt = new Date();
     const currentRun = activeRunRef.current;
@@ -1095,6 +1143,7 @@ export default function App() {
               end_time_local: null,
               end_time_utc: null,
             },
+            finalization: defaultFinalization(),
           }
         : run,
     );
@@ -1434,10 +1483,18 @@ export default function App() {
 
   const applyServiceWorkerUpdate = () => {
     const waiting = serviceWorkerRegistrationRef.current?.waiting;
-    if (waiting) {
-      waiting.postMessage({ type: "SKIP_WAITING" });
+    if (!waiting) {
+      window.location.reload();
+      return;
     }
-    window.location.reload();
+    navigator.serviceWorker.addEventListener(
+      "controllerchange",
+      () => {
+        window.location.reload();
+      },
+      { once: true },
+    );
+    waiting.postMessage({ type: "SKIP_WAITING" });
   };
 
   const appendMotionWindow = useCallback((windowSummary: MotionWindow) => {
@@ -1461,7 +1518,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (screen !== "live" || !activeRun || activeRun.run_metadata.end_time_utc) {
+    if (screen !== "live" || !activeRun || activeRun.status !== "running" || activeRun.run_metadata.end_time_utc) {
       return undefined;
     }
 
@@ -1472,6 +1529,8 @@ export default function App() {
     const intervalId = window.setInterval(() => {
       const elapsed = getElapsedSeconds();
       setElapsedSeconds(elapsed);
+      lastTickWallRef.current = Date.now();
+      lastTickPerfRef.current = performance.now();
       const currentRun = activeRunRef.current;
       const latestPoint = currentRun?.gps_points[currentRun.gps_points.length - 1] ?? null;
       if (!latestPoint) {
@@ -1521,12 +1580,15 @@ export default function App() {
       });
     }
 
+    const handleControllerChange = () => {
+      setPwaState((current) => detectPwaState(current.storage_persisted));
+    };
     if ("serviceWorker" in navigator) {
       void navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`, {
         scope: import.meta.env.BASE_URL,
       }).then((registration) => {
         serviceWorkerRegistrationRef.current = registration;
-        setPwaState(detectPwaState(pwaState.storage_persisted));
+        setPwaState((current) => detectPwaState(current.storage_persisted));
         registration.addEventListener("updatefound", () => {
           const installing = registration.installing;
           if (!installing) {
@@ -1539,12 +1601,15 @@ export default function App() {
           });
         });
       });
-      navigator.serviceWorker.addEventListener("controllerchange", () => {
-        setPwaState(detectPwaState(pwaState.storage_persisted));
-      });
+      navigator.serviceWorker.addEventListener("controllerchange", handleControllerChange);
     }
 
-    return () => window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.removeEventListener("controllerchange", handleControllerChange);
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -1612,6 +1677,7 @@ export default function App() {
     if (
       !activeRun ||
       screen !== "live" ||
+      activeRun.pre_run.intended_distance_meters <= 0 ||
       targetCheckpointRecorded ||
       targetReachedNotifiedRef.current ||
       liveStats.distanceMeters < activeRun.pre_run.intended_distance_meters
@@ -1693,6 +1759,9 @@ export default function App() {
 
   useEffect(() => {
     const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        reconcileElapsedClock();
+      }
       if (activeRunRef.current && screen === "live") {
         appendLifecycleEvent("visibility_events", {
           event: "visibilitychange",
@@ -1717,6 +1786,7 @@ export default function App() {
       }
     };
     const handlePageShow = () => {
+      reconcileElapsedClock();
       if (activeRunRef.current && screen === "live") {
         appendLifecycleEvent("pageshow_events", lifecycleEvent("pageshow", getElapsedSeconds()));
       }
@@ -1732,6 +1802,7 @@ export default function App() {
       }
     };
     const handleResume = () => {
+      reconcileElapsedClock();
       if (activeRunRef.current && screen === "live") {
         appendLifecycleEvent("visibility_events", {
           event: "resume",
@@ -1754,23 +1825,36 @@ export default function App() {
       document.removeEventListener("freeze", handleFreeze);
       document.removeEventListener("resume", handleResume);
     };
-  }, [appendLifecycleEvent, getElapsedSeconds, permissions.wake_lock_used, requestWakeLock, screen]);
+  }, [appendLifecycleEvent, getElapsedSeconds, permissions.wake_lock_available, reconcileElapsedClock, requestWakeLock, screen]);
 
   useEffect(() => {
     if (!activeRun) {
       return;
     }
-    const saveId = window.setTimeout(() => {
+    const persistDraft = () => {
+      const run = activeRunRef.current;
+      if (!run) {
+        return;
+      }
       const savedRun: ActiveRun = {
-        ...activeRun,
-        elapsed_offset_seconds: screen === "live" ? elapsedSeconds : activeRun.elapsed_offset_seconds,
+        ...run,
+        elapsed_offset_seconds: screen === "live" ? elapsedSecondsRef.current : run.elapsed_offset_seconds,
         last_saved_at_utc: new Date().toISOString(),
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(savedRun));
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(savedRun));
+      } catch {
+        // localStorage can hit quota on large drafts; the IndexedDB copy below still saves.
+      }
       void saveRunToIndexedDb(savedRun);
-    }, 500);
-    return () => window.clearTimeout(saveId);
-  }, [activeRun, elapsedSeconds, screen]);
+    };
+    const timeoutId = window.setTimeout(persistDraft, 500);
+    const intervalId = window.setInterval(persistDraft, 2000);
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.clearInterval(intervalId);
+    };
+  }, [activeRun !== null, activeRun?.status, screen]);
 
   useEffect(() => {
     setActiveRun((run) => (run ? { ...run, pwa_state: pwaState } : run));
@@ -1784,12 +1868,13 @@ export default function App() {
     return () => {
       clearStartTimers();
       stopGpsWatch();
+      stopWarmupWatch();
       if (startWeatherRetryTimeoutRef.current !== null) {
         window.clearTimeout(startWeatherRetryTimeoutRef.current);
       }
       void releaseWakeLock();
     };
-  }, [clearStartTimers, releaseWakeLock, stopGpsWatch]);
+  }, [clearStartTimers, releaseWakeLock, stopGpsWatch, stopWarmupWatch]);
 
   return (
     <main className="app-shell">
@@ -2020,7 +2105,7 @@ function SetupScreen({
     });
   };
   const gpsReady = isWarmupGpsReady(warmupStatus.latestPoint, warmupStatus.latestAccuracy);
-  const preflightItems = buildPreflightItems(preRun, permissions, warmupStatus, false, appVisible);
+  const preflightItems = buildPreflightItems(preRun, permissions, warmupStatus, appVisible);
   const preflightReady = preflightItems.every((item) => item.ok);
   const canStart = countdownSeconds === null && !pendingStart;
   const startLabel =
@@ -2414,7 +2499,7 @@ function LiveScreen({
 }: {
   run: ActiveRun;
   elapsedSeconds: number;
-  liveStats: ReturnType<typeof computeLiveStats>;
+  liveStats: LiveStats;
   targetReached: boolean;
   gpsStaleSeconds: number;
   onCheckpoint: () => void;
@@ -2527,13 +2612,14 @@ function LiveMap({
   liveStats,
 }: {
   run: ActiveRun;
-  liveStats: ReturnType<typeof computeLiveStats>;
+  liveStats: LiveStats;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
   const [tileFailure, setTileFailure] = useState(false);
   const [followLocked, setFollowLocked] = useState(true);
+  const programmaticMoveRef = useRef(false);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) {
@@ -2547,7 +2633,11 @@ function LiveMap({
       touchZoom: true,
       scrollWheelZoom: false,
     }).setView([47.679, -122.328], 14);
-    map.on("dragstart zoomstart", () => setFollowLocked(false));
+    map.on("dragstart zoomstart", () => {
+      if (!programmaticMoveRef.current) {
+        setFollowLocked(false);
+      }
+    });
 
     const tileLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19,
@@ -2638,9 +2728,13 @@ function LiveMap({
 
     const bounds = L.latLngBounds(latLngs);
     if (followLocked && latest) {
+      programmaticMoveRef.current = true;
       map.setView([latest.lat, latest.lon], Math.max(map.getZoom(), 16), { animate: false });
+      programmaticMoveRef.current = false;
     } else if (bounds.isValid() && points.length < 5) {
+      programmaticMoveRef.current = true;
       map.fitBounds(bounds.pad(0.25), { animate: false, maxZoom: 17 });
+      programmaticMoveRef.current = false;
     }
   }, [followLocked, run.checkpoints, run.gps_points]);
 
@@ -2781,7 +2875,7 @@ function StopScreen({
 }: {
   run: ActiveRun;
   elapsedSeconds: number;
-  liveStats: ReturnType<typeof computeLiveStats>;
+  liveStats: LiveStats;
   onContinue: () => void;
   onResume: () => void;
   onDiscard: () => void;
@@ -2790,14 +2884,20 @@ function StopScreen({
     () => buildExportPayload({ ...run, post_run: defaultPostRun }),
     [
       run.checkpoints,
+      run.data_quality_notes,
       run.elapsed_offset_seconds,
       run.finalization,
       run.gps_points,
+      run.in_run_notes,
+      run.motion_debug,
       run.motion_windows,
       run.permissions,
       run.pre_run,
+      run.pre_run_gps_warmup,
+      run.pwa_state,
       run.recording_lifecycle,
       run.run_metadata,
+      run.status,
       run.weather,
     ],
   );
@@ -2875,11 +2975,27 @@ function PostRunScreen({
   onConfirmRoute: () => void;
   onExport: () => void;
 }) {
-  const exportPayload = buildExportPayload(run);
-  const debriefRequired = false;
-  const debriefComplete = subjectiveDebriefCompleteForApp(postRun);
-  const skipComplete = postRun.subjective_debrief_skipped && Boolean(postRun.subjective_debrief_skip_reason?.trim());
-  const canContinue = true;
+  const exportPayload = useMemo(
+    () => buildExportPayload({ ...run, post_run: defaultPostRun }),
+    [
+      run.checkpoints,
+      run.data_quality_notes,
+      run.elapsed_offset_seconds,
+      run.finalization,
+      run.gps_points,
+      run.in_run_notes,
+      run.motion_debug,
+      run.motion_windows,
+      run.permissions,
+      run.pre_run,
+      run.pre_run_gps_warmup,
+      run.pwa_state,
+      run.recording_lifecycle,
+      run.run_metadata,
+      run.status,
+      run.weather,
+    ],
+  );
 
   return (
     <section className="screen-stack">
@@ -3053,10 +3169,56 @@ function PostRunScreen({
             <option value="legs">legs</option>
             <option value="heat">heat</option>
             <option value="hills">hills</option>
+            <option value="pacing">pacing</option>
             <option value="motivation">motivation</option>
+            <option value="time">time</option>
             <option value="other">other</option>
           </select>
         </label>
+
+        <label>
+          Interruptions
+          <select
+            value={postRun.interruption}
+            onChange={(event) => updatePostRun({ interruption: event.target.value as Interruption })}
+          >
+            <option value="none">none</option>
+            <option value="traffic">traffic</option>
+            <option value="crowd">crowd</option>
+            <option value="GPS issue">GPS issue</option>
+            <option value="bathroom">bathroom</option>
+            <option value="other">other</option>
+          </select>
+        </label>
+
+        <div className="paired-fields">
+          <label>
+            Started too fast?
+            <select
+              value={postRun.started_too_fast}
+              onChange={(event) => updatePostRun({ started_too_fast: event.target.value as YesNoUnsure })}
+            >
+              <option value="unknown">unknown</option>
+              <option value="yes">yes</option>
+              <option value="no">no</option>
+              <option value="unsure">unsure</option>
+            </select>
+          </label>
+          <label>
+            Final third harder?
+            <select
+              value={postRun.final_third_harder_than_expected}
+              onChange={(event) =>
+                updatePostRun({ final_third_harder_than_expected: event.target.value as YesNoUnsure })
+              }
+            >
+              <option value="unknown">unknown</option>
+              <option value="yes">yes</option>
+              <option value="no">no</option>
+              <option value="unsure">unsure</option>
+            </select>
+          </label>
+        </div>
 
         <details className="preflight-panel">
           <summary>Optional recovery details</summary>
@@ -3111,46 +3273,9 @@ function PostRunScreen({
           />
         </label>
 
-        {debriefRequired ? (
-          <section className="preflight-panel">
-            <div className="preflight-header">
-              <strong>Subjective debrief</strong>
-              <span>{debriefComplete ? "complete" : skipComplete ? "skipped" : "required"}</span>
-            </div>
-            <label className="preflight-check">
-              <input
-                type="checkbox"
-                checked={postRun.subjective_debrief_skipped}
-                onChange={(event) =>
-                  updatePostRun({
-                    subjective_debrief_skipped: event.target.checked,
-                    subjective_debrief_skip_reason: event.target.checked
-                      ? postRun.subjective_debrief_skip_reason
-                      : null,
-                  })
-                }
-              />
-              Skip subjective debrief
-            </label>
-            {postRun.subjective_debrief_skipped ? (
-              <label>
-                Skip reason
-                <input
-                  value={postRun.subjective_debrief_skip_reason ?? ""}
-                  onChange={(event) =>
-                    updatePostRun({ subjective_debrief_skip_reason: event.target.value || null })
-                  }
-                />
-              </label>
-            ) : null}
-            {!canContinue ? (
-              <p className="filename">RPE, energy, soreness, pain status, and limiter are required for calibration unless skipped with a reason.</p>
-            ) : null}
-          </section>
-        ) : null}
       </section>
 
-      <button type="button" className="primary-button sticky-action" onClick={onExport} disabled={!canContinue}>
+      <button type="button" className="primary-button sticky-action" onClick={onExport}>
         Continue to export
       </button>
     </section>
@@ -3374,12 +3499,10 @@ function buildPreflightItems(
   preRun: PreRunState,
   permissions: PermissionState,
   warmupStatus: { latestAccuracy: number | null },
-  motionSkipped: boolean,
   appVisible: boolean,
 ) {
   const gpsOk =
     warmupStatus.latestAccuracy !== null && warmupStatus.latestAccuracy <= ACCEPTABLE_GPS_ACCURACY_METERS;
-  const motionOk = true;
   const targetOk = Number.isFinite(preRun.intended_distance_meters) && preRun.intended_distance_meters >= 100;
 
   return [
@@ -3395,7 +3518,7 @@ function buildPreflightItems(
     },
     {
       label: "Motion",
-      ok: motionOk,
+      ok: true,
       detail: permissions.device_motion_permission === "ready" ? "will record if samples arrive" : "optional; Start will try once",
     },
     {
@@ -3576,6 +3699,7 @@ function openRunDatabase(): Promise<IDBDatabase | null> {
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => resolve(null);
+    request.onblocked = () => resolve(null);
   });
 }
 
@@ -3584,14 +3708,19 @@ async function saveRunToIndexedDb(run: ActiveRun): Promise<void> {
   if (!db) {
     return;
   }
-  await new Promise<void>((resolve) => {
-    const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
-    transaction.objectStore(IDB_STORE_NAME).put(run, IDB_ACTIVE_RUN_KEY);
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => resolve();
-    transaction.onabort = () => resolve();
-  });
-  db.close();
+  try {
+    await new Promise<void>((resolve) => {
+      const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+      transaction.objectStore(IDB_STORE_NAME).put(run, IDB_ACTIVE_RUN_KEY);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => resolve();
+      transaction.onabort = () => resolve();
+    });
+  } catch {
+    // Draft saving is best effort; the localStorage copy is the fallback.
+  } finally {
+    db.close();
+  }
 }
 
 async function loadRunFromIndexedDb(): Promise<ActiveRun | null> {
@@ -3599,14 +3728,21 @@ async function loadRunFromIndexedDb(): Promise<ActiveRun | null> {
   if (!db) {
     return null;
   }
-  const value = await new Promise<Partial<ActiveRun> | null>((resolve) => {
-    const transaction = db.transaction(IDB_STORE_NAME, "readonly");
-    const request = transaction.objectStore(IDB_STORE_NAME).get(IDB_ACTIVE_RUN_KEY);
-    request.onsuccess = () => resolve((request.result as Partial<ActiveRun> | undefined) ?? null);
-    request.onerror = () => resolve(null);
-  });
-  db.close();
-  return value ? normalizeStoredRun(value) : null;
+  try {
+    const value = await new Promise<Partial<ActiveRun> | null>((resolve) => {
+      const transaction = db.transaction(IDB_STORE_NAME, "readonly");
+      transaction.onerror = () => resolve(null);
+      transaction.onabort = () => resolve(null);
+      const request = transaction.objectStore(IDB_STORE_NAME).get(IDB_ACTIVE_RUN_KEY);
+      request.onsuccess = () => resolve((request.result as Partial<ActiveRun> | undefined) ?? null);
+      request.onerror = () => resolve(null);
+    });
+    return value ? normalizeStoredRun(value) : null;
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
 }
 
 async function deleteRunFromIndexedDb(): Promise<void> {
@@ -3614,14 +3750,19 @@ async function deleteRunFromIndexedDb(): Promise<void> {
   if (!db) {
     return;
   }
-  await new Promise<void>((resolve) => {
-    const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
-    transaction.objectStore(IDB_STORE_NAME).delete(IDB_ACTIVE_RUN_KEY);
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => resolve();
-    transaction.onabort = () => resolve();
-  });
-  db.close();
+  try {
+    await new Promise<void>((resolve) => {
+      const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+      transaction.objectStore(IDB_STORE_NAME).delete(IDB_ACTIVE_RUN_KEY);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => resolve();
+      transaction.onabort = () => resolve();
+    });
+  } catch {
+    // Draft deletion is best effort.
+  } finally {
+    db.close();
+  }
 }
 
 async function putRunDatabaseValue(key: string, value: unknown): Promise<boolean> {
@@ -3629,15 +3770,19 @@ async function putRunDatabaseValue(key: string, value: unknown): Promise<boolean
   if (!db) {
     return false;
   }
-  const saved = await new Promise<boolean>((resolve) => {
-    const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
-    transaction.objectStore(IDB_STORE_NAME).put(value, key);
-    transaction.oncomplete = () => resolve(true);
-    transaction.onerror = () => resolve(false);
-    transaction.onabort = () => resolve(false);
-  });
-  db.close();
-  return saved;
+  try {
+    return await new Promise<boolean>((resolve) => {
+      const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+      transaction.objectStore(IDB_STORE_NAME).put(value, key);
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+      transaction.onabort = () => resolve(false);
+    });
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
 }
 
 async function getRunDatabaseValue<T>(key: string): Promise<T | null> {
@@ -3645,14 +3790,20 @@ async function getRunDatabaseValue<T>(key: string): Promise<T | null> {
   if (!db) {
     return null;
   }
-  const value = await new Promise<T | null>((resolve) => {
-    const transaction = db.transaction(IDB_STORE_NAME, "readonly");
-    const request = transaction.objectStore(IDB_STORE_NAME).get(key);
-    request.onsuccess = () => resolve((request.result as T | undefined) ?? null);
-    request.onerror = () => resolve(null);
-  });
-  db.close();
-  return value;
+  try {
+    return await new Promise<T | null>((resolve) => {
+      const transaction = db.transaction(IDB_STORE_NAME, "readonly");
+      transaction.onerror = () => resolve(null);
+      transaction.onabort = () => resolve(null);
+      const request = transaction.objectStore(IDB_STORE_NAME).get(key);
+      request.onsuccess = () => resolve((request.result as T | undefined) ?? null);
+      request.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
 }
 
 async function deleteRunDatabaseValue(key: string): Promise<boolean> {
@@ -3660,15 +3811,19 @@ async function deleteRunDatabaseValue(key: string): Promise<boolean> {
   if (!db) {
     return false;
   }
-  const deleted = await new Promise<boolean>((resolve) => {
-    const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
-    transaction.objectStore(IDB_STORE_NAME).delete(key);
-    transaction.oncomplete = () => resolve(true);
-    transaction.onerror = () => resolve(false);
-    transaction.onabort = () => resolve(false);
-  });
-  db.close();
-  return deleted;
+  try {
+    return await new Promise<boolean>((resolve) => {
+      const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+      transaction.objectStore(IDB_STORE_NAME).delete(key);
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+      transaction.onabort = () => resolve(false);
+    });
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
 }
 
 function loadRunHistoryIndex(): RunHistoryEntry[] {
@@ -3698,9 +3853,19 @@ async function saveCompletedRunToHistory(payload: ExportPayload, filename: strin
   const historyId = buildHistoryId(payload);
   let storageKind: RunHistoryEntry["storage_kind"] = "indexeddb";
   const savedInIndexedDb = await putRunDatabaseValue(`${IDB_HISTORY_PREFIX}${historyId}`, payload);
-  if (!savedInIndexedDb) {
-    localStorage.setItem(`${RUN_HISTORY_PAYLOAD_PREFIX}${historyId}`, json);
-    storageKind = "localstorage";
+  if (savedInIndexedDb) {
+    try {
+      localStorage.removeItem(`${RUN_HISTORY_PAYLOAD_PREFIX}${historyId}`);
+    } catch {
+      // Removing a stale fallback copy is best effort.
+    }
+  } else {
+    try {
+      localStorage.setItem(`${RUN_HISTORY_PAYLOAD_PREFIX}${historyId}`, json);
+      storageKind = "localstorage";
+    } catch {
+      return loadRunHistoryIndex();
+    }
   }
 
   const entry = buildRunHistoryEntry(payload, filename, historyId, storageKind, new TextEncoder().encode(json).byteLength);
@@ -3726,9 +3891,13 @@ async function loadCompletedRunFromHistory(historyId: string): Promise<ExportPay
 }
 
 async function deleteCompletedRunFromHistory(historyId: string): Promise<RunHistoryEntry[]> {
-  await deleteCompletedRunPayload(historyId);
   const next = loadRunHistoryIndex().filter((entry) => entry.history_id !== historyId);
-  saveRunHistoryIndex(next);
+  try {
+    saveRunHistoryIndex(next);
+  } catch {
+    return loadRunHistoryIndex();
+  }
+  await deleteCompletedRunPayload(historyId);
   return next;
 }
 
@@ -3764,11 +3933,10 @@ function buildRunHistoryEntry(
     numberFromUnknown(activeSummary.distance_meters) ??
     numberFromUnknown(summary.distance_meters);
   const durationSeconds =
-    numberFromUnknown(payload.coach_ready_summary.target_time_seconds) ??
-    numberFromUnknown(payload.active_target_distance_result.active_elapsed_at_target_distance_seconds) ??
-    numberFromUnknown(payload.active_short_target_result.active_elapsed_at_target_seconds) ??
     numberFromUnknown(activeSummary.duration_seconds) ??
-    numberFromUnknown(summary.duration_seconds);
+    numberFromUnknown(summary.duration_seconds) ??
+    numberFromUnknown(payload.active_target_distance_result.active_elapsed_at_target_distance_seconds) ??
+    numberFromUnknown(payload.active_short_target_result.active_elapsed_at_target_seconds);
 
   return {
     history_id: historyId,
@@ -3791,7 +3959,11 @@ function buildRunHistoryEntry(
   };
 }
 
-function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
+function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun | null {
+  const runMetadata = run.run_metadata;
+  if (!runMetadata || typeof runMetadata.run_id !== "string" || typeof runMetadata.start_time_utc !== "string") {
+    return null;
+  }
   const postRun = {
     ...defaultPostRun,
     ...run.post_run,
@@ -3801,9 +3973,9 @@ function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun {
     },
   };
   return {
-    status: run.status ?? (run.run_metadata?.end_time_utc ? "stopped" : "running"),
-    run_metadata: run.run_metadata!,
-    pre_run: run.pre_run ?? defaultPreRun,
+    status: run.status ?? (runMetadata.end_time_utc ? "stopped" : "running"),
+    run_metadata: runMetadata,
+    pre_run: { ...defaultPreRun, ...run.pre_run },
     post_run: postRun,
     permissions: { ...defaultPermissions(), ...run.permissions },
     weather: run.weather ?? {
@@ -3839,15 +4011,15 @@ function saveRouteMemory(exportPayload: ExportPayload, options: { confirmRoute?:
     const existing = (current[routeId] ?? {}) as Record<string, unknown>;
     const routeLibraryEntry = exportPayload.route_library.routes.find((route) => route.route_id === routeId);
     const latestShortEstimate = exportPayload.coach_ready_summary.short_run.latest_estimated_1500m_time_seconds;
-    const priorBest = Number(existing.best_short_1500m_estimate_seconds);
+    const priorBestRaw = existing.best_short_1500m_estimate_seconds;
+    const priorBest =
+      typeof priorBestRaw === "number" && Number.isFinite(priorBestRaw) && priorBestRaw > 0 ? priorBestRaw : null;
     const bestShort =
       latestShortEstimate === null
-        ? Number.isFinite(priorBest)
-          ? priorBest
-          : null
-        : Number.isFinite(priorBest)
-          ? Math.min(priorBest, latestShortEstimate)
-          : latestShortEstimate;
+        ? priorBest
+        : priorBest === null
+          ? latestShortEstimate
+          : Math.min(priorBest, latestShortEstimate);
     current[routeId] = {
       ...existing,
       route_id: routeId,
@@ -3941,7 +4113,7 @@ function downloadBlob(blob: Blob, filename: string) {
   document.body.append(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function bytesToBlob(bytes: Uint8Array, type: string): Blob {
@@ -4031,7 +4203,7 @@ function summarizeMotionBucket(bucket: MotionBucket): MotionWindow {
     rotation_alpha_std: roundOrNull(std(bucket.rotationAlpha), 5),
     rotation_beta_std: roundOrNull(std(bucket.rotationBeta), 5),
     rotation_gamma_std: roundOrNull(std(bucket.rotationGamma), 5),
-    estimated_motion_frequency_hz_optional: round(bucket.sampleCount / duration, 3),
+    estimated_motion_sample_rate_hz_optional: round(bucket.sampleCount / duration, 3),
     rotation_rate_magnitude_mean: roundOrNull(mean(bucket.rotationMagnitude), 5),
     rotation_rate_magnitude_std: roundOrNull(std(bucket.rotationMagnitude), 5),
   };
@@ -4187,8 +4359,9 @@ function formatPace(secondsPerMile: number | null): string {
   if (secondsPerMile === null || !Number.isFinite(secondsPerMile)) {
     return "--";
   }
-  const minutes = Math.floor(secondsPerMile / 60);
-  const seconds = Math.round(secondsPerMile % 60);
+  const totalSeconds = Math.round(secondsPerMile);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
   return `${minutes}:${pad2(seconds)} /mi`;
 }
 
@@ -4196,8 +4369,9 @@ function formatPaceKm(secondsPerKm: number | null): string {
   if (secondsPerKm === null || !Number.isFinite(secondsPerKm)) {
     return "--";
   }
-  const minutes = Math.floor(secondsPerKm / 60);
-  const seconds = Math.round(secondsPerKm % 60);
+  const totalSeconds = Math.round(secondsPerKm);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
   return `${minutes}:${pad2(seconds)} /km`;
 }
 
@@ -4218,7 +4392,7 @@ function isWarmupGpsReady(point: GpsPoint | null, accuracy: number | null): bool
   }
   const fixTime = Date.parse(point.timestamp_utc);
   if (!Number.isFinite(fixTime)) {
-    return true;
+    return false;
   }
   return Date.now() - fixTime <= GPS_READY_FIX_AGE_SECONDS * 1000;
 }
@@ -4312,19 +4486,6 @@ function elapsedAtDistanceForApp(
   return null;
 }
 
-function subjectiveDebriefCompleteForApp(postRun: PostRunState): boolean {
-  const painComplete =
-    !postRun.pain_after_run.present ||
-    (Boolean(postRun.pain_after_run.location?.trim()) && postRun.pain_after_run.severity_1_to_10 !== null);
-  return (
-    postRun.rpe_1_to_10 !== null &&
-    postRun.energy_after_run_1_to_5 !== null &&
-    postRun.soreness_after_run !== "unknown" &&
-    postRun.primary_limiter !== "unknown" &&
-    painComplete
-  );
-}
-
 function permissionLabel(value: string): string {
   return value === "ready" || value === "denied" || value === "unavailable" ? value : "unknown";
 }
@@ -4384,7 +4545,8 @@ function formatLocalIso(date: Date): string {
 }
 
 function buildExportFilename(startTimeUtc: string): string {
-  const date = new Date(startTimeUtc);
+  const parsed = Date.parse(startTimeUtc);
+  const date = Number.isFinite(parsed) ? new Date(parsed) : new Date();
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: TIMEZONE,
     year: "numeric",
