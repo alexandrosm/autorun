@@ -2,7 +2,12 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.20`
+Current version: `0.1.21`
+
+## v0.1.21 focus
+
+- Sync can no longer hang on "syncing…": packing progress is shown, errors surface with their message, and a 4s watchdog detects a blocked automatic jump to the lab page.
+- When the automatic jump is blocked, an "Open lab page" link appears — a direct tap-navigation that completes the identical handover (runs are already packed in `window.name`).
 
 ## v0.1.20 focus
 

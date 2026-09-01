@@ -671,6 +671,13 @@ button {
   padding-inline: 12px;
 }
 
+.history-sync-row a.secondary-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
 .history-table {
   width: 100%;
   border-collapse: collapse;

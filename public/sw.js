@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.20-handover-sync";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.21-handover-watchdog";
 const APP_SCOPE = self.registration.scope;
 const APP_SHELL = [APP_SCOPE];
 

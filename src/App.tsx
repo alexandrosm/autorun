@@ -51,7 +51,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.20";
+const APP_VERSION = "0.1.21";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -149,6 +149,7 @@ interface RunHistoryEntry {
 interface LabSyncStatus {
   status: "idle" | "syncing" | "ok" | "offline";
   detail: string;
+  handoverUrl?: string;
 }
 
 interface RunHistoryActions {
@@ -1520,10 +1521,27 @@ export default function App() {
         return;
       }
       labSyncBusyRef.current = true;
-      setLabSync({ status: "syncing", detail: "Handing runs to the lab page…" });
+      setLabSync({ status: "syncing", detail: `Packing ${pending.length} run${pending.length === 1 ? "" : "s"}…` });
       try {
-        await handOverRunsViaLabPage(endpoint, pending);
-        // If navigation started, this page is being torn down; nothing more to do.
+        const handover = await packRunsForLabHandover(endpoint, pending);
+        if (!handover) {
+          setLabSync({ status: "offline", detail: "Could not load the pending runs from storage." });
+          setActionMessage("Could not load the pending runs from storage.");
+          return;
+        }
+        setLabSync({ status: "syncing", detail: "Opening the lab page…" });
+        // If this navigation commits, the page unloads and nothing below matters.
+        const watchdog = window.setTimeout(() => {
+          setLabSync({
+            status: "offline",
+            detail: "The lab page didn't open automatically. Tap \"Open lab page\" to finish syncing.",
+            handoverUrl: handover.url,
+          });
+        }, 4000);
+        window.addEventListener("pagehide", () => window.clearTimeout(watchdog), { once: true });
+        window.location.assign(handover.url);
+      } catch (error) {
+        setLabSync({ status: "offline", detail: `Sync failed: ${error instanceof Error ? error.message : String(error)}` });
       } finally {
         labSyncBusyRef.current = false;
       }
@@ -3828,7 +3846,12 @@ function RunHistoryPanel({
             <RefreshCw size={16} />
             Sync to lab
           </button>
-          <small>{actions.labSync.status === "syncing" ? "Syncing…" : actions.labSync.detail}</small>
+          {actions.labSync.handoverUrl ? (
+            <a className="secondary-button" href={actions.labSync.handoverUrl}>
+              Open lab page
+            </a>
+          ) : null}
+          <small>{actions.labSync.status === "syncing" ? actions.labSync.detail || "Syncing…" : actions.labSync.detail}</small>
         </div>
       ) : null}
 
@@ -4341,7 +4364,10 @@ const LAB_HANDOVER_PREFIX = "greenlake-labsync:";
 const LAB_HANDOVER_RESULT_PREFIX = "greenlake-labsync-result:";
 const LAB_HANDOVER_BUDGET_BYTES = 4_000_000;
 
-async function handOverRunsViaLabPage(endpoint: string, pending: RunHistoryEntry[]): Promise<void> {
+async function packRunsForLabHandover(
+  endpoint: string,
+  pending: RunHistoryEntry[],
+): Promise<{ url: string } | null> {
   const runs: Array<{ id: string; payload: ExportPayload }> = [];
   let budget = 0;
   for (const entry of pending) {
@@ -4355,11 +4381,11 @@ async function handOverRunsViaLabPage(endpoint: string, pending: RunHistoryEntry
     }
   }
   if (runs.length === 0) {
-    return;
+    return null;
   }
   const returnTo = `${window.location.origin}${window.location.pathname}`;
   window.name = LAB_HANDOVER_PREFIX + JSON.stringify({ v: 1, returnTo, runs });
-  window.location.href = `${endpoint}/web/lab-receiver.html`;
+  return { url: `${endpoint}/web/lab-receiver.html` };
 }
 
 async function saveCompletedRunToHistory(payload: ExportPayload, filename: string): Promise<RunHistoryEntry[]> {
