@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.22-fragment-handover";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.23-streamlined-home";
 const APP_SCOPE = self.registration.scope;
 const APP_SHELL = [APP_SCOPE];
 

@@ -51,7 +51,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.1.22";
+const APP_VERSION = "0.1.23";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -1503,6 +1503,13 @@ export default function App() {
     labSyncBusyRef.current = true;
     try {
       const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
+      if (pending.length === 0) {
+        setLabSync({ status: "ok", detail: "All saved runs are in the lab." });
+        if (announce) {
+          setActionMessage("All saved runs are in the lab.");
+        }
+        return;
+      }
       setLabSync({ status: "syncing", detail: "Contacting lab…" });
       if (await probeLabEndpoint(endpoint)) {
         // Direct connection available (same-scheme, localhost, or a granted
@@ -2296,17 +2303,52 @@ function HomeScreen({
     [onLabEndpointChange],
   );
 
+  const paired = labEndpoint.trim().length > 0;
+  const pendingCount = runHistory.filter((entry) => !entry.synced_at_utc).length;
+  const syncBusy = historyActions.labSync.status === "syncing";
+
   return (
     <section className="screen-stack">
-      <button type="button" className="primary-button" onClick={onStartNew}>
-        <Play size={20} />
-        Start a new run
-      </button>
+      <div className="home-actions">
+        {!paired ? (
+          <button type="button" className="primary-button" onClick={() => setScanning(true)}>
+            <Camera size={20} />
+            Pair with the lab
+          </button>
+        ) : historyActions.labSync.handoverUrl ? (
+          <a className="primary-button" href={historyActions.labSync.handoverUrl}>
+            <RefreshCw size={20} />
+            Open lab page to finish sync
+          </a>
+        ) : pendingCount > 0 ? (
+          <button type="button" className="primary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}>
+            <RefreshCw size={20} />
+            {syncBusy ? "Syncing…" : `Sync ${pendingCount} run${pendingCount === 1 ? "" : "s"} to lab`}
+          </button>
+        ) : null}
+
+        <button
+          type="button"
+          className={!paired || pendingCount > 0 ? "secondary-button" : "primary-button"}
+          onClick={onStartNew}
+        >
+          <Play size={20} />
+          Start run
+        </button>
+
+        <p className="home-status">
+          {scanMessage ||
+            (!paired
+              ? "Not paired yet — scan the QR on the lab computer's /pair page."
+              : historyActions.labSync.detail ||
+                (pendingCount === 0 ? "All runs are in the lab." : `${pendingCount} run${pendingCount === 1 ? "" : "s"} waiting to sync.`))}
+        </p>
+      </div>
 
       <RunHistoryPanel entries={runHistory} actions={historyActions} />
 
-      <details className="preflight-panel" open={labEndpoint.trim().length === 0}>
-        <summary>{labEndpoint.trim() ? "Lab pairing" : "Pair with the lab"}</summary>
+      <details className="preflight-panel">
+        <summary>Lab settings</summary>
         <button type="button" className="secondary-button" onClick={() => setScanning(true)}>
           <Camera size={18} />
           Scan lab QR
@@ -2320,14 +2362,6 @@ function HomeScreen({
             onChange={(event) => onLabEndpointChange(event.target.value)}
           />
         </label>
-        <p className="filename">
-          {scanMessage ||
-            (labEndpoint.trim()
-              ? labEndpoint.trim().startsWith("http://")
-                ? 'Paired. On home WiFi, tap "Sync to lab" — the app visits the lab page, stores runs with progress shown, and returns.'
-                : "Paired over https: runs upload automatically whenever the lab answers."
-              : "Tap Scan lab QR and point at the QR on the lab computer's /pair page.")}
-        </p>
       </details>
 
       {scanning ? <QrScanner onResult={handleScanResult} onClose={() => setScanning(false)} /> : null}
@@ -3841,27 +3875,12 @@ function RunHistoryPanel({
   return (
     <section className="health-panel run-history-panel">
       <div className="health-header">
-        <strong>Local run history</strong>
+        <strong>Runs</strong>
         <span>
           {entries.length} saved
           {actions.labConfigured ? ` · ${entries.filter((entry) => entry.synced_at_utc).length} in lab` : ""}
         </span>
       </div>
-
-      {actions.labConfigured ? (
-        <div className="history-sync-row">
-          <button type="button" className="secondary-button" onClick={actions.onSyncToLab}>
-            <RefreshCw size={16} />
-            Sync to lab
-          </button>
-          {actions.labSync.handoverUrl ? (
-            <a className="secondary-button" href={actions.labSync.handoverUrl}>
-              Open lab page
-            </a>
-          ) : null}
-          <small>{actions.labSync.status === "syncing" ? actions.labSync.detail || "Syncing…" : actions.labSync.detail}</small>
-        </div>
-      ) : null}
 
       {entries.length === 0 ? (
         <p className="history-empty">Completed exports will be saved on this device for later download.</p>

@@ -659,23 +659,35 @@ button {
   line-height: 1.35;
 }
 
-.history-sync-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
+.home-actions {
+  display: grid;
+  gap: 12px;
 }
 
-.history-sync-row button {
-  min-height: 38px;
-  padding-inline: 12px;
+.home-actions .primary-button,
+.home-actions .secondary-button {
+  min-height: 58px;
+  font-size: 17px;
+  border-radius: 14px;
 }
 
-.history-sync-row a.secondary-button {
+.home-actions a.primary-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 8px;
   text-decoration: none;
+}
+
+.home-status {
+  margin: 0;
+  font-size: 13px;
+  opacity: 0.7;
+  text-align: center;
+}
+
+.history-table tbody tr:nth-child(odd):not(.history-detail-row) td {
+  background: rgba(215, 239, 226, 0.03);
 }
 
 .history-table {

@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.22`
+Current version: `0.1.23`
+
+## v0.1.23 focus
+
+- Streamlined home: one contextual action that appears only when needed (Pair with the lab → Sync N runs → Open lab page fallback), with Start run as the standing second action.
+- Sync controls left the history panel; the table is cleaner with zebra rows; endpoint editing moved behind a quiet "Lab settings" panel.
+- A status line under the actions reports pairing/sync state in one sentence.
 
 ## v0.1.22 focus
 
