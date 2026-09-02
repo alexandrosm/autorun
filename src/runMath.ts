@@ -24,6 +24,7 @@ import type {
   PatchExecutionAssessment,
   PermissionState,
   PostRunState,
+  PlanBand,
   PreRunState,
   RecordingLifecycle,
   RouteDirection,
@@ -174,10 +175,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const weatherFetchSuccess = Boolean(run.weather.start_weather.fetched_at_utc || run.weather.finish_weather.fetched_at_utc);
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
   return {
-    schema_version: "0.1.24",
+    schema_version: "0.2.0",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.1.24",
+      version: "0.2.0",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -254,7 +255,7 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     usability: features.usability,
     subjective_debrief: buildSubjectiveDebrief(run.post_run),
     ux_prompt_policy: buildUxPromptPolicy(),
-    current_patch: buildCurrentPatch(run.pre_run.active_patch_id),
+    current_patch: buildCurrentPatch(run.pre_run.active_patch_id, run.pre_run.plan_bands ?? null),
     grounded_debrief_context: features.groundedDebriefContext,
     coach_ready_summary: features.coachReadySummary,
     patch_execution_assessment: features.patchExecutionAssessment,
@@ -2981,9 +2982,13 @@ function buildPatchExecutionAssessment(
   activeTargetSplits: ActiveTargetSplits,
 ): PatchExecutionAssessment {
   const isControlledStart = preRun.active_patch_id === "controlled_start_v1";
-  const intendedStrategy = buildCurrentPatch(preRun.active_patch_id).strategy;
+  const intendedStrategy = buildCurrentPatch(preRun.active_patch_id, preRun.plan_bands ?? null).strategy;
+  const planBands =
+    isControlledStart && preRun.plan_bands && preRun.plan_bands.length > 0
+      ? preRun.plan_bands
+      : CONTROLLED_START_BANDS_FOR_MATH;
   const actualSplits = activeTargetSplits.kilometers.slice(0, 5).map((split, index) => {
-    const band = isControlledStart ? CONTROLLED_START_BANDS_FOR_MATH[index] ?? null : null;
+    const band = isControlledStart ? planBands[index] ?? null : null;
     const paceSecondsPerKm =
       split.duration_seconds !== null && split.distance_meters !== null && split.distance_meters > 0
         ? round(split.duration_seconds / (split.distance_meters / METERS_PER_KM), 2)
@@ -3301,7 +3306,11 @@ function buildUxPromptPolicy() {
   };
 }
 
-function buildCurrentPatch(patchId: string): CurrentPatch {
+function buildCurrentPatch(patchId: string, planBands: PlanBand[] | null = null): CurrentPatch {
+  const strategyFromPlan =
+    planBands && planBands.length > 0
+      ? Object.fromEntries(planBands.map((band) => [`km${band.km}`, band.text]))
+      : null;
   return {
     patch_id: patchId,
     mission:
@@ -3313,14 +3322,14 @@ function buildCurrentPatch(patchId: string): CurrentPatch {
       patchId === "controlled_start_v1" ? "next comparable Green Lake run" : "next comparable run",
     strategy:
       patchId === "controlled_start_v1"
-        ? {
+        ? strategyFromPlan ?? {
             km1: "5:15-5:25",
             km2: "5:10-5:20",
             km3: "5:10-5:22",
             km4: "hold steady",
             km5: "squeeze only if stable",
           }
-        : {},
+        : strategyFromPlan ?? {},
   };
 }
 
@@ -3336,6 +3345,8 @@ function exportPreRun(preRun: PreRunState) {
     soreness_before_run: preRun.soreness_before_run,
     pain_before_run: preRun.pain_before_run,
     free_text: preRun.free_text,
+    plan_bands: preRun.plan_bands ?? null,
+    plan_basis: preRun.plan_basis ?? null,
   };
 }
 

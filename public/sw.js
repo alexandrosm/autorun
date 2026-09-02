@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.1.24-band-recalibration";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.2.0-voice-notes";
 const APP_SCOPE = self.registration.scope;
 const APP_SHELL = [APP_SCOPE];
 

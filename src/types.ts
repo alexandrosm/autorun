@@ -38,6 +38,14 @@ export interface PainState {
   severity_1_to_10: number | null;
 }
 
+export interface PlanBand {
+  km: number;
+  label: string;
+  minSecondsPerKm: number | null;
+  maxSecondsPerKm: number | null;
+  text: string;
+}
+
 export interface PreRunState {
   runner_id: "user_001";
   goal: "sub_25_5k";
@@ -51,6 +59,8 @@ export interface PreRunState {
   soreness_before_run: SorenessLevel;
   pain_before_run: PainState;
   free_text: string;
+  plan_bands?: PlanBand[] | null;
+  plan_basis?: string | null;
 }
 
 export interface PostRunState {
@@ -756,10 +766,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.1.24";
+  schema_version: "0.2.0";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.1.24";
+    version: "0.2.0";
     platform: "web";
     user_agent: string;
     created_at_utc: string;

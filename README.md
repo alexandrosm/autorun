@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.1.24`
+Current version: `0.2.0`
+
+## v0.2.0 focus
+
+- Voice notes: record feedback in the app; notes sync to the lab both lanes (direct upload and handover link) and raise a `voice_note` realm event.
+- Map-centric live screen: full-screen map, metrics overlaid, Stop always on screen.
+- Metric/imperial toggle on tap; adaptive plan bands from recent run history.
+- Background app update when parked on the home screen; Done button on export; tappable changelog under the version label.
 
 ## v0.1.24 focus
 
