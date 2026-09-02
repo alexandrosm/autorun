@@ -2,7 +2,12 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.2.0`
+Current version: `0.2.1`
+
+## v0.2.1 focus
+
+- Run history sorts and labels entries by run start time; export time moved to the expanded details.
+- Adaptive plan recency is judged by run date, not export date.
 
 ## v0.2.0 focus
 

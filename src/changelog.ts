@@ -5,6 +5,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.2.1",
+    notes: [
+      "Run history shows and sorts by when you ran, not when the export was created.",
+      "Expanded run details show the export time separately.",
+    ],
+  },
+  {
     version: "0.2.0",
     notes: [
       "Voice notes: record feedback in the app; notes sync to the lab with your runs.",

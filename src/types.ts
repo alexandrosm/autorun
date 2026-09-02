@@ -766,10 +766,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.2.0";
+  schema_version: "0.2.1";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.2.0";
+    version: "0.2.1";
     platform: "web";
     user_agent: string;
     created_at_utc: string;

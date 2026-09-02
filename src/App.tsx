@@ -54,7 +54,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.2.1";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -4092,6 +4092,7 @@ function RunHistoryPanel({
   currentHistoryId?: string;
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const sorted = [...entries].sort((a, b) => historyEntryTime(b) - historyEntryTime(a));
   return (
     <section className="health-panel run-history-panel">
       <div className="health-header">
@@ -4115,7 +4116,7 @@ function RunHistoryPanel({
             </tr>
           </thead>
           <tbody>
-            {entries.map((entry) => {
+            {sorted.map((entry) => {
               const isCurrent = entry.history_id === currentHistoryId || entry.run_id === currentHistoryId;
               const isExpanded = expandedId === entry.history_id;
               return (
@@ -4124,7 +4125,7 @@ function RunHistoryPanel({
                     className={[isCurrent ? "current" : "", isExpanded ? "expanded" : ""].join(" ").trim() || undefined}
                     onClick={() => setExpandedId(isExpanded ? null : entry.history_id)}
                   >
-                    <td>{formatHistoryDate(entry.created_at_utc)}</td>
+                    <td>{formatHistoryDate(entry.start_time_utc ?? entry.created_at_utc)}</td>
                     <td>{entry.distance_meters === null ? "unknown" : formatDistance(entry.distance_meters, actions.units)}</td>
                     <td>{formatNullableDuration(entry.duration_seconds)}</td>
                     {actions.labConfigured ? <td>{entry.synced_at_utc ? "✓" : "—"}</td> : null}
@@ -4134,7 +4135,8 @@ function RunHistoryPanel({
                       <td colSpan={actions.labConfigured ? 4 : 3}>
                         <small>
                           {entry.route_name} · {entry.inferred_mode} · {entry.gps_point_count} GPS points ·{" "}
-                          {entry.in_run_note_count} notes · {formatBytes(entry.json_bytes)} · {entry.storage_kind}
+                          {entry.in_run_note_count} notes · {formatBytes(entry.json_bytes)} · {entry.storage_kind} ·{" "}
+                          exported {formatHistoryDate(entry.created_at_utc)}
                         </small>
                         <div className="history-actions">
                           <button type="button" className="secondary-button" onClick={() => actions.onDownloadJson(entry)}>
@@ -5264,6 +5266,15 @@ function formatHistoryDate(value: string): string {
   });
 }
 
+function historyEntryTime(entry: RunHistoryEntry): number {
+  const start = entry.start_time_utc ? Date.parse(entry.start_time_utc) : Number.NaN;
+  if (Number.isFinite(start)) {
+    return start;
+  }
+  const created = Date.parse(entry.created_at_utc);
+  return Number.isFinite(created) ? created : 0;
+}
+
 function formatPace(secondsPerMile: number | null): string {
   if (secondsPerMile === null || !Number.isFinite(secondsPerMile)) {
     return "--";
@@ -5555,11 +5566,11 @@ function computeAdaptivePlan(entries: RunHistoryEntry[]): { bands: PlanBand[]; b
   const cutoff = Date.now() - 90 * 24 * 3600 * 1000;
   const paces = entries
     .filter((entry) => {
-      const at = Date.parse(entry.created_at_utc);
+      const at = historyEntryTime(entry);
       return (
         (entry.distance_meters ?? 0) >= 3000 &&
         (entry.duration_seconds ?? 0) > 0 &&
-        Number.isFinite(at) &&
+        at > 0 &&
         at >= cutoff
       );
     })

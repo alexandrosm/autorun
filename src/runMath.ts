@@ -175,10 +175,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const weatherFetchSuccess = Boolean(run.weather.start_weather.fetched_at_utc || run.weather.finish_weather.fetched_at_utc);
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
   return {
-    schema_version: "0.2.0",
+    schema_version: "0.2.1",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.2.0",
+      version: "0.2.1",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
