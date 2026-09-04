@@ -5,6 +5,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.3.0",
+    notes: [
+      "The coach now runs the experiment: bands, pre-run expectation, live display, and post-run questions arrive as a protocol from the lab.",
+      "Every export is stamped with the protocol it ran under, so results are judged against the plan that was actually in force.",
+      "Protocol arrives on any lab contact — direct, via the handover link, or the moment you pair.",
+      "Live screen fixed: legible HUD, map controls reachable, elapsed no longer freezes under motion sampling, km 1 measured from when you start moving.",
+      "Sync fixed: off-WiFi taps no longer hang on a dead page; stuck uploads time out; items the lab rejects are marked instead of retried forever.",
+      "Voice notes: mic released on every path; a note survives the phone taking the microphone; synced audio is freed from the phone.",
+      "Replaces the phone-side adaptive plan heuristic.",
+    ],
+  },
+  {
     version: "0.2.1",
     notes: [
       "Run history shows and sorts by when you ran, not when the export was created.",

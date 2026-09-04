@@ -709,6 +709,15 @@ button {
   50% { transform: scale(1.06); }
 }
 
+.coach-questions {
+  border-left: 3px solid #2dd078;
+}
+
+.coach-questions h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
 .version-button {
   background: none;
   border: none;
@@ -750,10 +759,15 @@ button {
 
 .live-wrap {
   position: relative;
-  height: calc(100dvh - 170px);
-  min-height: 460px;
+  /* The live view owns the viewport: the map is the page, the HUD floats.
+     dvh tracks the URL bar; the bottom bar is inside this box, so Stop is
+     always on-screen regardless of notices or banners above. */
+  height: calc(100dvh - 120px);
+  min-height: 380px;
   border-radius: 16px;
   overflow: hidden;
+  color: #e6f4ec; /* everything painted over the dark HUD panels is light */
+  isolation: isolate; /* stacking context: Leaflet's z-1000 controls stay under our HUD */
 }
 
 .live-wrap .map-panel {
@@ -763,6 +777,36 @@ button {
   display: flex;
   flex-direction: column;
   border-radius: 0;
+}
+
+/* The map's own toolbar/controls are replaced by the HUD in live mode. */
+.live-wrap .map-toolbar {
+  display: none;
+}
+
+.live-wrap .map-controls {
+  position: absolute;
+  right: 8px;
+  bottom: 200px;
+  z-index: 600;
+  display: grid;
+  gap: 6px;
+}
+
+.live-wrap .map-control {
+  min-height: 44px;
+  min-width: 44px;
+  background: rgba(8, 16, 12, 0.85);
+  color: #e6f4ec;
+  border-color: transparent;
+}
+
+.live-wrap .map-control.active {
+  color: #2dd078;
+}
+
+.live-wrap .leaflet-control-zoom {
+  display: none; /* pinch zooms; +/- only steals space and unlocks follow */
 }
 
 .live-wrap .map-frame {
@@ -809,7 +853,8 @@ button {
 
 .live-hero-cards {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr; /* 2, 3 or 4 cards share the row evenly */
   gap: 6px;
   cursor: pointer;
 }
@@ -830,7 +875,7 @@ button {
 }
 
 .live-hero-cards strong {
-  font-size: 16px;
+  font-size: 18px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -851,9 +896,10 @@ button {
   bottom: 8px;
   left: 8px;
   right: 8px;
-  z-index: 500;
+  z-index: 700;
   display: grid;
   gap: 8px;
+  max-height: calc(100% - 16px);
 }
 
 .live-secondary {
@@ -862,9 +908,52 @@ button {
   gap: 8px;
 }
 
-.live-secondary .secondary-button,
-.live-secondary button {
+.live-secondary > .secondary-button {
   background: rgba(8, 16, 12, 0.85);
+  color: #e6f4ec;
+  border-color: transparent;
+}
+
+/* The note panel is a sheet, not a bar: scroll inside it, never clip it. */
+.live-secondary .live-note-panel {
+  grid-column: 1 / -1;
+  max-height: calc(100dvh - 320px);
+  overflow-y: auto;
+  background: rgba(8, 16, 12, 0.94);
+  color: #e6f4ec;
+  border-radius: 12px;
+  padding: 10px;
+}
+
+.live-secondary .live-note-panel label {
+  color: #e6f4ec;
+}
+
+/* While the sheet is open, the Checkpoint button yields its row to it. */
+.live-secondary:has(.live-note-panel) > .secondary-button {
+  display: none;
+}
+
+.live-secondary .live-note-panel .tag-button {
+  min-height: 44px;
+  color: #e6f4ec;
+  background: rgba(230, 244, 236, 0.08);
+  border-color: rgba(230, 244, 236, 0.2);
+}
+
+.live-secondary .live-note-panel .tag-button.active {
+  background: #2dd078;
+  color: #08100c;
+}
+
+.live-secondary .live-note-panel .secondary-button {
+  color: #e6f4ec;
+  background: rgba(230, 244, 236, 0.08);
+}
+
+.live-secondary .live-note-panel select,
+.live-secondary .live-note-panel textarea {
+  color: #10231b;
 }
 
 .live-stop {
@@ -876,8 +965,10 @@ button {
 .live-discard {
   justify-self: center;
   background: rgba(8, 16, 12, 0.6);
+  color: #ffb3a7;
   border-radius: 8px;
   padding: 4px 10px;
+  min-height: 44px;
 }
 
 .history-table {

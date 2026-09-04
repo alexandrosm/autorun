@@ -26,6 +26,7 @@ import type {
   ActiveRun,
   BreathingRecoveredAfter,
   Checkpoint,
+  CoachProtocol,
   ExportPayload,
   FinalizationDiagnostics,
   GpsPoint,
@@ -37,6 +38,7 @@ import type {
   PermissionState,
   PhonePosition,
   PlanBand,
+  ProtocolQuestion,
   PreRunGpsWarmup,
   PostRunState,
   PreRunState,
@@ -54,7 +56,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.2.1";
+const APP_VERSION = "0.3.0";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -150,6 +152,7 @@ interface RunHistoryEntry {
   in_run_note_count: number;
   storage_kind: "indexeddb" | "localstorage";
   synced_at_utc?: string | null;
+  sync_error?: string | null;
 }
 
 interface LabSyncStatus {
@@ -164,6 +167,7 @@ interface VoiceNoteEntry {
   duration_seconds: number;
   mime: string;
   synced_at_utc?: string | null;
+  sync_error?: string | null;
 }
 
 interface RunHistoryActions {
@@ -216,6 +220,7 @@ const defaultPostRun: PostRunState = {
   pulse_after_3_to_5_min_bpm_manual: null,
   breathing_recovered_after: "unknown",
   subjective_debrief_skipped: false,
+  protocol_answers: {},
   subjective_debrief_skip_reason: null,
   free_text: "",
 };
@@ -936,8 +941,26 @@ export default function App() {
     stopWarmupWatch();
     setWarmup(finalWarmup);
 
-    const plan = computeAdaptivePlan(runHistory);
-    const planPreRun: PreRunState = { ...preRun, plan_bands: plan.bands, plan_basis: plan.basis };
+    const protocol = loadCoachProtocol();
+    const planPreRun: PreRunState = protocol
+      ? {
+          ...preRun,
+          active_patch_id: protocol.patch_id,
+          plan_bands: protocol.bands,
+          plan_basis: `coach protocol ${protocol.protocol_id}`,
+          protocol_id: protocol.protocol_id,
+          protocol_issued_at_utc: protocol.issued_at_utc,
+          protocol_thesis: protocol.thesis,
+          protocol_expectation: protocol.expectation,
+          protocol_live_ui: protocol.live_ui,
+          protocol_questions: protocol.post_run_questions,
+        }
+      : {
+          ...preRun,
+          plan_bands: CONTROLLED_START_BANDS.map((band) => ({ ...band })),
+          plan_basis: "built-in default (no coach protocol received yet)",
+          protocol_id: null,
+        };
     setPreRun(planPreRun);
     const run = createBlankRun(planPreRun, permissions, finalWarmup, pwaState, motionDebugDraft);
     recoverySuppressedRef.current = false;
@@ -965,7 +988,6 @@ export default function App() {
     fetchWeatherForRun,
     motionDebugDraft,
     permissions,
-    runHistory,
     preRun,
     pwaState,
     requestWakeLock,
@@ -1543,52 +1565,95 @@ export default function App() {
     if (!endpoint || labSyncBusyRef.current) {
       return;
     }
+    if (!announce && activeRunRef.current) {
+      return; // never do multi-MB work on the main thread during a live run
+    }
     labSyncBusyRef.current = true;
     try {
-      const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
-      const pendingNotes = loadVoiceNotesIndex().filter((note) => !note.synced_at_utc);
+      const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc && !entry.sync_error);
+      const pendingNotes = loadVoiceNotesIndex().filter((note) => !note.synced_at_utc && !note.sync_error);
       const pendingTotal = pending.length + pendingNotes.length;
       const itemsLabel = describePendingItems(pending.length, pendingNotes.length);
+      const protocolStale = Date.now() - (loadCoachProtocolFetchedAt() ?? 0) > PROTOCOL_REFRESH_MS;
+      if (pendingTotal === 0 && !announce && !protocolStale) {
+        return; // nothing to send and the protocol is fresh: no network, no flicker
+      }
+      if (announce || pendingTotal > 0) {
+        setLabSync({ status: "syncing", detail: "Contacting lab…" });
+      }
+      const probe = await probeLabEndpoint(endpoint, announce ? 15000 : 4000); // long enough for the LNA prompt on a tap
+      const direct = probe === "reachable";
+      if (direct) {
+        // The coach's channel into the phone: pull the current protocol on
+        // every direct contact, whether or not anything needs uploading.
+        const protocol = await fetchCoachProtocol(endpoint);
+        if (protocol) {
+          markCoachProtocolFetched();
+          if (saveCoachProtocol(protocol)) {
+            setActionMessage(`New coach protocol ${protocol.protocol_id}: ${protocol.expectation}`);
+          }
+        }
+      }
       if (pendingTotal === 0) {
-        setLabSync({ status: "ok", detail: "Everything is in the lab." });
+        if (announce || direct) {
+          setLabSync({ status: direct ? "ok" : "offline", detail: direct ? "Everything is in the lab." : "Lab not reachable from this network." });
+        }
         if (announce) {
-          setActionMessage("Everything is in the lab.");
+          setActionMessage(direct ? "Everything is in the lab." : "Lab is not reachable from this network.");
         }
         return;
       }
-      setLabSync({ status: "syncing", detail: "Contacting lab…" });
-      if (await probeLabEndpoint(endpoint)) {
+      if (direct) {
         // Direct connection available (same-scheme, localhost, or a granted
         // local-network-access permission): upload in place, no navigation.
         let sent = 0;
         let failed = 0;
+        let rejected = 0;
         for (const entry of pending) {
           const payload = await loadCompletedRunFromHistory(entry.history_id);
-          if (payload && (await uploadRunToLab(endpoint, payload))) {
+          const result: UploadResult = payload ? await uploadRunToLab(endpoint, payload) : "rejected";
+          if (result === "stored") {
             sent += 1;
             markRunSynced(entry.history_id);
+          } else if (result === "rejected") {
+            rejected += 1;
+            markRunSyncError(entry.history_id, payload ? "lab rejected this run" : "run data missing on this device");
           } else {
             failed += 1;
           }
         }
         for (const note of pendingNotes) {
-          if (await uploadVoiceNoteToLab(endpoint, note)) {
+          const result = await uploadVoiceNoteToLab(endpoint, note);
+          if (result === "stored") {
             sent += 1;
             markVoiceNoteSynced(note.note_id);
+          } else if (result === "rejected") {
+            rejected += 1;
+            markVoiceNoteSyncError(note.note_id, "lab rejected this note");
           } else {
             failed += 1;
           }
         }
         setRunHistory(loadRunHistoryIndex());
         setVoiceNotes(loadVoiceNotesIndex());
-        const detail = `Sent ${sent} of ${pendingTotal} (${itemsLabel}) to the lab.`;
+        const parts = [`Sent ${sent} of ${pendingTotal} (${itemsLabel}) to the lab.`];
+        if (failed > 0) {
+          parts.push(`${failed} failed — will retry.`);
+        }
+        if (rejected > 0) {
+          parts.push(`${rejected} can't sync — see the run list.`);
+        }
+        const detail = parts.join(" ");
         setLabSync({ status: failed > 0 ? "offline" : "ok", detail });
         if (announce) {
           setActionMessage(detail);
         }
         return;
       }
-      const handoverPossible = endpoint.startsWith("http://") && window.location.protocol === "https:";
+      // Not directly reachable. Only a *policy* block (mixed content / LNA denied)
+      // justifies the top-level handover; a dead host would just hang the runner.
+      const handoverPossible =
+        probe === "blocked" && endpoint.startsWith("http://") && window.location.protocol === "https:";
       if (!handoverPossible) {
         setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
         if (announce) {
@@ -1606,10 +1671,16 @@ export default function App() {
       }
       setLabSync({ status: "syncing", detail: `Packing ${itemsLabel}…` });
       const handover = await packRunsForLabHandover(endpoint, pending, pendingNotes);
-      if (!handover) {
+      for (const id of handover?.oversized ?? []) {
+        markRunSyncError(id, "too large for the handover link — sync on WiFi with local network access allowed");
+      }
+      if (handover?.oversized.length) {
+        setRunHistory(loadRunHistoryIndex());
+      }
+      if (!handover || handover.count === 0) {
         setLabSync({
           status: "offline",
-          detail: "Pending items are too large for the handover link. Grant local network access when Chrome asks, then retry.",
+          detail: "Nothing packable: the pending items are too large for the handover link. Grant local network access when Chrome asks, then retry.",
         });
         return;
       }
@@ -1640,7 +1711,12 @@ export default function App() {
         const result = JSON.parse(base64UrlToUtf8(window.location.hash.slice("#labsync=".length))) as {
           acks?: Array<{ id?: string; ok?: boolean }>;
           noteAcks?: Array<{ id?: string; ok?: boolean }>;
+          protocol?: unknown;
         };
+        const protocol = parseCoachProtocol(result.protocol);
+        if (protocol && saveCoachProtocol(protocol)) {
+          setActionMessage(`New coach protocol ${protocol.protocol_id}: ${protocol.expectation}`);
+        }
         const acks = Array.isArray(result.acks) ? result.acks : [];
         const noteAcks = Array.isArray(result.noteAcks) ? result.noteAcks : [];
         let stored = 0;
@@ -1675,6 +1751,9 @@ export default function App() {
       saveLabSyncSettings({ endpoint: normalized });
       setLabEndpoint(normalized);
       setActionMessage("Lab sync endpoint saved from link.");
+      // One-shot provisioning: a refresh must not re-save the QR endpoint over
+      // an edit the runner made by hand.
+      window.history.replaceState(null, "", window.location.pathname);
     }
     if (loadLabSyncSettings().endpoint) {
       void syncRunsToLab();
@@ -1686,6 +1765,7 @@ export default function App() {
       if (document.visibilityState === "visible" && !activeRunRef.current) {
         // A lab-page round trip in another surface may have marked runs synced.
         setRunHistory(loadRunHistoryIndex());
+        setVoiceNotes(loadVoiceNotesIndex());
       }
     };
     document.addEventListener("visibilitychange", refreshOnReturn);
@@ -1694,12 +1774,19 @@ export default function App() {
 
   useEffect(() => {
     // Background update: apply a waiting version automatically, but only when
-    // it cannot interrupt anything (home screen, no active run).
-    if (serviceWorkerUpdateReady && screen === "home" && !activeRun && !autoUpdateAppliedRef.current) {
+    // it cannot interrupt anything: home screen, no run, no recording, no upload.
+    if (
+      serviceWorkerUpdateReady &&
+      screen === "home" &&
+      !activeRun &&
+      !recordingNote &&
+      labSync.status !== "syncing" &&
+      !autoUpdateAppliedRef.current
+    ) {
       autoUpdateAppliedRef.current = true;
       applyServiceWorkerUpdate();
     }
-  }, [activeRun, screen, serviceWorkerUpdateReady]);
+  }, [activeRun, screen, serviceWorkerUpdateReady, recordingNote, labSync.status]);
 
   const historyActions: RunHistoryActions = {
     onDownloadJson: downloadHistoryJson,
@@ -1716,9 +1803,13 @@ export default function App() {
   };
 
   const planPreview = useMemo(() => {
-    const plan = computeAdaptivePlan(runHistory);
-    return `Plan ${plan.basis}: km1 ${plan.bands[0].text}, km2 ${plan.bands[1].text}, km3 ${plan.bands[2].text}.`;
-  }, [runHistory]);
+    const protocol = loadCoachProtocol();
+    if (!protocol) {
+      return `No coach protocol yet — built-in plan: km1 ${CONTROLLED_START_BANDS[0].text}, km2 ${CONTROLLED_START_BANDS[1].text}, km3 ${CONTROLLED_START_BANDS[2].text}. Pair with the lab to receive one.`;
+    }
+    return `${protocol.expectation} (protocol ${protocol.protocol_id})`;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [labEndpoint, labSync.status, screen]);
 
   const installPwa = async () => {
     const promptEvent = installPrompt as Event & { prompt?: () => Promise<void> };
@@ -1766,8 +1857,14 @@ export default function App() {
     [appendMotionWindow],
   );
 
+  // Keyed on the run's *status*, never the run object: every GPS fix and every
+  // motion-debug update replaces the object, and a 500 ms interval that is torn
+  // down more often than every 500 ms never fires (frozen Elapsed, dead stale
+  // detection, unarmed clock reconciliation).
+  const tickerActive =
+    screen === "live" && activeRun !== null && activeRun.status === "running" && !activeRun.run_metadata.end_time_utc;
   useEffect(() => {
-    if (screen !== "live" || !activeRun || activeRun.status !== "running" || activeRun.run_metadata.end_time_utc) {
+    if (!tickerActive) {
       return undefined;
     }
 
@@ -1812,7 +1909,7 @@ export default function App() {
     }, 500);
 
     return () => window.clearInterval(intervalId);
-  }, [activeRun, appendLifecycleEvent, getElapsedSeconds, screen, startGpsWatch]);
+  }, [tickerActive, appendLifecycleEvent, getElapsedSeconds, startGpsWatch]);
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (event: Event) => {
@@ -2165,7 +2262,7 @@ export default function App() {
         <div className="screen-chip">{screenLabel(screen)}</div>
       </header>
 
-      {actionMessage ? <div className="notice">{actionMessage}</div> : null}
+      {actionMessage && screen !== "live" ? <div className="notice">{actionMessage}</div> : null}
       {serviceWorkerUpdateReady && (screen === "home" || screen === "setup" || screen === "export") ? (
         <button type="button" className="update-banner" onClick={applyServiceWorkerUpdate}>
           New version ready. Tap to update.
@@ -2183,8 +2280,9 @@ export default function App() {
           historyActions={historyActions}
           labEndpoint={labEndpoint}
           onLabEndpointChange={handleLabEndpointChange}
+          onPaired={() => void syncRunsToLab(true)}
           onStartNew={() => setScreen("setup")}
-          pendingNoteCount={voiceNotes.filter((note) => !note.synced_at_utc).length}
+          pendingNoteCount={voiceNotes.filter((note) => !note.synced_at_utc && !note.sync_error).length}
           onRecordNote={() => setRecordingNote(true)}
         />
       ) : null}
@@ -2207,7 +2305,16 @@ export default function App() {
           onWakeLock={() => void requestWakeLock(false)}
           onStart={handleStartPressed}
           onStartAnyway={() => beginStartCountdown(true)}
-          onBack={() => setScreen("home")}
+          onBack={() => {
+            // Leaving setup must disarm everything Start set in motion, or the
+            // countdown can fire and drop the runner into a live run from Home.
+            clearStartTimers();
+            setPendingStart(false);
+            setCountdownSeconds(null);
+            setGpsStartTimedOut(false);
+            stopWarmupWatch();
+            setScreen("home");
+          }}
           planPreview={planPreview}
         />
       ) : null}
@@ -2395,6 +2502,7 @@ function HomeScreen({
   historyActions,
   labEndpoint,
   onLabEndpointChange,
+  onPaired,
   onStartNew,
   pendingNoteCount,
   onRecordNote,
@@ -2403,6 +2511,7 @@ function HomeScreen({
   historyActions: RunHistoryActions;
   labEndpoint: string;
   onLabEndpointChange: (value: string) => void;
+  onPaired: () => void;
   onStartNew: () => void;
   pendingNoteCount: number;
   onRecordNote: () => void;
@@ -2416,15 +2525,16 @@ function HomeScreen({
         return false;
       }
       onLabEndpointChange(endpoint);
-      setScanMessage(`Paired with ${endpoint}.`);
       setScanning(false);
+      // Pairing is the moment the coach's protocol should arrive: contact the lab now.
+      onPaired();
       return true;
     },
-    [onLabEndpointChange],
+    [onLabEndpointChange, onPaired],
   );
 
   const paired = labEndpoint.trim().length > 0;
-  const pendingRuns = runHistory.filter((entry) => !entry.synced_at_utc).length;
+  const pendingRuns = runHistory.filter((entry) => !entry.synced_at_utc && !entry.sync_error).length;
   const pendingCount = pendingRuns + pendingNoteCount;
   const syncBusy = historyActions.labSync.status === "syncing";
 
@@ -2465,13 +2575,12 @@ function HomeScreen({
         </button>
 
         <p className="home-status">
-          {scanMessage ||
-            (!paired
-              ? "Not paired yet — scan the QR on the lab computer's /pair page."
-              : historyActions.labSync.detail ||
-                (pendingCount === 0
-                  ? "Everything is in the lab."
-                  : `${describePendingItems(pendingRuns, pendingNoteCount)} waiting to sync.`))}
+          {!paired
+            ? "Not paired yet — scan the QR on the lab computer's /pair page."
+            : historyActions.labSync.detail ||
+              (pendingCount === 0
+                ? "Everything is in the lab."
+                : `${describePendingItems(pendingRuns, pendingNoteCount)} waiting to sync.`)}
         </p>
       </div>
 
@@ -2483,6 +2592,12 @@ function HomeScreen({
           <Camera size={18} />
           Scan lab QR
         </button>
+        {paired ? (
+          <button type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}>
+            <RefreshCw size={18} />
+            Check in with the lab
+          </button>
+        ) : null}
         <label>
           Lab endpoint URL
           <input
@@ -2506,7 +2621,9 @@ function extractLabEndpoint(text: string): string {
     if (lab) {
       return normalizeLabEndpoint(lab);
     }
-    if ((url.protocol === "http:" || url.protocol === "https:") && url.host !== window.location.host) {
+    // A bare bridge URL (the /pair page itself, or the endpoint) also pairs;
+    // an arbitrary website QR must not — it would point every sync at a stranger.
+    if ((url.protocol === "http:" || url.protocol === "https:") && url.port && url.host !== window.location.host) {
       return normalizeLabEndpoint(url.origin);
     }
   } catch {
@@ -2530,86 +2647,127 @@ function VoiceNoteRecorder({ onSaved, onClose }: { onSaved: () => void; onClose:
   const [error, setError] = useState("");
   const [seconds, setSeconds] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [micEnded, setMicEnded] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
   const startedAtRef = useRef(Date.now());
+  const timerRef = useRef(0);
+
+  const releaseMic = () => {
+    window.clearInterval(timerRef.current);
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  };
 
   useEffect(() => {
-    let stream: MediaStream | null = null;
-    let timerId = 0;
+    let unmounted = false;
     void (async () => {
+      let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const recorder = new MediaRecorder(stream);
-        recorderRef.current = recorder;
-        recorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            chunksRef.current.push(event.data);
-          }
-        };
-        recorder.start();
-        startedAtRef.current = Date.now();
-        timerId = window.setInterval(
-          () => setSeconds(Math.round((Date.now() - startedAtRef.current) / 1000)),
-          500,
-        );
       } catch (err) {
-        setError(
-          err instanceof Error && err.name === "NotAllowedError"
-            ? "Microphone permission was denied. Allow it and try again."
-            : "Microphone unavailable on this device/browser.",
-        );
+        if (!unmounted) {
+          setError(
+            err instanceof Error && err.name === "NotAllowedError"
+              ? "Microphone permission was denied. Allow it and try again."
+              : "Microphone unavailable on this device/browser.",
+          );
+        }
+        return;
       }
+      if (unmounted) {
+        // Discarded while the permission prompt was up: never leave the mic hot.
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      streamRef.current = stream;
+      const recorder = new MediaRecorder(stream);
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+        }
+      };
+      // The OS took the mic (call, another app): keep what we have, stop the clock.
+      stream.getTracks()[0]?.addEventListener("ended", () => {
+        if (recorder.state !== "inactive") {
+          recorder.stop();
+        }
+        window.clearInterval(timerRef.current);
+        setMicEnded(true);
+      });
+      recorder.start(1000);
+      startedAtRef.current = Date.now();
+      timerRef.current = window.setInterval(
+        () => setSeconds(Math.round((Date.now() - startedAtRef.current) / 1000)),
+        500,
+      );
     })();
     return () => {
-      window.clearInterval(timerId);
+      unmounted = true;
       const recorder = recorderRef.current;
       if (recorder && recorder.state !== "inactive") {
         recorder.onstop = null;
         recorder.stop();
       }
-      stream?.getTracks().forEach((track) => track.stop());
+      releaseMic();
     };
   }, []);
 
+  const persist = async (recorder: MediaRecorder) => {
+    const mime = recorder.mimeType || "audio/webm";
+    const blob = new Blob(chunksRef.current, { type: mime });
+    if (blob.size === 0) {
+      setError("Nothing was captured.");
+      setSaving(false);
+      return;
+    }
+    const duration = Math.max(1, Math.round((Date.now() - startedAtRef.current) / 1000));
+    const noteId = `note_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const stored = await putRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`, blob);
+    if (!stored) {
+      setError("Could not store the note on this device. Try again or discard.");
+      setSaving(false);
+      return;
+    }
+    saveVoiceNotesIndex([
+      { note_id: noteId, created_at_utc: new Date().toISOString(), duration_seconds: duration, mime },
+      ...loadVoiceNotesIndex(),
+    ]);
+    onSaved();
+  };
+
   const saveNote = () => {
     const recorder = recorderRef.current;
-    if (!recorder || recorder.state === "inactive") {
+    if (!recorder) {
       onClose();
       return;
     }
     setSaving(true);
+    if (recorder.state === "inactive") {
+      releaseMic();
+      void persist(recorder); // mic ended early; save whatever was captured
+      return;
+    }
+    // Stop the recorder first so the final chunk flushes; only then drop the tracks.
     recorder.onstop = () => {
-      void (async () => {
-        const mime = recorder.mimeType || "audio/webm";
-        const blob = new Blob(chunksRef.current, { type: mime });
-        const duration = Math.max(1, Math.round((Date.now() - startedAtRef.current) / 1000));
-        const noteId = `note_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        const stored = await putRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`, blob);
-        if (!stored) {
-          setError("Could not store the note on this device.");
-          setSaving(false);
-          return;
-        }
-        saveVoiceNotesIndex([
-          { note_id: noteId, created_at_utc: new Date().toISOString(), duration_seconds: duration, mime },
-          ...loadVoiceNotesIndex(),
-        ]);
-        onSaved();
-      })();
+      releaseMic();
+      void persist(recorder);
     };
     recorder.stop();
   };
 
+  const canSave = !saving && (!error || chunksRef.current.length > 0);
   return (
     <div className="scanner-overlay">
       <div className="recorder-pulse">{error ? "!" : formatDuration(seconds)}</div>
-      <p>{error || "Recording voice note for the lab…"}</p>
+      <p>{error || (micEnded ? "Microphone was taken by another app — save what you have." : "Recording voice note for the lab…")}</p>
       <div className="button-grid">
         <button type="button" className="secondary-button" onClick={onClose} disabled={saving}>
           Discard
         </button>
-        <button type="button" className="primary-button" onClick={saveNote} disabled={saving || Boolean(error)}>
+        <button type="button" className="primary-button" onClick={saveNote} disabled={!canSave}>
           {saving ? "Saving…" : "Save note"}
         </button>
       </div>
@@ -2636,6 +2794,13 @@ function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean;
       }
     };
 
+    let detectFailures = 0;
+    const loadFallback = async () => {
+      // Dynamic on purpose: jsQR is a fallback for browsers without a working
+      // BarcodeDetector; a static import would put ~40KB into the main bundle.
+      const module = await import("jsqr");
+      decodeFallback = (data, width, height) => module.default(data, width, height);
+    };
     const scan = async () => {
       if (stopped) {
         return;
@@ -2645,6 +2810,7 @@ function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean;
         try {
           if (detector) {
             const results = await detector.detect(video);
+            detectFailures = 0;
             const value = results[0]?.rawValue;
             if (value) {
               deliver(value);
@@ -2662,8 +2828,19 @@ function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean;
               }
             }
           }
-        } catch {
-          // Detection hiccups are normal while focusing; keep scanning.
+        } catch (err) {
+          // Focus hiccups reject occasionally; a detector whose backend is missing
+          // (Chrome without ML Kit) rejects every frame — switch to jsQR then.
+          detectFailures += 1;
+          const unsupported = err instanceof DOMException && err.name === "NotSupportedError";
+          if (detector && (unsupported || detectFailures >= 8) && !decodeFallback) {
+            detector = null;
+            try {
+              await loadFallback();
+            } catch {
+              setError("QR scanning isn't available offline on this browser. Type the lab address instead.");
+            }
+          }
         }
       }
       if (!stopped) {
@@ -2677,10 +2854,7 @@ function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean;
         if (DetectorCtor) {
           detector = new DetectorCtor({ formats: ["qr_code"] });
         } else {
-          // Dynamic on purpose: jsQR is a fallback for browsers without BarcodeDetector;
-          // a static import would put ~40KB into the main bundle every phone must load.
-          const module = await import("jsqr");
-          decodeFallback = (data, width, height) => module.default(data, width, height);
+          await loadFallback();
         }
         stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
         if (stopped) {
@@ -2930,32 +3104,31 @@ function SetupScreen({
         Use Green Lake 5K calibration
       </button>
 
-      <section className="preflight-panel">
-        <div className="preflight-header">
-          <strong>Strategy patch</strong>
-          <span>{preRun.active_patch_id}</span>
-        </div>
-        <div className="preflight-list">
-          <div className="preflight-item ok">
-            <span>PATCH</span>
-            <strong>controlled_start_v1</strong>
-            <small>Mission: reduce late fade with a controlled first kilometer.</small>
-          </div>
-          {CONTROLLED_START_BANDS.map((band) => (
-            <div className="preflight-item ok" key={band.km}>
-              <span>{band.label}</span>
-              <strong>{band.text}</strong>
+      {(() => {
+        const protocol = loadCoachProtocol();
+        const bands = protocol?.bands ?? CONTROLLED_START_BANDS;
+        return (
+          <section className="preflight-panel">
+            <div className="preflight-header">
+              <strong>{protocol ? "Coach protocol" : "Built-in plan"}</strong>
+              <span>{protocol ? protocol.protocol_id : preRun.active_patch_id}</span>
             </div>
-          ))}
-        </div>
-        <button
-          type="button"
-          className="secondary-button full-width-button"
-          onClick={() => setPreRun({ ...preRun, active_patch_id: CONTROLLED_START_PATCH_ID })}
-        >
-          Load controlled start
-        </button>
-      </section>
+            <div className="preflight-list">
+              <div className="preflight-item ok">
+                <span>PATCH</span>
+                <strong>{protocol?.patch_id ?? CONTROLLED_START_PATCH_ID}</strong>
+                <small>{protocol?.thesis || "Mission: reduce late fade with a controlled first kilometer."}</small>
+              </div>
+              {bands.map((band) => (
+                <div className="preflight-item ok" key={band.km}>
+                  <span>{band.label}</span>
+                  <strong>{band.text}</strong>
+                </div>
+              ))}
+            </div>
+          </section>
+        );
+      })()}
 
       {preRun.mode === "green_lake_5k_calibration" ? (
         <section className="preflight-panel">
@@ -3177,8 +3350,11 @@ function LiveScreen({
   const gpsStale = gpsStaleSeconds > 10;
   const planBands =
     run.pre_run.plan_bands && run.pre_run.plan_bands.length > 0 ? run.pre_run.plan_bands : CONTROLLED_START_BANDS;
+  const liveUi = run.pre_run.protocol_live_ui ?? { show_pace_band: true, show_current_pace: true, show_average_pace: true };
   const strategyStatus =
-    run.pre_run.intended_distance_meters >= 3000 ? computeControlledStartStatus(run.gps_points, planBands) : null;
+    liveUi.show_pace_band && run.pre_run.intended_distance_meters >= 3000
+      ? computeControlledStartStatus(run.gps_points, planBands)
+      : null;
 
   return (
     <section className="live-wrap">
@@ -3205,14 +3381,18 @@ function LiveScreen({
             <span>Distance</span>
             <strong>{formatDistance(liveStats.distanceMeters, units)}</strong>
           </div>
-          <div>
-            <span>Avg</span>
-            <strong>{formatPaceForUnits(liveStats.averagePaceSecondsPerMile, units)}</strong>
-          </div>
-          <div>
-            <span>Now</span>
-            <strong>{formatPaceForUnits(liveStats.currentPaceSecondsPerMile, units)}</strong>
-          </div>
+          {liveUi.show_average_pace ? (
+            <div>
+              <span>Avg</span>
+              <strong>{formatPaceForUnits(liveStats.averagePaceSecondsPerMile, units)}</strong>
+            </div>
+          ) : null}
+          {liveUi.show_current_pace ? (
+            <div>
+              <span>Now</span>
+              <strong>{formatPaceForUnits(liveStats.currentPaceSecondsPerMile, units)}</strong>
+            </div>
+          ) : null}
         </div>
 
         {strategyStatus ? (
@@ -3293,6 +3473,7 @@ function LiveMap({
       crossOrigin: true,
     });
     tileLayer.on("tileerror", () => setTileFailure(true));
+    tileLayer.on("load", () => setTileFailure(false));
     tileLayer.addTo(map);
 
     layerGroupRef.current = L.layerGroup().addTo(map);
@@ -3873,6 +4054,51 @@ function PostRunScreen({
           </label>
         </div>
 
+        {run.pre_run.protocol_questions && run.pre_run.protocol_questions.length > 0 ? (
+          <section className="form-panel coach-questions">
+            <h3>Coach asks (protocol {run.pre_run.protocol_id})</h3>
+            {run.pre_run.protocol_questions.map((question) => {
+              const value = postRun.protocol_answers[question.id];
+              const answer = (next: string | number | null) =>
+                updatePostRun({ protocol_answers: { ...postRun.protocol_answers, [question.id]: next } });
+              return (
+                <label key={question.id}>
+                  {question.prompt}
+                  {question.kind === "text" ? (
+                    <textarea
+                      rows={2}
+                      value={typeof value === "string" ? value : ""}
+                      onChange={(event) => answer(event.target.value)}
+                    />
+                  ) : question.kind === "scale_1_to_5" ? (
+                    <select
+                      value={typeof value === "number" ? String(value) : ""}
+                      onChange={(event) => answer(event.target.value === "" ? null : Number(event.target.value))}
+                    >
+                      <option value="">—</option>
+                      {[1, 2, 3, 4, 5].map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <select
+                      value={typeof value === "string" ? value : ""}
+                      onChange={(event) => answer(event.target.value === "" ? null : event.target.value)}
+                    >
+                      <option value="">—</option>
+                      <option value="yes">yes</option>
+                      <option value="no">no</option>
+                      <option value="unsure">unsure</option>
+                    </select>
+                  )}
+                </label>
+              );
+            })}
+          </section>
+        ) : null}
+
         <details className="preflight-panel">
           <summary>Optional recovery details</summary>
         <div className="paired-fields">
@@ -4128,7 +4354,9 @@ function RunHistoryPanel({
                     <td>{formatHistoryDate(entry.start_time_utc ?? entry.created_at_utc)}</td>
                     <td>{entry.distance_meters === null ? "unknown" : formatDistance(entry.distance_meters, actions.units)}</td>
                     <td>{formatNullableDuration(entry.duration_seconds)}</td>
-                    {actions.labConfigured ? <td>{entry.synced_at_utc ? "✓" : "—"}</td> : null}
+                    {actions.labConfigured ? (
+                      <td title={entry.sync_error ?? undefined}>{entry.synced_at_utc ? "✓" : entry.sync_error ? "!" : "—"}</td>
+                    ) : null}
                   </tr>
                   {isExpanded ? (
                     <tr className="history-detail-row">
@@ -4137,6 +4365,7 @@ function RunHistoryPanel({
                           {entry.route_name} · {entry.inferred_mode} · {entry.gps_point_count} GPS points ·{" "}
                           {entry.in_run_note_count} notes · {formatBytes(entry.json_bytes)} · {entry.storage_kind} ·{" "}
                           exported {formatHistoryDate(entry.created_at_utc)}
+                          {entry.sync_error ? ` · not syncing: ${entry.sync_error}` : ""}
                         </small>
                         <div className="history-actions">
                           <button type="button" className="secondary-button" onClick={() => actions.onDownloadJson(entry)}>
@@ -4570,56 +4799,84 @@ function normalizeLabEndpoint(value: string): string {
   if (!trimmed) {
     return "";
   }
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
-}
-
-async function probeLabEndpoint(endpoint: string): Promise<boolean> {
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
   try {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 4000);
-    const response = await fetch(`${endpoint}/api/runs/ping`, { signal: controller.signal });
-    window.clearTimeout(timeoutId);
-    return response.ok;
+    return new URL(withScheme).origin; // a pasted path would break both lanes
   } catch {
-    return false;
+    return withScheme;
   }
 }
 
-async function uploadRunToLab(endpoint: string, payload: ExportPayload): Promise<boolean> {
+type ProbeResult = "reachable" | "blocked" | "unreachable";
+
+/**
+ * "blocked": the browser refused the request outright (mixed content, CORS,
+ * local-network-access denied) — the host may well be up, so a top-level
+ * handover navigation can still work. "unreachable": we waited and nobody
+ * answered — navigating there would just hang the runner on an error page.
+ */
+async function probeLabEndpoint(endpoint: string, timeoutMs = 4000): Promise<ProbeResult> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = performance.now();
   try {
-    const response = await fetch(`${endpoint}/api/runs`, {
+    const response = await fetch(`${endpoint}/api/runs/ping`, { signal: controller.signal });
+    return response.ok ? "reachable" : "unreachable";
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return "unreachable";
+    }
+    // A policy refusal is synchronous-ish; a dead host takes the TCP timeout.
+    return performance.now() - startedAt < 1500 ? "blocked" : "unreachable";
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+type UploadResult = "stored" | "rejected" | "failed";
+
+async function postToLab(url: string, body: string, timeoutMs = 60000): Promise<UploadResult> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body,
+      signal: controller.signal,
     });
-    return response.ok;
+    if (response.ok) {
+      return "stored";
+    }
+    // 4xx is the lab saying "never": retrying the same bytes cannot help.
+    return response.status >= 400 && response.status < 500 ? "rejected" : "failed";
   } catch {
-    return false;
+    return "failed";
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 }
 
-async function uploadVoiceNoteToLab(endpoint: string, note: VoiceNoteEntry): Promise<boolean> {
+function uploadRunToLab(endpoint: string, payload: ExportPayload): Promise<UploadResult> {
+  return postToLab(`${endpoint}/api/runs`, JSON.stringify(payload));
+}
+
+async function uploadVoiceNoteToLab(endpoint: string, note: VoiceNoteEntry): Promise<UploadResult> {
   const blob = await getRunDatabaseValue<Blob>(`${IDB_VOICE_PREFIX}${note.note_id}`);
   if (!blob) {
-    return false;
+    return "rejected"; // audio is gone from this device; nothing will ever upload
   }
-  try {
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    const response = await fetch(`${endpoint}/api/voice-notes`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        note_id: note.note_id,
-        mime: note.mime,
-        duration_seconds: note.duration_seconds,
-        created_at_utc: note.created_at_utc,
-        data_base64: bytesToBase64(bytes),
-      }),
-    });
-    return response.ok;
-  } catch {
-    return false;
-  }
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  return postToLab(
+    `${endpoint}/api/voice-notes`,
+    JSON.stringify({
+      note_id: note.note_id,
+      mime: note.mime,
+      duration_seconds: note.duration_seconds,
+      created_at_utc: note.created_at_utc,
+      data_base64: bytesToBase64(bytes),
+    }),
+  );
 }
 
 function loadVoiceNotesIndex(): VoiceNoteEntry[] {
@@ -4637,7 +4894,13 @@ function loadVoiceNotesIndex(): VoiceNoteEntry[] {
 
 function saveVoiceNotesIndex(entries: VoiceNoteEntry[]) {
   try {
-    localStorage.setItem(VOICE_NOTES_INDEX_KEY, JSON.stringify(entries.slice(0, 50)));
+    // Cap only what the lab already holds; an unsynced note is never dropped.
+    const synced = entries.filter((entry) => entry.synced_at_utc);
+    const kept = new Set(synced.slice(0, 50).map((entry) => entry.note_id));
+    localStorage.setItem(
+      VOICE_NOTES_INDEX_KEY,
+      JSON.stringify(entries.filter((entry) => !entry.synced_at_utc || kept.has(entry.note_id))),
+    );
   } catch {
     // Voice note index is best effort.
   }
@@ -4646,9 +4909,11 @@ function saveVoiceNotesIndex(entries: VoiceNoteEntry[]) {
 function markVoiceNoteSynced(noteId: string) {
   saveVoiceNotesIndex(
     loadVoiceNotesIndex().map((entry) =>
-      entry.note_id === noteId ? { ...entry, synced_at_utc: new Date().toISOString() } : entry,
+      entry.note_id === noteId ? { ...entry, synced_at_utc: new Date().toISOString(), sync_error: null } : entry,
     ),
   );
+  // The lab holds the audio now; the phone copy has no reader and only fills storage.
+  void deleteRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`);
 }
 
 function describePendingItems(runCount: number, noteCount: number): string {
@@ -4664,13 +4929,29 @@ function describePendingItems(runCount: number, noteCount: number): string {
 
 function markRunSynced(historyId: string) {
   const entries = loadRunHistoryIndex().map((entry) =>
-    entry.history_id === historyId ? { ...entry, synced_at_utc: new Date().toISOString() } : entry,
+    entry.history_id === historyId ? { ...entry, synced_at_utc: new Date().toISOString(), sync_error: null } : entry,
   );
   try {
     saveRunHistoryIndex(entries);
   } catch {
     // Sync markers are best effort; unsynced runs retry next flush.
   }
+}
+
+function markRunSyncError(historyId: string, reason: string) {
+  try {
+    saveRunHistoryIndex(
+      loadRunHistoryIndex().map((entry) => (entry.history_id === historyId ? { ...entry, sync_error: reason } : entry)),
+    );
+  } catch {
+    // Best effort; the item simply stays pending.
+  }
+}
+
+function markVoiceNoteSyncError(noteId: string, reason: string) {
+  saveVoiceNotesIndex(
+    loadVoiceNotesIndex().map((entry) => (entry.note_id === noteId ? { ...entry, sync_error: reason } : entry)),
+  );
 }
 
 const LAB_HANDOVER_FRAGMENT_BUDGET = 350_000;
@@ -4702,7 +4983,7 @@ async function packRunsForLabHandover(
   endpoint: string,
   pending: RunHistoryEntry[],
   pendingNotes: VoiceNoteEntry[] = [],
-): Promise<{ url: string; count: number } | null> {
+): Promise<{ url: string; count: number; oversized: string[] } | null> {
   // The payload rides the URL fragment: unlike window.name it survives every
   // navigation context (installed-PWA Custom Tabs clear window.name).
   const returnTo = `${window.location.origin}${window.location.pathname}`;
@@ -4711,6 +4992,7 @@ async function packRunsForLabHandover(
   let encoded = "";
   const pack = () =>
     bytesToBase64Url(deflateSync(strToU8(JSON.stringify({ v: 1, returnTo, runs, notes }))));
+  const oversized: string[] = [];
   for (const entry of pending) {
     const payload = await loadCompletedRunFromHistory(entry.history_id);
     if (!payload) {
@@ -4723,7 +5005,8 @@ async function packRunsForLabHandover(
       break;
     }
     if (packed.length > LAB_HANDOVER_FRAGMENT_MAX) {
-      runs.pop(); // This single run is too large even alone; skip it.
+      runs.pop(); // This single run is too large even alone: report it so the runner isn't left guessing.
+      oversized.push(entry.history_id);
       continue;
     }
     encoded = packed;
@@ -4754,9 +5037,9 @@ async function packRunsForLabHandover(
   }
   const count = runs.length + notes.length;
   if (count === 0 || !encoded) {
-    return null;
+    return oversized.length > 0 ? { url: "", count: 0, oversized } : null;
   }
-  return { url: `${endpoint}/web/lab-receiver.html#lab=v1.${encoded}`, count };
+  return { url: `${endpoint}/web/lab-receiver.html#lab=v1.${encoded}`, count, oversized };
 }
 
 async function saveCompletedRunToHistory(payload: ExportPayload, filename: string): Promise<RunHistoryEntry[]> {
@@ -5334,11 +5617,22 @@ function computeControlledStartStatus(points: GpsPoint[], bands: readonly PlanBa
   }
   const track = buildAppTrack(points);
   const latest = track[track.length - 1];
-  const currentKm = Math.min(5, Math.max(1, Math.floor(latest.cumulative_meters / 1000) + 1));
-  const band = bands[currentKm - 1] ?? CONTROLLED_START_BANDS[currentKm - 1];
+  const currentKm = Math.max(1, Math.floor(latest.cumulative_meters / 1000) + 1);
+  const lastPlanned = bands.reduce((max, candidate) => Math.max(max, candidate.km), 0);
+  const band =
+    bands.find((candidate) => candidate.km === currentKm) ??
+    (currentKm > lastPlanned
+      ? { km: currentKm, label: `Km ${currentKm}`, minSecondsPerKm: null, maxSecondsPerKm: null, text: "hold steady" }
+      : (CONTROLLED_START_BANDS.find((candidate) => candidate.km === currentKm) ??
+        CONTROLLED_START_BANDS[CONTROLLED_START_BANDS.length - 1]));
   const kmStartDistance = (currentKm - 1) * 1000;
-  const kmStartElapsed = elapsedAtDistanceForApp(track, kmStartDistance) ?? track[0].t_elapsed_seconds;
-  const splitDistance = Math.max(0, latest.cumulative_meters - kmStartDistance);
+  // Km 1 is measured from when the runner actually moved (first 10 m), not from
+  // the end of the countdown: a standing start must not read as "too slow".
+  const movingStart = currentKm === 1 ? track.find((point) => point.cumulative_meters >= 10) ?? track[0] : null;
+  const kmStartElapsed =
+    movingStart?.t_elapsed_seconds ?? elapsedAtDistanceForApp(track, kmStartDistance) ?? track[0].t_elapsed_seconds;
+  const kmStartMeters = movingStart?.cumulative_meters ?? kmStartDistance;
+  const splitDistance = Math.max(0, latest.cumulative_meters - kmStartMeters);
   const splitElapsed = Math.max(0, latest.t_elapsed_seconds - kmStartElapsed);
   const currentSplitSecondsPerKm = splitDistance >= 50 ? splitElapsed / (splitDistance / 1000) : null;
   const inBand =
@@ -5360,17 +5654,7 @@ function computeControlledStartStatus(points: GpsPoint[], bands: readonly PlanBa
     currentSplitSecondsPerKm,
     status: band.minSecondsPerKm === null ? "steady" : inBand ? "in_band" : tooFast ? "too_fast" : tooSlow ? "too_slow" : "warming",
     statusLabel:
-      band.minSecondsPerKm === null
-        ? "steady"
-        : inBand
-          ? "in band"
-          : tooFast
-            ? currentKm === 1 && currentSplitSecondsPerKm !== null && currentSplitSecondsPerKm < 330
-              ? "too fast for test"
-              : "too fast"
-            : tooSlow
-              ? "too slow"
-              : "warming",
+      band.minSecondsPerKm === null ? "steady" : inBand ? "in band" : tooFast ? "too fast" : tooSlow ? "too slow" : "warming",
   };
 }
 
@@ -5562,41 +5846,128 @@ function formatPaceForUnits(secondsPerMile: number | null, units: Units): string
   return formatPaceKm(secondsPerMile === null ? null : secondsPerMile / 1.609344);
 }
 
-function computeAdaptivePlan(entries: RunHistoryEntry[]): { bands: PlanBand[]; basis: string } {
-  const cutoff = Date.now() - 90 * 24 * 3600 * 1000;
-  const paces = entries
-    .filter((entry) => {
-      const at = historyEntryTime(entry);
-      return (
-        (entry.distance_meters ?? 0) >= 3000 &&
-        (entry.duration_seconds ?? 0) > 0 &&
-        at > 0 &&
-        at >= cutoff
-      );
-    })
-    .map((entry) => (entry.duration_seconds as number) / ((entry.distance_meters as number) / 1000));
-  if (paces.length === 0) {
-    return {
-      bands: CONTROLLED_START_BANDS.map((band) => ({ ...band })),
-      basis: "default plan (no recent 3km+ runs on this device)",
-    };
+const PROTOCOL_KEY = "greenlake_autoresearch_logger_coach_protocol_v0_1";
+const PROTOCOL_FETCHED_KEY = "greenlake_autoresearch_logger_coach_protocol_fetched_v0_1";
+const PROTOCOL_REFRESH_MS = 6 * 3600 * 1000;
+
+function loadCoachProtocol(): CoachProtocol | null {
+  try {
+    const raw = localStorage.getItem(PROTOCOL_KEY);
+    return raw ? parseCoachProtocol(JSON.parse(raw)) : null;
+  } catch {
+    return null;
   }
-  let best = paces[0];
-  for (const pace of paces) {
-    if (pace < best) {
-      best = pace;
+}
+
+/** Persists the protocol; returns true when it differs from the stored one. */
+function saveCoachProtocol(protocol: CoachProtocol): boolean {
+  const previous = loadCoachProtocol();
+  const changed = !previous || previous.protocol_id !== protocol.protocol_id || previous.issued_at_utc !== protocol.issued_at_utc;
+  try {
+    localStorage.setItem(PROTOCOL_KEY, JSON.stringify(protocol));
+  } catch {
+    // Protocol persistence is best effort; the next lab contact re-pulls it.
+  }
+  return changed;
+}
+
+function loadCoachProtocolFetchedAt(): number | null {
+  try {
+    const raw = localStorage.getItem(PROTOCOL_FETCHED_KEY);
+    const at = raw ? Number(raw) : Number.NaN;
+    return Number.isFinite(at) ? at : null;
+  } catch {
+    return null;
+  }
+}
+
+function markCoachProtocolFetched() {
+  try {
+    localStorage.setItem(PROTOCOL_FETCHED_KEY, String(Date.now()));
+  } catch {
+    // Best effort; the next boot simply re-pulls.
+  }
+}
+
+async function fetchCoachProtocol(endpoint: string): Promise<CoachProtocol | null> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 4000);
+    const response = await fetch(`${endpoint}/api/protocol`, { signal: controller.signal });
+    window.clearTimeout(timeoutId);
+    if (!response.ok) {
+      return null;
+    }
+    return parseCoachProtocol(await response.json());
+  } catch {
+    return null;
+  }
+}
+
+function parseCoachProtocol(value: unknown): CoachProtocol | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const protocolId = stringFromUnknown(raw.protocol_id);
+  const issuedAt = stringFromUnknown(raw.issued_at_utc);
+  const patchId = stringFromUnknown(raw.patch_id);
+  if (!protocolId || !issuedAt || !patchId || !Array.isArray(raw.bands)) {
+    return null;
+  }
+  const bands: PlanBand[] = [];
+  for (const item of raw.bands as unknown[]) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const band = item as Record<string, unknown>;
+    const km = numberFromUnknown(band.km);
+    if (km === null) {
+      continue;
+    }
+    const min = numberFromUnknown(band.min_seconds_per_km);
+    const max = numberFromUnknown(band.max_seconds_per_km);
+    bands.push({
+      km,
+      label: stringFromUnknown(band.label) ?? `Km ${km}`,
+      minSecondsPerKm: min,
+      maxSecondsPerKm: max,
+      text: stringFromUnknown(band.text) ?? (min !== null && max !== null ? `${formatPaceKm(min)}-${formatPaceKm(max)}` : "free"),
+    });
+  }
+  // Consumers look bands up by km; a protocol may list them in any order.
+  bands.sort((a, b) => a.km - b.km);
+  if (bands.length === 0) {
+    return null; // a protocol with no bands cannot drive the live screen
+  }
+  const liveUiRaw = (raw.live_ui && typeof raw.live_ui === "object" ? raw.live_ui : {}) as Record<string, unknown>;
+  const questions: ProtocolQuestion[] = [];
+  if (Array.isArray(raw.post_run_questions)) {
+    for (const item of raw.post_run_questions as unknown[]) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const q = item as Record<string, unknown>;
+      const id = stringFromUnknown(q.id);
+      const prompt = stringFromUnknown(q.prompt);
+      const kind = q.kind === "scale_1_to_5" || q.kind === "text" ? q.kind : "yes_no_unsure";
+      if (id && prompt) {
+        questions.push({ id, prompt, kind });
+      }
     }
   }
-  const target = Math.max(240, Math.round(best) - 5);
-  const bandText = (low: number, high: number) =>
-    `${Math.floor(low / 60)}:${String(low % 60).padStart(2, "0")}-${Math.floor(high / 60)}:${String(high % 60).padStart(2, "0")}`;
-  const bands: PlanBand[] = [
-    { km: 1, label: "Km 1", minSecondsPerKm: target, maxSecondsPerKm: target + 10, text: bandText(target, target + 10) },
-    { km: 2, label: "Km 2", minSecondsPerKm: target - 5, maxSecondsPerKm: target + 5, text: bandText(target - 5, target + 5) },
-    { km: 3, label: "Km 3", minSecondsPerKm: target - 5, maxSecondsPerKm: target + 7, text: bandText(target - 5, target + 7) },
-    { km: 4, label: "Km 4", minSecondsPerKm: null, maxSecondsPerKm: null, text: "hold steady" },
-    { km: 5, label: "Km 5", minSecondsPerKm: null, maxSecondsPerKm: null, text: "squeeze only if stable" },
-  ];
-  const bestLabel = `${Math.floor(best / 60)}:${String(Math.round(best % 60)).padStart(2, "0")}`;
-  return { bands, basis: `from your best recent run (${bestLabel}/km avg)` };
+  return {
+    protocol_id: protocolId,
+    issued_at_utc: issuedAt,
+    patch_id: patchId,
+    thesis: stringFromUnknown(raw.thesis) ?? "",
+    expectation: stringFromUnknown(raw.expectation) ?? "",
+    bands,
+    live_ui: {
+      show_pace_band: liveUiRaw.show_pace_band !== false,
+      show_current_pace: liveUiRaw.show_current_pace !== false,
+      show_average_pace: liveUiRaw.show_average_pace !== false,
+    },
+    post_run_questions: questions,
+  };
 }

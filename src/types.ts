@@ -46,6 +46,27 @@ export interface PlanBand {
   text: string;
 }
 
+export interface ProtocolQuestion {
+  id: string;
+  prompt: string;
+  kind: "yes_no_unsure" | "scale_1_to_5" | "text";
+}
+
+export interface CoachProtocol {
+  protocol_id: string;
+  issued_at_utc: string;
+  patch_id: string;
+  thesis: string;
+  expectation: string;
+  bands: PlanBand[];
+  live_ui: {
+    show_pace_band: boolean;
+    show_current_pace: boolean;
+    show_average_pace: boolean;
+  };
+  post_run_questions: ProtocolQuestion[];
+}
+
 export interface PreRunState {
   runner_id: "user_001";
   goal: "sub_25_5k";
@@ -61,6 +82,12 @@ export interface PreRunState {
   free_text: string;
   plan_bands?: PlanBand[] | null;
   plan_basis?: string | null;
+  protocol_id?: string | null;
+  protocol_issued_at_utc?: string | null;
+  protocol_thesis?: string | null;
+  protocol_expectation?: string | null;
+  protocol_live_ui?: CoachProtocol["live_ui"] | null;
+  protocol_questions?: ProtocolQuestion[] | null;
 }
 
 export interface PostRunState {
@@ -80,6 +107,7 @@ export interface PostRunState {
   subjective_debrief_skipped: boolean;
   subjective_debrief_skip_reason: string | null;
   free_text: string;
+  protocol_answers: Record<string, string | number | null>;
 }
 
 export interface PermissionState {
@@ -766,10 +794,10 @@ export interface SplitFeature {
 }
 
 export interface ExportPayload {
-  schema_version: "0.2.1";
+  schema_version: "0.3.0";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.2.1";
+    version: "0.3.0";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -789,6 +817,8 @@ export interface ExportPayload {
     active_patch_id: string;
     active_patch_description: string;
     current_thesis: string;
+    protocol_id: string | null;
+    protocol_issued_at_utc: string | null;
   };
   pre_run: Record<string, unknown>;
   run_metadata: Record<string, unknown>;

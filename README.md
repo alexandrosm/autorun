@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.2.1`
+Current version: `0.3.0`
+
+## v0.3.0 focus
+
+- Coach protocol: the lab issues `protocol.json` (bands, thesis, expectation, live-UI knobs, post-run questions); the app pulls it on every lab contact (`GET /api/protocol` directly, or carried home by the handover receiver) and renders the run from it.
+- Payload stamps `training_state_before_run.protocol_id` / `protocol_issued_at_utc`, `pre_run.protocol_*`, and `post_run.protocol_answers`; `tools/run-report.py` shows the protocol a run ran under versus the one now in force.
+- Removes the phone-side adaptive plan; built-in bands remain only as the fallback before any protocol is received.
 
 ## v0.2.1 focus
 

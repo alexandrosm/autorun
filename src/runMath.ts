@@ -57,11 +57,11 @@ const SEGMENT_ARTIFACT_FRACTION_THRESHOLD = 0.1;
 const ROUTE_MEMORY_KEY_FOR_MATH = "greenlake_autoresearch_logger_route_memory_v0_1";
 // Recalibrated 2026-09-01 for ~26:30 fitness; keep in lockstep with App CONTROLLED_START_BANDS.
 const CONTROLLED_START_BANDS_FOR_MATH = [
-  { minSecondsPerKm: 315, maxSecondsPerKm: 325 },
-  { minSecondsPerKm: 310, maxSecondsPerKm: 320 },
-  { minSecondsPerKm: 310, maxSecondsPerKm: 322 },
-  { minSecondsPerKm: null, maxSecondsPerKm: null },
-  { minSecondsPerKm: null, maxSecondsPerKm: null },
+  { km: 1, minSecondsPerKm: 315, maxSecondsPerKm: 325 },
+  { km: 2, minSecondsPerKm: 310, maxSecondsPerKm: 320 },
+  { km: 3, minSecondsPerKm: 310, maxSecondsPerKm: 322 },
+  { km: 4, minSecondsPerKm: null, maxSecondsPerKm: null },
+  { km: 5, minSecondsPerKm: null, maxSecondsPerKm: null },
 ] as const;
 
 const PATCH_LIBRARY: Record<string, { description: string; thesis: string }> = {
@@ -175,10 +175,10 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
   const weatherFetchSuccess = Boolean(run.weather.start_weather.fetched_at_utc || run.weather.finish_weather.fetched_at_utc);
   const notes = uniqueStrings([...run.data_quality_notes, ...features.dataQualityNotes]);
   return {
-    schema_version: "0.2.1",
+    schema_version: "0.3.0",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.2.1",
+      version: "0.3.0",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -197,7 +197,9 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
       mode: run.pre_run.mode,
       active_patch_id: run.pre_run.active_patch_id,
       active_patch_description: patchDescription(run.pre_run.active_patch_id),
-      current_thesis: patchThesis(run.pre_run.active_patch_id),
+      current_thesis: run.pre_run.protocol_thesis ?? patchThesis(run.pre_run.active_patch_id),
+      protocol_id: run.pre_run.protocol_id ?? null,
+      protocol_issued_at_utc: run.pre_run.protocol_issued_at_utc ?? null,
     },
     pre_run: exportPreRun(run.pre_run),
     run_metadata: {
@@ -2988,7 +2990,7 @@ function buildPatchExecutionAssessment(
       ? preRun.plan_bands
       : CONTROLLED_START_BANDS_FOR_MATH;
   const actualSplits = activeTargetSplits.kilometers.slice(0, 5).map((split, index) => {
-    const band = isControlledStart ? planBands[index] ?? null : null;
+    const band = isControlledStart ? planBands.find((candidate) => candidate.km === index + 1) ?? null : null;
     const paceSecondsPerKm =
       split.duration_seconds !== null && split.distance_meters !== null && split.distance_meters > 0
         ? round(split.duration_seconds / (split.distance_meters / METERS_PER_KM), 2)
@@ -3347,6 +3349,11 @@ function exportPreRun(preRun: PreRunState) {
     free_text: preRun.free_text,
     plan_bands: preRun.plan_bands ?? null,
     plan_basis: preRun.plan_basis ?? null,
+    protocol_id: preRun.protocol_id ?? null,
+    protocol_issued_at_utc: preRun.protocol_issued_at_utc ?? null,
+    protocol_expectation: preRun.protocol_expectation ?? null,
+    protocol_live_ui: preRun.protocol_live_ui ?? null,
+    protocol_questions: preRun.protocol_questions ?? null,
   };
 }
 
@@ -3368,6 +3375,7 @@ function exportPostRun(postRun: PostRunState) {
     subjective_debrief_skipped: postRun.subjective_debrief_skipped,
     subjective_debrief_skip_reason: postRun.subjective_debrief_skip_reason,
     free_text: postRun.free_text,
+    protocol_answers: postRun.protocol_answers ?? {},
   };
 }
 
