@@ -14,13 +14,14 @@ import {
 } from "lucide-react";
 import { encode as encodeMsgpack } from "@msgpack/msgpack";
 import { deflateSync, strToU8, zipSync } from "fflate";
-import L from "leaflet";
-import { Component, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import "leaflet/dist/leaflet.css";
+import { createPortal } from "react-dom";
 import { CHANGELOG } from "./changelog";
 import { buildExportPayload, computeLiveStats, createGpsPointFromPosition } from "./runMath";
 import type { LiveStats } from "./runMath";
+import { RunRouteMap } from "./RunRouteMap";
+import { PostRunSelfie } from "./PostRunSelfie";
 import type {
   ActiveRun,
   BreathingRecoveredAfter,
@@ -47,6 +48,7 @@ import type {
   RouteDirection,
   RunMode,
   Screen,
+  SelfieBiometrics,
   SimpleEffort,
   SorenessLevel,
   WeatherStatusText,
@@ -55,7 +57,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.3.2";
+const APP_VERSION = "0.4.0";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -167,6 +169,15 @@ interface VoiceNoteEntry {
   mime: string;
   synced_at_utc?: string | null;
   sync_error?: string | null;
+}
+
+interface RunVoiceContext {
+  runId: string;
+  timestampUtc: string;
+  elapsedSeconds: number;
+  distanceMeters: number;
+  lat: number | null;
+  lon: number | null;
 }
 
 interface RunHistoryActions {
@@ -1374,8 +1385,9 @@ export default function App() {
     setActionMessage("In-run note saved.");
   };
 
-  const continueToPostRun = () => {
-    setScreen("post");
+  const finishRecording = () => {
+    setActionMessage("");
+    setScreen("selfie");
   };
 
   const continueToExport = () => {
@@ -1581,6 +1593,22 @@ export default function App() {
   const [voiceNotes, setVoiceNotes] = useState<VoiceNoteEntry[]>(() => loadVoiceNotesIndex());
   const [recordingNote, setRecordingNote] = useState(false);
   const [scanningLab, setScanningLab] = useState(false);
+  const [voiceContext, setVoiceContext] = useState<RunVoiceContext | null>(null);
+
+  const startVoiceNote = () => {
+    if (recordingNote || labSyncBusyRef.current) return;
+    const run = activeRunRef.current;
+    const point = run?.gps_points[run.gps_points.length - 1];
+    setVoiceContext(screenRef.current === "live" && run ? {
+      runId: run.run_metadata.run_id,
+      timestampUtc: new Date().toISOString(),
+      elapsedSeconds: getElapsedSeconds(),
+      distanceMeters: liveStats.distanceMeters,
+      lat: point?.lat ?? null,
+      lon: point?.lon ?? null,
+    } : null);
+    setRecordingNote(true);
+  };
 
   const handleLabEndpointChange = useCallback((value: string) => {
     setLabEndpoint(value);
@@ -2382,7 +2410,7 @@ export default function App() {
           scanning={scanningLab}
           setScanning={setScanningLab}
           pendingNoteCount={voiceNotes.filter((note) => !note.synced_at_utc).length}
-          onRecordNote={() => setRecordingNote(true)}
+          onRecordNote={startVoiceNote}
         />
       ) : null}
 
@@ -2436,6 +2464,8 @@ export default function App() {
           gpsStaleSeconds={gpsStaleSeconds}
           onCheckpoint={addCheckpoint}
           onAddNote={addInRunNote}
+          voiceRecording={recordingNote}
+          onRecordVoice={startVoiceNote}
           onStop={() => void stopRun()}
           onDiscard={discardRun}
           units={units}
@@ -2450,9 +2480,20 @@ export default function App() {
           liveStats={liveStats}
           units={units}
           onToggleUnits={toggleUnits}
-          onContinue={continueToPostRun}
+          onContinue={finishRecording}
           onResume={resumeRun}
           onDiscard={discardRun}
+        />
+      ) : null}
+
+      {screen === "selfie" && activeRun ? (
+        <PostRunSelfie
+          stoppedAtUtc={activeRun.run_metadata.end_time_utc}
+          onComplete={(result) => {
+            updatePostRun({ selfie_biometrics: result });
+            setScreen("post");
+          }}
+          onSkip={() => setScreen("post")}
         />
       ) : null}
 
@@ -2464,6 +2505,7 @@ export default function App() {
           updatePostRunPain={updatePostRunPain}
           onConfirmRoute={confirmHomeBlockRoute}
           onExport={continueToExport}
+          onRescan={() => setScreen("selfie")}
         />
       ) : null}
 
@@ -2483,6 +2525,7 @@ export default function App() {
           onDownloadCoachSummary={downloadCoachSummary}
           runHistory={runHistory}
           historyActions={historyActions}
+          biometrics={activeRun.post_run.selfie_biometrics}
           onBackToPost={() => setScreen("post")}
           onDiscard={discardRun}
           onDone={finishRunToHome}
@@ -2491,13 +2534,39 @@ export default function App() {
 
       {recordingNote ? (
         <VoiceNoteRecorder
-          onSaved={() => {
+          inline={voiceContext !== null && screen === "live"}
+          finishRequested={voiceContext !== null && screen !== "live"}
+          onSaved={(entry) => {
+            if (voiceContext) {
+              const context = voiceContext;
+              setActiveRun((run) => {
+                if (!run || run.run_metadata.run_id !== context.runId ||
+                    run.in_run_notes.some((note) => note.voice_note_id === entry.note_id)) return run;
+                const note: InRunNote = {
+                  note_id: `voice_${entry.note_id}`,
+                  timestamp_utc: context.timestampUtc,
+                  t_elapsed_seconds: round(context.elapsedSeconds, 2),
+                  distance_meters: round(context.distanceMeters, 2),
+                  lat: context.lat,
+                  lon: context.lon,
+                  note_type: "run_observation",
+                  tags: [],
+                  text: `Voice note (${entry.duration_seconds} seconds)`,
+                  voice_note_id: entry.note_id,
+                };
+                return { ...run, in_run_notes: [...run.in_run_notes, note] };
+              });
+            }
+            setVoiceContext(null);
             setVoiceNotes(loadVoiceNotesIndex());
             setRecordingNote(false);
             setActionMessage("Voice note saved. It syncs with your next lab sync.");
             void syncRunsToLab();
           }}
-          onClose={() => setRecordingNote(false)}
+          onClose={() => {
+            setRecordingNote(false);
+            setVoiceContext(null);
+          }}
         />
       ) : null}
 
@@ -2746,7 +2815,14 @@ declare global {
   }
 }
 
-function VoiceNoteRecorder({ onSaved, onClose }: { onSaved: () => void; onClose: () => void }) {
+function VoiceNoteRecorder({
+  onSaved, onClose, inline = false, finishRequested = false,
+}: {
+  onSaved: (entry: VoiceNoteEntry) => void;
+  onClose: () => void;
+  inline?: boolean;
+  finishRequested?: boolean;
+}) {
   const [error, setError] = useState("");
   const [seconds, setSeconds] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -2761,6 +2837,11 @@ function VoiceNoteRecorder({ onSaved, onClose }: { onSaved: () => void; onClose:
   const finishedRef = useRef(false);
   const saveRequestedRef = useRef(false);
   const timerRef = useRef(0);
+  const [portalHost, setPortalHost] = useState<Element | null>(null);
+
+  useLayoutEffect(() => {
+    setPortalHost(inline ? document.querySelector(".live-voice-host") : null);
+  }, [inline]);
 
   const releaseMic = () => {
     window.clearInterval(timerRef.current);
@@ -2778,18 +2859,23 @@ function VoiceNoteRecorder({ onSaved, onClose }: { onSaved: () => void; onClose:
     const mime = recorder.mimeType || "audio/webm";
     const blob = new Blob(chunksRef.current, { type: mime });
     let saved = false;
+    const entry: VoiceNoteEntry = {
+      note_id: noteId,
+      created_at_utc: new Date(startedAtRef.current).toISOString(),
+      duration_seconds: Math.max(1, Math.round(((endedAtRef.current ?? Date.now()) - startedAtRef.current) / 1000)),
+      mime,
+    };
     if (blob.size === 0) {
       setError("Nothing was captured.");
     } else if (await putRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`, blob)) {
-      const duration = Math.max(1, Math.round(((endedAtRef.current ?? Date.now()) - startedAtRef.current) / 1000));
       saved = saveVoiceNotesIndex([
-        { note_id: noteId, created_at_utc: new Date(startedAtRef.current).toISOString(), duration_seconds: duration, mime },
+        entry,
         ...loadVoiceNotesIndex().filter((note) => note.note_id !== noteId),
       ]);
       if (!saved) await deleteRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`);
     }
     if (saved) {
-      onSaved();
+      onSaved(entry);
     } else {
       if (blob.size > 0) setError("Could not store the note on this device. Try again or discard.");
       saveRequestedRef.current = false;
@@ -2872,21 +2958,27 @@ function VoiceNoteRecorder({ onSaved, onClose }: { onSaved: () => void; onClose:
     // Its onstop handler saves only after those final bytes arrive.
   };
 
+  useEffect(() => {
+    if (finishRequested && ready) saveNote();
+  }, [finishRequested, ready]);
+
   const canSave = ready && !saving && (!error || chunksRef.current.length > 0);
-  return (
-    <div className="scanner-overlay">
+  const content = (
+    <section className={inline ? "live-note-panel voice-inline-panel" : "scanner-overlay"} aria-label="Voice recorder">
+      <h3>Voice note</h3>
       <div className="recorder-pulse">{error ? "!" : formatDuration(seconds)}</div>
-      <p>{error || (!ready ? "Requesting microphone…" : micEnded ? "Recording ended — save what you have." : "Recording voice note for the lab…")}</p>
+      <p role="status">{error || (!ready ? "Requesting microphone…" : micEnded ? "Recording ended — save what you have." : "Recording audio…")}</p>
       <div className="button-grid">
         <button type="button" className="secondary-button" onClick={onClose} disabled={saving}>
-          Discard
+          Discard voice note
         </button>
         <button type="button" className="primary-button" onClick={saveNote} disabled={!canSave}>
-          {saving ? "Saving…" : "Save note"}
+          {saving ? "Saving…" : "Save voice note"}
         </button>
       </div>
-    </div>
+    </section>
   );
+  return portalHost ? createPortal(content, portalHost) : content;
 }
 
 function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean; onClose: () => void }) {
@@ -3436,17 +3528,8 @@ function SetupScreen({
 }
 
 function LiveScreen({
-  run,
-  elapsedSeconds,
-  liveStats,
-  targetReached,
-  gpsStaleSeconds,
-  onCheckpoint,
-  onAddNote,
-  onStop,
-  onDiscard,
-  units,
-  onToggleUnits,
+  run, elapsedSeconds, liveStats, targetReached, gpsStaleSeconds,
+  onCheckpoint, onAddNote, voiceRecording, onRecordVoice, onStop, onDiscard, units, onToggleUnits,
 }: {
   run: ActiveRun;
   elapsedSeconds: number;
@@ -3455,6 +3538,8 @@ function LiveScreen({
   gpsStaleSeconds: number;
   onCheckpoint: () => void;
   onAddNote: (note: Pick<InRunNote, "note_type" | "tags" | "text">) => void;
+  voiceRecording: boolean;
+  onRecordVoice: () => void;
   onStop: () => void;
   onDiscard: () => void;
   units: Units;
@@ -3462,276 +3547,92 @@ function LiveScreen({
 }) {
   const [noteOpen, setNoteOpen] = useState(false);
   const remainingMeters = Math.max(0, run.pre_run.intended_distance_meters - liveStats.distanceMeters);
-  const gpsStale = gpsStaleSeconds > 10;
-  const planBands =
-    run.pre_run.plan_bands && run.pre_run.plan_bands.length > 0 ? run.pre_run.plan_bands : CONTROLLED_START_BANDS;
+  const planBands = run.pre_run.plan_bands?.length ? run.pre_run.plan_bands : CONTROLLED_START_BANDS;
   const liveUi = run.pre_run.protocol_live_ui ?? { show_pace_band: true, show_current_pace: true, show_average_pace: true };
-  const strategyStatus =
-    liveUi.show_pace_band && run.pre_run.intended_distance_meters >= 3000
-      ? computeControlledStartStatus(run.gps_points, planBands)
-      : null;
+  const strategyStatus = useMemo(
+    () => liveUi.show_pace_band && run.pre_run.intended_distance_meters >= 3000
+      ? computeControlledStartStatus(run.gps_points, planBands) : null,
+    [liveUi.show_pace_band, run.pre_run.intended_distance_meters, run.gps_points, planBands],
+  );
+  const latest = run.gps_points[run.gps_points.length - 1];
+  const paceUncertain = gpsStaleSeconds > 5 || Boolean(latest && (
+    latest.horizontal_accuracy_meters === null || latest.horizontal_accuracy_meters > 25 ||
+    latest.impossible_speed || latest.possible_gps_jump || latest.tiny_dt_segment
+  ));
+  const paceState = !strategyStatus ? "hidden" : paceUncertain ? "uncertain" : strategyStatus.status;
 
   return (
-    <section className="live-wrap">
-      <LiveMap run={run} />
-
+    <section className={`live-wrap live-pace-${paceState}`}>
+      <RunRouteMap points={run.gps_points} checkpoints={run.checkpoints} units={units} live allowSpeedColor={liveUi.show_current_pace} />
       <div className="live-top">
-        {noteOpen ? (
+        {voiceRecording ? <div className="live-voice-host" /> : noteOpen ? (
           <LiveNoteForm onAddNote={onAddNote} onClose={() => setNoteOpen(false)} />
-        ) : <Fragment>
-        <div className="live-chips">
-          {targetReached ? <span className="live-chip ok">Target reached — you can stop</span> : null}
-          {gpsStale ? <span className="live-chip warn">GPS stale — keep app visible</span> : null}
-          {run.permissions.wake_lock_available && run.permissions.wake_lock_status !== "active" ? (
-            <span className="live-chip warn">Wake lock inactive</span>
-          ) : null}
-          {liveStats.lastAccuracy !== null && liveStats.lastAccuracy > 25 ? (
-            <span className="live-chip warn">GPS ±{Math.round(liveStats.lastAccuracy)}m</span>
-          ) : null}
-        </div>
-
-        <div className="live-hero-cards" onClick={onToggleUnits}>
-          <div>
-            <span>Elapsed</span>
-            <strong>{formatDuration(elapsedSeconds)}</strong>
-          </div>
-          <div>
-            <span>Distance</span>
-            <strong>{formatDistance(liveStats.distanceMeters, units)}</strong>
-          </div>
-          {liveUi.show_average_pace ? (
-            <div>
-              <span>Avg</span>
-              <strong>{formatPaceForUnits(liveStats.averagePaceSecondsPerMile, units)}</strong>
+        ) : (
+          <Fragment>
+            <div className="live-chips">
+              <span className="live-chip">Recording</span>
+              {targetReached ? <span className="live-chip ok">Target reached — you can stop</span> : null}
+              {gpsStaleSeconds > 10 ? <span className="live-chip warn">GPS stale — keep app visible</span> : null}
+              {run.in_run_notes.length > 0 ? <span className="live-chip">{run.in_run_notes.length} notes saved</span> : null}
+              {run.permissions.wake_lock_available && run.permissions.wake_lock_status !== "active" ? (
+                <span className="live-chip warn">Wake lock inactive</span>
+              ) : null}
             </div>
-          ) : null}
-          {liveUi.show_current_pace ? (
-            <div>
-              <span>Now</span>
-              <strong>{formatPaceForUnits(liveStats.currentPaceSecondsPerMile, units)}</strong>
+            <div className="live-hero-cards" onClick={onToggleUnits}>
+              <div><span>Elapsed</span><strong>{formatDuration(elapsedSeconds)}</strong></div>
+              <div><span>Distance</span><strong>{formatDistance(liveStats.distanceMeters, units)}</strong></div>
+              {liveUi.show_average_pace ? (
+                <div><span>Avg</span><strong>{formatPaceForUnits(liveStats.averagePaceSecondsPerMile, units)}</strong></div>
+              ) : null}
+              {liveUi.show_current_pace ? (
+                <div><span>Now</span><strong>{formatPaceForUnits(liveStats.currentPaceSecondsPerMile, units)}</strong></div>
+              ) : null}
             </div>
-          ) : null}
-        </div>
-
-        {strategyStatus ? (
-          <div
-            className={
-              strategyStatus.status === "in_band" || strategyStatus.status === "steady"
-                ? "live-band ok"
-                : strategyStatus.status === "warming"
-                  ? "live-band"
-                  : "live-band warn"
-            }
-          >
-            {strategyStatus.band.label} · {formatPaceKm(strategyStatus.currentSplitSecondsPerKm)} · plan{" "}
-            {strategyStatus.band.text} · {strategyStatus.statusLabel}
-          </div>
-        ) : null}
-        {run.pre_run.intended_distance_meters > 0 ? (
-          <div className="live-band">
-            {formatDistance(remainingMeters, units)} to go
-          </div>
-        ) : null}
-        </Fragment>}
+            {strategyStatus ? (
+              <div className={`live-pace-status pace-${paceState}`} role="status">
+                <span>{strategyStatus.band.label} · kilometre average</span>
+                <strong>{paceUncertain ? "Pace uncertain" : strategyStatus.statusLabel}</strong>
+                <p>{paceUncertain ? "Waiting for a fresh, accurate GPS signal." :
+                  paceState === "too_fast" ? "Ease off toward the coach's target." :
+                  paceState === "too_slow" ? "Below the planned pace — follow how you feel." :
+                  paceState === "in_band" ? "You're inside the coach's pace band." :
+                  paceState === "warming" ? "Keep moving — pace settles after the first 50 m." :
+                  "No pace target for this kilometre."}</p>
+                <small>Target: {strategyStatus.band.text}
+                  {liveUi.show_current_pace && !paceUncertain && strategyStatus.currentSplitSecondsPerKm !== null
+                    ? ` · this km ${formatPaceKm(strategyStatus.currentSplitSecondsPerKm)}` : ""}
+                </small>
+              </div>
+            ) : null}
+            {run.pre_run.intended_distance_meters > 0 ? (
+              <div className="live-band">{formatDistance(remainingMeters, units)} to go</div>
+            ) : null}
+          </Fragment>
+        )}
       </div>
-
       <div className="live-bottom">
         <div className="live-secondary">
           <button type="button" className="secondary-button" onClick={onCheckpoint}>
-            <Clipboard size={18} />
-            Checkpoint
+            <Clipboard size={18} />Checkpoint
           </button>
-          <button type="button" className="secondary-button" aria-expanded={noteOpen} onClick={() => setNoteOpen(!noteOpen)}>
-            <Clipboard size={18} />
-            {noteOpen ? "Close note" : "Note"}
+          <button type="button" className="secondary-button" aria-expanded={noteOpen} disabled={voiceRecording}
+            onClick={() => setNoteOpen(!noteOpen)}>
+            <Clipboard size={18} />{noteOpen ? "Close note" : "Text note"}
+          </button>
+          <button type="button" className="secondary-button" disabled={voiceRecording}
+            onClick={() => { setNoteOpen(false); onRecordVoice(); }}>
+            <Mic size={18} />{voiceRecording ? "Recording…" : "Voice note"}
           </button>
         </div>
         <button type="button" className="danger-button live-stop" onClick={onStop}>
-          <Square size={20} />
-          Stop run
+          <Square size={20} />Stop run
         </button>
-        <button type="button" className="link-button live-discard" onClick={onDiscard}>
-          Emergency discard
-        </button>
+        <button type="button" className="link-button live-discard" onClick={onDiscard}>Emergency discard</button>
       </div>
     </section>
   );
 }
 
-function LiveMap({ run }: { run: ActiveRun }) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const mapRef = useRef<L.Map | null>(null);
-  const layerGroupRef = useRef<L.LayerGroup | null>(null);
-  const [tileFailure, setTileFailure] = useState(false);
-  const [followLocked, setFollowLocked] = useState(true);
-  const programmaticMoveRef = useRef(false);
-
-  useEffect(() => {
-    if (!containerRef.current || mapRef.current) {
-      return undefined;
-    }
-
-    const map = L.map(containerRef.current, {
-      attributionControl: false,
-      zoomControl: false,
-      dragging: true,
-      touchZoom: true,
-      scrollWheelZoom: false,
-    }).setView([47.679, -122.328], 14);
-    map.on("dragstart zoomstart", () => {
-      if (!programmaticMoveRef.current) {
-        setFollowLocked(false);
-      }
-    });
-
-    const tileLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      crossOrigin: true,
-    });
-    tileLayer.on("tileerror", () => setTileFailure(true));
-    tileLayer.on("load", () => setTileFailure(false));
-    tileLayer.addTo(map);
-
-    layerGroupRef.current = L.layerGroup().addTo(map);
-    mapRef.current = map;
-
-    // Leaflet watches window resize, not container changes or a suspended page.
-    // Re-measure after layout, without remounting the map or touching recording.
-    let resizeFrame: number | undefined;
-    const refreshSize = () => {
-      if (document.visibilityState !== "visible") return;
-      if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-      resizeFrame = requestAnimationFrame(() => {
-        resizeFrame = undefined;
-        map.invalidateSize({ animate: false, debounceMoveend: true });
-      });
-    };
-    const resizeObserver = new ResizeObserver(refreshSize);
-    resizeObserver.observe(containerRef.current);
-    document.addEventListener("visibilitychange", refreshSize);
-    window.addEventListener("pageshow", refreshSize);
-
-    return () => {
-      resizeObserver.disconnect();
-      document.removeEventListener("visibilitychange", refreshSize);
-      window.removeEventListener("pageshow", refreshSize);
-      if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-      map.remove();
-      mapRef.current = null;
-      layerGroupRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    const layers = layerGroupRef.current;
-    if (!map || !layers) {
-      return;
-    }
-
-    layers.clearLayers();
-    const points = run.gps_points;
-    if (points.length === 0) {
-      return;
-    }
-
-    const latLngs = points.map((point) => L.latLng(point.lat, point.lon));
-    const first = points[0];
-    const latest = points[points.length - 1];
-
-    L.polyline(latLngs, { color: "#12683f", weight: 4, opacity: 0.85 }).addTo(layers);
-    L.circleMarker([first.lat, first.lon], {
-      radius: 6,
-      color: "#0f5d38",
-      fillColor: "#ffffff",
-      fillOpacity: 1,
-      weight: 3,
-    }).addTo(layers);
-    L.circleMarker([latest.lat, latest.lon], {
-      radius: 7,
-      color: "#10231b",
-      fillColor: "#2dd078",
-      fillOpacity: 1,
-      weight: 3,
-    }).addTo(layers);
-
-    if (latest.horizontal_accuracy_meters !== null) {
-      L.circle([latest.lat, latest.lon], {
-        radius: latest.horizontal_accuracy_meters,
-        color: "#2b7a58",
-        fillColor: "#2b7a58",
-        fillOpacity: 0.1,
-        weight: 1,
-      }).addTo(layers);
-    }
-
-    for (let i = 1; i < points.length; i += 1) {
-      const gap = points[i].t_elapsed_seconds - points[i - 1].t_elapsed_seconds;
-      if (gap > 5) {
-        L.circleMarker([(points[i].lat + points[i - 1].lat) / 2, (points[i].lon + points[i - 1].lon) / 2], {
-          radius: gap > 10 ? 7 : 5,
-          color: "#b15b00",
-          fillColor: "#ffb35b",
-          fillOpacity: 0.9,
-          weight: 2,
-        }).addTo(layers);
-      }
-    }
-
-    const targetCheckpoint = run.checkpoints.find((checkpoint) => checkpoint.label === "target_distance_reached");
-    if (targetCheckpoint) {
-      const targetPoint = nearestPointByElapsed(points, targetCheckpoint.t_elapsed_seconds);
-      if (targetPoint) {
-        L.circleMarker([targetPoint.lat, targetPoint.lon], {
-          radius: 8,
-          color: "#12683f",
-          fillColor: "#f7d154",
-          fillOpacity: 1,
-          weight: 3,
-        }).addTo(layers);
-      }
-    }
-
-    const bounds = L.latLngBounds(latLngs);
-    if (followLocked && latest) {
-      programmaticMoveRef.current = true;
-      map.setView([latest.lat, latest.lon], Math.max(map.getZoom(), 16), { animate: false });
-      programmaticMoveRef.current = false;
-    } else if (bounds.isValid() && points.length < 5) {
-      programmaticMoveRef.current = true;
-      map.fitBounds(bounds.pad(0.25), { animate: false, maxZoom: 17 });
-      programmaticMoveRef.current = false;
-    }
-  }, [followLocked, run.checkpoints, run.gps_points]);
-
-  return (
-    <Fragment>
-      <div className="map-controls">
-        {tileFailure ? (
-          <div className="map-fallback-message">
-            Map tiles unavailable. Recording still active.
-          </div>
-        ) : null}
-        <button type="button" className={followLocked ? "map-control active" : "map-control"} onClick={() => setFollowLocked(true)}>
-          Lock follow
-        </button>
-        <button
-          type="button"
-          className="map-control"
-          onClick={() => {
-            mapRef.current?.invalidateSize();
-            setFollowLocked(true);
-          }}
-        >
-          Reset map
-        </button>
-      </div>
-      <div className="map-frame">
-        <div ref={containerRef} className="live-map" />
-      </div>
-    </Fragment>
-  );
-}
 
 const IN_RUN_NOTE_TAGS = [
   "breathing",
@@ -3899,7 +3800,7 @@ function StopScreen({
 
       <section className="button-grid vertical">
         <button type="button" className="primary-button" onClick={onContinue}>
-          Save and continue
+          Finish run
         </button>
         <button type="button" className="secondary-button" onClick={onResume}>
           <RefreshCw size={18} />
@@ -3921,6 +3822,7 @@ function PostRunScreen({
   updatePostRunPain,
   onConfirmRoute,
   onExport,
+  onRescan,
 }: {
   run: ActiveRun;
   postRun: PostRunState;
@@ -3928,6 +3830,7 @@ function PostRunScreen({
   updatePostRunPain: (patch: Partial<PostRunState["pain_after_run"]>) => void;
   onConfirmRoute: () => void;
   onExport: () => void;
+  onRescan: () => void;
 }) {
   const exportPayload = useMemo(
     () => buildExportPayload({ ...run, post_run: defaultPostRun }),
@@ -3953,6 +3856,13 @@ function PostRunScreen({
 
   return (
     <section className="screen-stack">
+      <section className="health-panel">
+        <SelfieSummary value={postRun.selfie_biometrics} />
+        <button type="button" className="secondary-button" onClick={onRescan}>
+          <Camera size={18} />
+          {postRun.selfie_biometrics ? "Retake selfie check" : "Measure camera pulse"}
+        </button>
+      </section>
       <section className="health-panel">
         <div className="health-header">
           <strong>Objective facts I inferred</strong>
@@ -4281,24 +4191,36 @@ function PostRunScreen({
   );
 }
 
+function SelfieSummary({ value }: { value: SelfieBiometrics | null | undefined }) {
+  return (
+    <Fragment>
+      <div className="health-header"><strong>Camera pulse</strong><span>experimental</span></div>
+      {!value ? <p>No camera measurement saved.</p> : value.status !== "estimated" || value.heart_rate_bpm === null ? (
+        <p>No reliable reading. {value.notes.join(" ")}</p>
+      ) : (
+        <Fragment>
+          <div className="metrics-grid">
+            <Metric label="Estimated pulse" value={`${Math.round(value.heart_rate_bpm)} bpm`} />
+            <Metric label="Change during scan" value={value.heart_rate_change_bpm === null
+              ? "not enough data" : `${value.heart_rate_change_bpm > 0 ? "+" : ""}${Math.round(value.heart_rate_change_bpm)} bpm`} />
+          </div>
+          <p className="small-copy">
+            {Math.round(value.duration_seconds)} s scan
+            {value.seconds_after_run_stop !== null ? ` · started ${Math.round(value.seconds_after_run_stop)} s after Stop` : ""}
+            {value.trend_interval_seconds !== null ? ` · pulse change over ${Math.round(value.trend_interval_seconds)} s` : ""}.
+            {" "}Not a medical measurement or a one-minute recovery test.
+          </p>
+        </Fragment>
+      )}
+    </Fragment>
+  );
+}
+
 function ExportScreen({
-  exportPayload,
-  exportJson,
-  exportArtifacts,
-  filename,
-  onDownload,
-  onCopy,
-  onShare,
-  onDownloadMsgpack,
-  onCopyMsgpack,
-  onDownloadZip,
-  onCopyZip,
-  onDownloadCoachSummary,
-  runHistory,
-  historyActions,
-  onBackToPost,
-  onDiscard,
-  onDone,
+  exportPayload, exportJson, exportArtifacts, filename,
+  onDownload, onCopy, onShare, onDownloadMsgpack, onCopyMsgpack,
+  onDownloadZip, onCopyZip, onDownloadCoachSummary,
+  runHistory, historyActions, onBackToPost, biometrics, onDiscard, onDone,
 }: {
   exportPayload: ExportPayload | null;
   exportJson: string;
@@ -4317,113 +4239,81 @@ function ExportScreen({
   onBackToPost: () => void;
   onDiscard: () => void;
   onDone: () => void;
+  biometrics: SelfieBiometrics | null | undefined;
 }) {
+  const [format, setFormat] = useState<"json" | "zip" | "msgpack" | "summary">("json");
+  const [previewOpen, setPreviewOpen] = useState(false);
   const health = exportPayload ? buildRunHealth(exportPayload) : [];
+  const saved = runHistory.some((entry) => entry.run_id === exportPayload?.run_metadata.run_id);
+  const download = format === "zip" ? onDownloadZip : format === "msgpack" ? onDownloadMsgpack :
+    format === "summary" ? onDownloadCoachSummary : onDownload;
+  const copy = format === "zip" ? onCopyZip : format === "msgpack" ? onCopyMsgpack : onCopy;
+  const label = format === "summary" ? "coach summary" : format === "msgpack" ? "MessagePack" : format.toUpperCase();
 
   return (
     <section className="screen-stack">
       <section className="result-panel">
-        <h2>Export ready</h2>
-        <p className="filename">{filename}</p>
+        <h2>{saved ? "Run saved on this device" : "Export ready"}</h2>
+        <p>{saved ? "You can finish now. Files and the route stay available in Runs." :
+          "Keep this draft until local history has saved, or download a copy."}</p>
+        <button type="button" className="primary-button full-width-button" onClick={onDone}>Done — back to runs</button>
       </section>
-
-      {health.length > 0 ? (
-        <section className="health-panel">
-          <div className="health-header">
-            <strong>Run health</strong>
-            <span>{health.some((item) => item.status === "warn") ? "review" : "ready"}</span>
+      {historyActions.labConfigured ? (
+        <button type="button" className="secondary-button" onClick={historyActions.onSyncToLab}
+          disabled={historyActions.labSync.status === "syncing"}>
+          <RefreshCw size={18} />{historyActions.labSync.status === "syncing" ? "Syncing…" : "Sync to lab"}
+        </button>
+      ) : null}
+      <section className="form-panel export-actions-panel">
+        <h3>Download a copy</h3>
+        <label>File format
+          <select value={format} onChange={(event) => setFormat(event.target.value as typeof format)}>
+            <option value="json">JSON — full run{exportArtifacts ? ` (${formatBytes(exportArtifacts.json_bytes)})` : ""}</option>
+            <option value="zip">ZIP — compressed bundle{exportArtifacts ? ` (${formatBytes(exportArtifacts.zip_bytes.byteLength)})` : ""}</option>
+            <option value="msgpack">MessagePack — compact data{exportArtifacts ? ` (${formatBytes(exportArtifacts.msgpack_bytes.byteLength)})` : ""}</option>
+            <option value="summary">Coach summary{exportArtifacts ? ` (${formatBytes(exportArtifacts.coach_summary_bytes)})` : ""}</option>
+          </select>
+        </label>
+        <button type="button" className="secondary-button" onClick={download}><Download size={18} />Download {label}</button>
+        <details className="export-more">
+          <summary>Copy, share and preview</summary>
+          <div className="button-grid">
+            {format !== "summary" ? (
+              <button type="button" className="secondary-button" onClick={copy}>
+                <Clipboard size={18} />Copy {label}{format === "json" ? "" : " base64"}
+              </button>
+            ) : null}
+            <button type="button" className="secondary-button" onClick={onShare}><Share2 size={18} />Share JSON</button>
           </div>
+          <p className="filename">{filename}</p>
+          <details onToggle={(event) => setPreviewOpen(event.currentTarget.open)}>
+            <summary>Preview full JSON</summary>
+            {previewOpen ? <textarea aria-label="Export JSON" className="json-preview" readOnly value={exportJson} /> : null}
+          </details>
+        </details>
+      </section>
+      {exportPayload ? (
+        <section className="health-panel">
+          <h3>Run route</h3>
+          <RunRouteMap points={exportPayload.time_series.gps_points} checkpoints={exportPayload.checkpoints} units={historyActions.units} />
+        </section>
+      ) : null}
+      {biometrics ? <section className="health-panel"><SelfieSummary value={biometrics} /></section> : null}
+      {health.length > 0 ? (
+        <details className="health-panel">
+          <summary>Run health and diagnostics</summary>
           <div className="health-grid">
             {health.map((item) => (
-              <div className={`health-item ${item.status}`} key={item.label}>
-                <span>{item.label}</span>
-                <strong>{item.value}</strong>
-              </div>
+              <div className={`health-item ${item.status}`} key={item.label}><span>{item.label}</span><strong>{item.value}</strong></div>
             ))}
           </div>
-        </section>
+        </details>
       ) : null}
-
-      {exportArtifacts ? (
-        <section className="health-panel">
-          <div className="health-header">
-            <strong>Export sizes</strong>
-            <span>try smaller</span>
-          </div>
-          <div className="health-grid">
-            <div className="health-item ok">
-              <span>JSON</span>
-              <strong>{formatBytes(exportArtifacts.json_bytes)}</strong>
-            </div>
-            <div className="health-item ok">
-              <span>MessagePack</span>
-              <strong>{formatBytes(exportArtifacts.msgpack_bytes.byteLength)}</strong>
-            </div>
-            <div className="health-item ok">
-              <span>ZIP</span>
-              <strong>{formatBytes(exportArtifacts.zip_bytes.byteLength)}</strong>
-            </div>
-            <div className="health-item ok">
-              <span>Coach summary</span>
-              <strong>{formatBytes(exportArtifacts.coach_summary_bytes)}</strong>
-            </div>
-          </div>
-        </section>
-      ) : null}
-
-      <section className="button-grid vertical">
-        <button type="button" className="primary-button" onClick={onDownload}>
-          <Download size={18} />
-          Download JSON
-        </button>
-        <button type="button" className="secondary-button" onClick={onShare}>
-          <Share2 size={18} />
-          Share JSON
-        </button>
-        <button type="button" className="secondary-button" onClick={onCopy}>
-          <Clipboard size={18} />
-          Copy JSON
-        </button>
-      </section>
-
-      <section className="button-grid vertical">
-        <button type="button" className="secondary-button" onClick={onDownloadMsgpack}>
-          <Download size={18} />
-          Download MessagePack
-        </button>
-        <button type="button" className="secondary-button" onClick={onCopyMsgpack}>
-          <Clipboard size={18} />
-          Copy MessagePack base64
-        </button>
-        <button type="button" className="secondary-button" onClick={onDownloadZip}>
-          <Download size={18} />
-          Download ZIP
-        </button>
-        <button type="button" className="secondary-button" onClick={onCopyZip}>
-          <Clipboard size={18} />
-          Copy ZIP base64
-        </button>
-        <button type="button" className="secondary-button" onClick={onDownloadCoachSummary}>
-          <Download size={18} />
-          Download coach_summary.json
-        </button>
-      </section>
-
-      <textarea className="json-preview" readOnly value={exportJson} />
-
       <RunHistoryPanel entries={runHistory} actions={historyActions} currentHistoryId={exportPayload?.run_metadata.run_id as string | undefined} />
-
-      <section className="button-grid vertical">
-        <button type="button" className="primary-button" onClick={onDone}>
-          Done — back to runs
-        </button>
-        <button type="button" className="secondary-button" onClick={onBackToPost}>
-          Edit post-run
-        </button>
-        <button type="button" className="link-button" onClick={onDiscard}>
-          Clear local draft
-        </button>
-      </section>
+      <div className="button-grid">
+        <button type="button" className="secondary-button" onClick={onBackToPost}>Edit post-run</button>
+        <button type="button" className="link-button" onClick={onDiscard}>Clear local draft</button>
+      </div>
     </section>
   );
 }
@@ -4509,6 +4399,7 @@ function RunHistoryPanel({
                             Delete
                           </button>
                         </div>
+                        <SavedRunRoute historyId={entry.history_id} units={actions.units} />
                       </td>
                     </tr>
                   ) : null}
@@ -4519,6 +4410,27 @@ function RunHistoryPanel({
         </table>
       )}
     </section>
+  );
+}
+
+function SavedRunRoute({ historyId, units }: { historyId: string; units: Units }) {
+  const [payload, setPayload] = useState<ExportPayload | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void loadCompletedRunFromHistory(historyId).then((value) => {
+      if (cancelled) return;
+      setPayload(value);
+      setFailed(value === null);
+    }).catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, [historyId]);
+  return (
+    <div className="history-route">
+      {payload ? (
+        <RunRouteMap points={payload.time_series.gps_points} checkpoints={payload.checkpoints} units={units} />
+      ) : <p>{failed ? "Saved route data is unavailable on this device." : "Loading saved route…"}</p>}
+    </div>
   );
 }
 
@@ -5441,6 +5353,7 @@ function buildCompactCoachSummary(exportPayload: ExportPayload) {
     patch_execution_assessment: exportPayload.patch_execution_assessment,
     route_confirmation_prompt: exportPayload.route_confirmation_prompt,
     in_run_notes: exportPayload.in_run_notes,
+    selfie_biometrics: exportPayload.post_run.selfie_biometrics ?? null,
     data_quality_notes: exportPayload.data_quality_notes,
   };
 }
@@ -5746,31 +5659,21 @@ function isWarmupGpsReady(point: GpsPoint | null, accuracy: number | null): bool
   return Date.now() - fixTime <= GPS_READY_FIX_AGE_SECONDS * 1000;
 }
 
-function nearestPointByElapsed(points: GpsPoint[], elapsedSeconds: number): GpsPoint | null {
-  if (points.length === 0) {
-    return null;
-  }
-  return points.reduce((nearest, point) =>
-    Math.abs(point.t_elapsed_seconds - elapsedSeconds) < Math.abs(nearest.t_elapsed_seconds - elapsedSeconds)
-      ? point
-      : nearest,
-  );
-}
 
 function computeControlledStartStatus(points: GpsPoint[], bands: readonly PlanBand[]) {
   if (points.length < 2) {
-    return null;
+    return {
+      band: bands.find((band) => band.km === 1) ?? CONTROLLED_START_BANDS[0],
+      currentSplitSecondsPerKm: null,
+      status: "warming",
+      statusLabel: "Finding pace",
+    };
   }
   const track = buildAppTrack(points);
   const latest = track[track.length - 1];
   const currentKm = Math.max(1, Math.floor(latest.cumulative_meters / 1000) + 1);
-  const lastPlanned = bands.reduce((max, candidate) => Math.max(max, candidate.km), 0);
-  const band =
-    bands.find((candidate) => candidate.km === currentKm) ??
-    (currentKm > lastPlanned
-      ? { km: currentKm, label: `Km ${currentKm}`, minSecondsPerKm: null, maxSecondsPerKm: null, text: "hold steady" }
-      : (CONTROLLED_START_BANDS.find((candidate) => candidate.km === currentKm) ??
-        CONTROLLED_START_BANDS[CONTROLLED_START_BANDS.length - 1]));
+  const band = bands.find((candidate) => candidate.km === currentKm) ??
+    { km: currentKm, label: `Km ${currentKm}`, minSecondsPerKm: null, maxSecondsPerKm: null, text: "free pace" };
   const kmStartDistance = (currentKm - 1) * 1000;
   // Km 1 is measured from when the runner actually moved (first 10 m), not from
   // the end of the countdown: a standing start must not read as "too slow".
@@ -5800,7 +5703,7 @@ function computeControlledStartStatus(points: GpsPoint[], bands: readonly PlanBa
     currentSplitSecondsPerKm,
     status: band.minSecondsPerKm === null ? "steady" : inBand ? "in_band" : tooFast ? "too_fast" : tooSlow ? "too_slow" : "warming",
     statusLabel:
-      band.minSecondsPerKm === null ? "steady" : inBand ? "in band" : tooFast ? "too fast" : tooSlow ? "too slow" : "warming",
+      band.minSecondsPerKm === null ? "Free pace" : inBand ? "On target" : tooFast ? "Too fast" : tooSlow ? "Below target" : "Finding pace",
   };
 }
 
@@ -5869,6 +5772,8 @@ function screenLabel(screen: Screen): string {
       return "live";
     case "stop":
       return "stopped";
+    case "selfie":
+      return "selfie check";
     case "post":
       return "post-run";
     case "export":

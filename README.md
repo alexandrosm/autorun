@@ -2,7 +2,20 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.3.2`
+Current version: `0.4.0`
+
+## v0.4.0 focus
+
+- Voice recording is available during runs alongside text notes and checkpoints. Stop remains reachable at small portrait/landscape sizes and finishes a recording already in progress. Saved `in_run_notes[].voice_note_id` links the audio to its run time, distance and GPS position; audio uses the existing lab outbox.
+- Coach feedback uses large words and color: **On target**, **Too fast**, **Below target**, and neutral **Pace uncertain** for stale/poor GPS. It assesses the current kilometre's average, not instantaneous pace. Existing protocol pace/display settings remain in force.
+- Live, export and expanded history maps offer Plain, Speed and Elevation coloring. Elevation means GPS altitude, not slope. Gray marks missing/unreliable measurements; orange dashed connections mark gaps, not measured paths. Color ranges avoid magnifying tiny numeric differences.
+- Export has one format selector and Download button for JSON, ZIP, MessagePack or coach summary. Copy/share/preview and diagnostics are collapsible; **Done** is the main completion action.
+- **Finish run** opens the front camera; **Skip** remains available. Three face regions feed an independent [POS rPPG implementation](https://doi.org/10.1109/TBME.2016.2609282) after at least 20 seconds of contiguous signal, for up to 60 active seconds. Bad timing, motion, clipping, lighting-only signals and inconsistent regional rhythms withhold the estimate. Hidden-app scans pause and restart their signal windows.
+- Usable scans export `post_run.selfie_biometrics` (also in the compact coach summary): experimental pulse, timing/quality metadata and, when available, pulse change between windows at least 20 seconds apart. This is **not** clinical one-minute heart-rate recovery. No images or video are stored or uploaded; numerical results travel with the run.
+- This implementation is **not clinically validated** and can still produce inaccurate readings, especially after exercise. It does not estimate blood pressure, oxygen saturation, temperature, respiration or HRV. Do not rely on it if you feel unwell.
+- MediaPipe Tasks Vision is pinned to `0.10.32`; its unmodified WASM files, BlazeFace short-range model and license are bundled under `public/mediapipe` and `public/models`. The service worker installs the camera dependencies before activating the update, so a first post-run scan can work offline.
+- First offline boot also works when the static host sends `Vary: Origin`: bundled asset matching tolerates the browser's `crossorigin` request header, while other cached responses still honor `Vary`.
+- `npm test` includes signal rejection, export-math and offline-worker regressions. Export schema remains `0.3.0` with optional additive fields; old run files and the coach's protocol are not rewritten.
 
 ## v0.3.2 focus
 

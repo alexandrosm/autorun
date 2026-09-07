@@ -1,0 +1,74 @@
+.selfie-screen {
+  display: grid;
+  gap: 14px;
+  width: 100%;
+  min-width: 0;
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+  color: #10231b;
+}
+
+.selfie-screen h2 { margin: 0 0 10px; font-size: 1.6rem; }
+.selfie-screen p { margin: 0; line-height: 1.45; }
+.selfie-notice { padding: 12px; border: 1px solid #c9b56d; border-radius: 10px; background: #fff8de; }
+.selfie-preview {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  max-height: 44dvh;
+  overflow: hidden;
+  isolation: isolate;
+  border-radius: 16px;
+  background: #15231d;
+  color: #fff;
+}
+.selfie-preview video { display: block; width: 100%; height: 100%; object-fit: contain; transform: scaleX(-1); }
+.selfie-face-guide {
+  position: absolute;
+  inset: 12% 25%;
+  border: 2px dashed rgba(255, 255, 255, 0.8);
+  border-radius: 45%;
+  pointer-events: none;
+}
+.selfie-preview-ended { aspect-ratio: auto; height: 76px; }
+.selfie-preview-ended video { visibility: hidden; }
+.selfie-preview-ended > span { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 800; }
+.selfie-status { min-height: 3em; }
+.selfie-status > p:first-child { font-weight: 750; }
+.selfie-status .selfie-hint { margin-top: 7px; font-size: 0.88rem; color: #40564a; }
+.selfie-progress { display: grid; gap: 6px; }
+.selfie-progress label { font-weight: 750; }
+.selfie-progress progress { width: 100%; height: 14px; accent-color: #12683f; }
+.selfie-progress small, .selfie-reading > small { color: #40564a; line-height: 1.4; }
+.selfie-reading { display: grid; gap: 8px; padding: 14px; border: 1px solid #c0d6c8; border-radius: 12px; background: #fff; }
+.selfie-reading-label { font-size: 0.9rem; font-weight: 750; }
+.selfie-reading > strong { font-size: 2.5rem; line-height: 1; font-variant-numeric: tabular-nums; }
+.selfie-reading > strong small { font-size: 1rem; }
+.selfie-actions { display: grid; gap: 10px; }
+.selfie-actions button {
+  min-height: 52px;
+  width: 100%;
+  padding: 13px 16px;
+  border: 1px solid #729c85;
+  border-radius: 12px;
+  background: #fff;
+  color: #173d29;
+  font-weight: 800;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.selfie-actions .selfie-primary { border-color: #12683f; background: #12683f; color: #fff; }
+.selfie-actions .selfie-primary:disabled { background: #d5ded8; color: #4e6155; border-color: #b4c2b9; cursor: default; }
+.selfie-actions .selfie-skip { border-color: #647a6c; }
+.selfie-actions button:focus-visible { outline: 3px solid #2045c7; outline-offset: 3px; }
+.selfie-limitations { font-size: 0.8rem; color: #40564a; }
+
+@media (max-width: 350px) {
+  .selfie-screen { gap: 11px; }
+  .selfie-screen h2 { font-size: 1.4rem; }
+  .selfie-preview { max-height: 35dvh; }
+  .selfie-notice, .selfie-reading { padding: 10px; }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .selfie-preview { max-height: 55dvh; }
+}

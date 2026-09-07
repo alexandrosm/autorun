@@ -1,4 +1,4 @@
-export type Screen = "home" | "setup" | "recovery" | "live" | "stop" | "post" | "export";
+export type Screen = "home" | "setup" | "recovery" | "live" | "stop" | "selfie" | "post" | "export";
 export type RunStatus = "idle" | "armed" | "running" | "stopping" | "stopped" | "discarded";
 
 export type PermissionStatusText = "unknown" | "ready" | "denied" | "unavailable";
@@ -90,6 +90,43 @@ export interface PreRunState {
   protocol_questions?: ProtocolQuestion[] | null;
 }
 
+export interface SelfiePulseSample {
+  timestamp_seconds: number;
+  regions: readonly [
+    readonly [number, number, number],
+    readonly [number, number, number],
+    readonly [number, number, number],
+  ];
+  motion: number;
+  clipped_fraction: number;
+}
+
+export interface SelfiePulseEstimate {
+  heart_rate_bpm: number | null;
+  signal_quality: number;
+  frames_per_second: number;
+  usable_seconds: number;
+  reason: string | null;
+}
+
+export interface SelfieBiometrics {
+  method: "face_camera_pos_rppg";
+  status: "estimated" | "insufficient_signal";
+  started_at_utc: string;
+  ended_at_utc: string;
+  duration_seconds: number;
+  seconds_after_run_stop: number | null;
+  heart_rate_bpm: number | null;
+  first_heart_rate_bpm: number | null;
+  last_heart_rate_bpm: number | null;
+  heart_rate_change_bpm: number | null;
+  trend_interval_seconds: number | null;
+  signal_quality: number;
+  accepted_window_count: number;
+  frame_rate_hz: number;
+  notes: string[];
+}
+
 export interface PostRunState {
   rpe_1_to_10: number | null;
   rpe_estimation_source: "manual" | "simple_effort_fallback" | "not_answered";
@@ -108,6 +145,7 @@ export interface PostRunState {
   subjective_debrief_skip_reason: string | null;
   free_text: string;
   protocol_answers: Record<string, string | number | null>;
+  selfie_biometrics?: SelfieBiometrics | null;
 }
 
 export interface PermissionState {
@@ -214,6 +252,7 @@ export interface InRunNote {
   note_type: "run_observation" | "app_feedback" | "route_note" | "other";
   tags: string[];
   text: string;
+  voice_note_id?: string;
 }
 
 export interface TargetDistanceResult {
@@ -796,7 +835,7 @@ export interface ExportPayload {
   schema_version: "0.3.0";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.3.2";
+    version: "0.4.0";
     platform: "web";
     user_agent: string;
     created_at_utc: string;

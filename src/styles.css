@@ -548,19 +548,7 @@ button {
   max-width: 100%;
 }
 
-.map-control {
-  min-height: 44px;
-  padding: 6px 10px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: rgba(8, 16, 12, 0.9);
-  color: #e6f4ec;
-  font-weight: 900;
-}
 
-.map-control.active {
-  color: #2dd078;
-}
 
 .live-map {
   width: 100%;
@@ -849,8 +837,40 @@ button {
   overflow-wrap: anywhere;
 }
 
-.live-band.ok { color: #2dd078; }
-.live-band.warn { color: #ffb35b; }
+.live-pace-status {
+  --pace-color: #b4c9bd;
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  background: rgba(8, 16, 12, 0.95);
+  color: #e6f4ec;
+  border: 2px solid var(--pace-color);
+  border-left-width: 9px;
+  border-radius: 12px;
+}
+
+.live-pace-status > strong { color: var(--pace-color); font-size: clamp(25px, 6vw, 34px); line-height: 1.1; }
+.live-pace-status > span { font-size: 12px; font-weight: 700; }
+.live-pace-status > p { margin: 0; font-size: 14px; }
+.live-pace-status > small { font-size: 12px; color: #d1e4d8; }
+.pace-in_band { --pace-color: #55ef98; }
+.pace-too_fast { --pace-color: #ff9985; }
+.pace-too_slow { --pace-color: #ffd36f; }
+.live-pace-in_band { box-shadow: inset 0 0 0 5px #55ef98; }
+.live-pace-too_fast { box-shadow: inset 0 0 0 5px #ff9985; }
+.live-pace-too_slow { box-shadow: inset 0 0 0 5px #ffd36f; }
+
+.live-voice-host { min-width: 0; }
+.voice-inline-panel { display: grid; gap: 10px; }
+.voice-inline-panel h3,
+.voice-inline-panel p { margin: 0; }
+.voice-inline-panel .recorder-pulse { font-size: 30px; }
+.export-actions-panel { display: grid; gap: 12px; }
+.export-actions-panel h3 { margin: 0; }
+.export-more { min-width: 0; }
+.export-more > .button-grid { margin-top: 12px; }
+.full-width-button { width: 100%; }
+.history-route { margin-top: 12px; white-space: normal; }
 
 .live-bottom {
   position: relative;
@@ -863,7 +883,7 @@ button {
 
 .live-secondary {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -871,7 +891,11 @@ button {
   background: rgba(8, 16, 12, 0.85);
   color: #e6f4ec;
   border-color: transparent;
+  padding: 8px 5px;
+  gap: 4px;
+  font-size: 12px;
 }
+
 
 
 .live-note-panel .tag-button {

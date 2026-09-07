@@ -1,12 +1,20 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.3.2-reliability";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.4.0-run-feedback";
 const APP_SCOPE = self.registration.scope;
 const CACHE_PREFIX = "greenlake-autoresearch-logger-";
+const STATIC_ASSET_PREFIXES = ["assets/", "mediapipe/", "models/"].map((path) => new URL(path, APP_SCOPE).href);
 
 async function cacheAppShell() {
   const response = await fetch(APP_SCOPE, { cache: "reload" });
   if (!response.ok) throw new Error("App shell download failed");
   const html = await response.clone().text();
-  const assets = [];
+  // Install on-device camera dependencies before the first offline post-run scan.
+  const assets = [
+    "mediapipe/vision_wasm_internal.js",
+    "mediapipe/vision_wasm_internal.wasm",
+    "mediapipe/vision_wasm_nosimd_internal.js",
+    "mediapipe/vision_wasm_nosimd_internal.wasm",
+    "models/blaze_face_short_range.tflite",
+  ].map((path) => new URL(path, APP_SCOPE).href);
   for (const tag of html.matchAll(/<(?:script|link)\b[^>]*>/gi)) {
     if (!/^<script\b/i.test(tag[0]) && !/\brel=["']stylesheet["']/i.test(tag[0])) continue;
     const source = tag[0].match(/\b(?:src|href)=["']([^"']+)["']/i)?.[1];
@@ -63,7 +71,11 @@ self.addEventListener("fetch", (event) => {
   }
 
   event.respondWith(
-    caches.match(request).then((cached) => {
+    // crossorigin scripts/styles send Origin, unlike the installer's requests.
+    // These bundled files do not vary by headers; dynamic responses still may.
+    caches.match(request, {
+      ignoreVary: STATIC_ASSET_PREFIXES.some((prefix) => url.href.startsWith(prefix)),
+    }).then((cached) => {
       if (cached) {
         return cached;
       }

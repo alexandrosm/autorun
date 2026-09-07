@@ -5,6 +5,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.4.0",
+    notes: [
+      "Record voice notes during a run. Notes keep their time, distance and GPS context; Stop stays reachable and saves audio already being recorded.",
+      "Large, color-coded On target / Too fast / Below target feedback follows the coach's kilometre pace band. Stale or poor GPS shows Pace uncertain instead.",
+      "Color live, exported and saved routes by speed or GPS altitude. Missing or unreliable values stay gray; recording gaps are dashed and marked.",
+      "Exports use one format selector and one Download button. Copy, share, previews and diagnostics are tucked away; Done comes first.",
+      "Finish run opens an optional front-camera pulse scan. An experimental estimate and pulse change are saved only from usable signals; images never leave the device.",
+      "Camera assets are bundled for offline use after the update finishes. Camera pulse is not medical measurement: motion, lighting and camera processing can prevent or distort a reading.",
+    ],
+  },
+  {
     version: "0.3.2",
     notes: [
       "Coach pace limits now survive saving and reopening the app; protocol downloads also time out if the response body stalls.",

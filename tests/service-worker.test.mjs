@@ -6,6 +6,13 @@ import vm from "node:vm";
 const source = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
 const scope = "https://fixture.invalid/autorun/";
 const shell = '<html><script type="module" src="/autorun/assets/main.js"></script><link rel="stylesheet" href="/autorun/assets/main.css"></html>';
+const cameraAssets = [
+  "mediapipe/vision_wasm_internal.js",
+  "mediapipe/vision_wasm_internal.wasm",
+  "mediapipe/vision_wasm_nosimd_internal.js",
+  "mediapipe/vision_wasm_nosimd_internal.wasm",
+  "models/blaze_face_short_range.tflite",
+];
 
 function worker() {
   const handlers = new Map();
@@ -17,8 +24,27 @@ function worker() {
     [scope, new Response(shell, { headers: { "Content-Type": "text/html" } })],
     [`${scope}assets/main.js`, new Response("window.booted = true;")],
     [`${scope}assets/main.css`, new Response("body { color: green; }")],
+    ...cameraAssets.map((path) => [`${scope}${path}`, new Response(`camera asset: ${path}`)]),
   ]);
   const key = (request) => typeof request === "string" ? new URL(request, scope).href : request.url;
+  const cachedHeaders = new WeakMap();
+  const put = (bucket, request, response) => {
+    const stored = response.clone();
+    cachedHeaders.set(stored, new Headers(typeof request === "string" ? undefined : request.headers));
+    bucket.set(key(request), stored);
+  };
+  const match = (bucket, request, options = {}) => {
+    const response = bucket.get(key(request));
+    if (!response) return undefined;
+    const incoming = new Headers(typeof request === "string" ? undefined : request.headers);
+    const stored = cachedHeaders.get(response) ?? new Headers();
+    const vary = response.headers.get("vary");
+    if (!options.ignoreVary && vary && vary.split(",").some(field => {
+      const name = field.trim().toLowerCase();
+      return name === "*" || incoming.get(name) !== stored.get(name);
+    })) return undefined;
+    return response.clone();
+  };
   const fetch = async (request) => {
     const response = network.get(key(request));
     if (!response) throw new TypeError("Network unavailable");
@@ -31,19 +57,19 @@ function worker() {
       if (!buckets.has(name)) buckets.set(name, new Map());
       const bucket = buckets.get(name);
       return {
-        match: async (request) => bucket.get(key(request))?.clone(),
-        put: async (request, response) => { bucket.set(key(request), response.clone()); },
+        match: async (request, options) => match(bucket, request, options),
+        put: async (request, response) => put(bucket, request, response),
         addAll: async (requests) => {
           const responses = await Promise.all(requests.map(fetch));
           if (responses.some(response => !response.ok)) throw new TypeError("Cache download failed");
-          requests.forEach((request, index) => bucket.set(key(request), responses[index]));
+          requests.forEach((request, index) => put(bucket, request, responses[index]));
         },
       };
     },
-    match: async (request) => {
+    match: async (request, options) => {
       for (const bucket of buckets.values()) {
-        const response = bucket.get(key(request));
-        if (response) return response.clone();
+        const response = match(bucket, request, options);
+        if (response) return response;
       }
     },
   };
@@ -68,7 +94,8 @@ function worker() {
     await Promise.all(pending);
     return resolved;
   };
-  const request = (url, mode = "cors") => dispatch("fetch", { request: { url, mode, method: "GET" } });
+  const request = (url, mode = "cors", headers = {}) =>
+    dispatch("fetch", { request: { url, mode, method: "GET", headers: new Headers(headers) } });
   return { dispatch, request, network, buckets };
 }
 
@@ -80,6 +107,33 @@ test("an activated update boots offline before any client has fetched its script
   assert.equal(await (await app.request(scope, "navigate")).text(), shell);
   assert.equal(await (await app.request(`${scope}assets/main.js`)).text(), "window.booted = true;");
   assert.equal(await (await app.request(`${scope}assets/main.css`)).text(), "body { color: green; }");
+  for (const path of cameraAssets) {
+    assert.equal(await (await app.request(`${scope}${path}`)).text(), `camera asset: ${path}`);
+  }
+});
+
+test("crossorigin boot assets use their precache even when the server varies by Origin", async () => {
+  const app = worker();
+  for (const asset of ["assets/main.js", "assets/main.css"]) {
+    const original = app.network.get(`${scope}${asset}`);
+    app.network.set(`${scope}${asset}`, new Response(await original.text(), { headers: { Vary: "Origin" } }));
+  }
+  await app.dispatch("install");
+  await app.dispatch("activate");
+  app.network.clear();
+  const headers = { Origin: new URL(scope).origin };
+  assert.equal(await (await app.request(`${scope}assets/main.js`, "cors", headers)).text(), "window.booted = true;");
+  assert.equal(await (await app.request(`${scope}assets/main.css`, "cors", headers)).text(), "body { color: green; }");
+});
+
+test("non-static responses still respect their Vary headers", async () => {
+  const app = worker();
+  const url = `${scope}api/example`;
+  app.network.set(url, new Response("English", { headers: { Vary: "Accept-Language" } }));
+  await app.request(url, "cors", { "Accept-Language": "en" });
+  app.network.clear();
+  assert.equal(await (await app.request(url, "cors", { "Accept-Language": "en" })).text(), "English");
+  await assert.rejects(app.request(url, "cors", { "Accept-Language": "fr" }));
 });
 
 test("activation preserves other apps' cached data on the same origin", async () => {
@@ -102,7 +156,7 @@ test("a server failure cannot replace the last bootable offline shell", async ()
 
 test("an incomplete shell download fails installation instead of retiring the old cache", async () => {
   const app = worker();
-  app.network.delete(`${scope}assets/main.js`);
+  app.network.delete(`${scope}models/blaze_face_short_range.tflite`);
   await assert.rejects(app.dispatch("install"));
   assert.equal(await app.buckets.get("greenlake-autoresearch-logger-vold").get(scope).text(), "old shell");
 });
