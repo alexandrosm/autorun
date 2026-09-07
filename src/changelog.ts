@@ -5,6 +5,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.3.2",
+    notes: [
+      "Coach pace limits now survive saving and reopening the app; protocol downloads also time out if the response body stalls.",
+      "Stop no longer waits on wake-lock release. Recovery uses the newest draft, suspension flushes the authoritative clock, and failed exports stay recoverable.",
+      "Unsynced runs are never removed by the history limit. Failed and oversized uploads can be retried explicitly, including voice notes.",
+      "Voice recording handles unavailable encoders, final audio chunks, interrupted durations, and storage failures without claiming a failed save succeeded.",
+      "Target/split timing uses the first crossing; rejected GPS jumps stay excluded; partial kilometers cannot prove a pacing patch was followed.",
+      "Updates cache a complete offline app before activation and wait for recording, countdowns, voice capture, and QR scanning to finish.",
+    ],
+  },
+  {
     version: "0.3.1",
     notes: [
       "Live overlays and map tiles now occupy separate layers, with explicit light text on the dark panels.",

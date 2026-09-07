@@ -2,7 +2,17 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.3.1`
+Current version: `0.3.2`
+
+## v0.3.2 focus
+
+- Coach protocol storage preserves numeric pace bands. Protocol response-body reads share the download timeout; an empty handover can fetch the protocol without uploading a run.
+- Stop freezes elapsed immediately, independent of wake-lock release. Drafts flush on background/freeze, recovery prefers a newer same-run IndexedDB snapshot, and failed/pending history saves cannot be discarded by Done.
+- History retention caps only already-synced runs. Explicit sync retries prior errors; rate limits/timeouts remain retryable; oversized or missing handover audio is reported instead of silently skipped.
+- Voice notes wait for final recorder data, stop their duration clock when capture ends, release the microphone after encoder startup failures, and report index-storage failures without losing the retryable recording.
+- Target/split times stop at first crossing; activity-start boundaries retain the first moving segment and require sustained movement; active targets cannot borrow arbitrary preamble distance; excluded jumps are not restored by gap interpolation. Partial kilometer pacing remains unassessed until completion.
+- Updates precache HTML plus boot scripts/styles before activation, preserve unrelated caches, and cannot replace the offline shell with a server error. Activation/reload is deferred during capture, countdowns, sync, or QR scanning.
+- Run `npm test` with Node 24 for deterministic public-export boundary and service-worker lifecycle regressions. Export schema remains `0.3.0`; historical run files are not rewritten.
 
 ## v0.3.1 focus
 

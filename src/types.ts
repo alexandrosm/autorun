@@ -241,7 +241,6 @@ export interface ActiveTargetDistanceResult {
   target_distance_confidence: "unknown" | "low" | "medium" | "high";
   target_detection_method:
     | "active_cumulative_crossing"
-    | "recording_target_minus_activity_start"
     | "recording_target_with_active_tolerance"
     | "not_reached";
   target_distance_tolerance_meters: number;
@@ -312,7 +311,7 @@ export interface GpsGapInterpolation {
   surrounding_speed_mps: number | null;
   speed_based_distance_estimate_meters: number | null;
   chosen_distance_estimate_meters: number;
-  method: "straight_line" | "speed_based" | "route_based_placeholder";
+  method: "straight_line" | "speed_based" | "route_based_placeholder" | "excluded";
   confidence: "low" | "medium" | "high";
 }
 
@@ -797,7 +796,7 @@ export interface ExportPayload {
   schema_version: "0.3.0";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.3.1";
+    version: "0.3.2";
     platform: "web";
     user_agent: string;
     created_at_utc: string;

@@ -55,7 +55,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.3.1";
+const APP_VERSION = "0.3.2";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -373,6 +373,7 @@ export default function App() {
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
   const [gpsStaleSeconds, setGpsStaleSeconds] = useState(0);
   const [serviceWorkerUpdateReady, setServiceWorkerUpdateReady] = useState(false);
+  const [serviceWorkerReloadPending, setServiceWorkerReloadPending] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
   const [pwaState, setPwaState] = useState<PwaState>(initialRun?.pwa_state ?? detectPwaState());
   const [runHistory, setRunHistory] = useState<RunHistoryEntry[]>(() => loadRunHistoryIndex());
@@ -384,11 +385,7 @@ export default function App() {
   const gpsWatchIdsRef = useRef<Set<number>>(new Set());
   const warmupWatchIdRef = useRef<number | null>(null);
   const elapsedSecondsRef = useRef(initialRun?.elapsed_offset_seconds ?? 0);
-  const runStartPerfRef = useRef<number | null>(
-    initialRun && !initialRun.run_metadata.end_time_utc
-      ? performance.now() - initialRun.elapsed_offset_seconds * 1000
-      : null,
-  );
+  const runStartPerfRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const motionBucketRef = useRef<MotionBucket | null>(null);
   const startWeatherFetchStartedRef = useRef(Boolean(initialRun?.weather.start_weather.fetched_at_utc));
@@ -399,6 +396,8 @@ export default function App() {
   const stale10LoggedRef = useRef(false);
   const motionEventsSeenRef = useRef(initialRun?.motion_debug.sample_events_seen ?? 0);
   const activeRunRef = useRef<ActiveRun | null>(initialRun);
+  const screenRef = useRef(screen);
+  const serviceWorkerUpdateSafeRef = useRef(false);
   const serviceWorkerRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
   const startWeatherRetryTimeoutRef = useRef<number | null>(null);
   const recoverySuppressedRef = useRef(false);
@@ -438,6 +437,7 @@ export default function App() {
 
   elapsedSecondsRef.current = elapsedSeconds;
   activeRunRef.current = activeRun;
+  screenRef.current = screen;
 
   const getElapsedSeconds = useCallback(() => {
     if (runStartPerfRef.current === null) {
@@ -745,7 +745,9 @@ export default function App() {
         // A released wake lock is already inactive, so no extra state is needed.
       }
     }
-    updatePermissions({ wake_lock_status: navigator.wakeLock ? "inactive" : "unavailable" });
+    if (wakeLockRef.current === null) {
+      updatePermissions({ wake_lock_status: navigator.wakeLock ? "inactive" : "unavailable" });
+    }
   }, [updatePermissions]);
 
   const requestWakeLock = useCallback(
@@ -922,6 +924,10 @@ export default function App() {
   }, []);
 
   const startRun = useCallback(() => {
+    if (screenRef.current !== "setup" || activeRunRef.current) {
+      clearStartTimers();
+      return;
+    }
     clearStartTimers();
     setPendingStart(false);
     setGpsStartTimedOut(false);
@@ -963,11 +969,15 @@ export default function App() {
     setPreRun(planPreRun);
     const run = createBlankRun(planPreRun, permissions, finalWarmup, pwaState, motionDebugDraft);
     recoverySuppressedRef.current = false;
+    activeRunRef.current = run;
+    elapsedSecondsRef.current = 0;
     setActiveRun(run);
     setElapsedSeconds(0);
     setExportCreatedAt(new Date().toISOString());
     setActionMessage("");
     runStartPerfRef.current = performance.now();
+    lastTickWallRef.current = Date.now();
+    lastTickPerfRef.current = runStartPerfRef.current;
     motionBucketRef.current = null;
     motionEventsSeenRef.current = 0;
     startWeatherFetchStartedRef.current = false;
@@ -1001,6 +1011,9 @@ export default function App() {
 
   const beginStartCountdown = useCallback(
     (startAnyway = false) => {
+      if (screenRef.current !== "setup" || activeRunRef.current) {
+        return;
+      }
       clearStartTimers();
       setPendingStart(false);
       setGpsStartTimedOut(false);
@@ -1054,11 +1067,14 @@ export default function App() {
     warmupStatus.latestPoint,
   ]);
 
-  const stopRun = async () => {
+  const stopRun = () => {
     if (!activeRunRef.current || activeRunRef.current.status !== "running") {
       return;
     }
+    reconcileElapsedClock();
     const elapsed = getElapsedSeconds();
+    runStartPerfRef.current = null;
+    elapsedSecondsRef.current = elapsed;
     const stopClickedAt = new Date();
     const currentRun = activeRunRef.current;
     const preStopPoints = currentRun?.gps_points.filter((point) => point.t_elapsed_seconds <= elapsed + 0.05) ?? [];
@@ -1119,7 +1135,7 @@ export default function App() {
     stale5LoggedRef.current = false;
     stale10LoggedRef.current = false;
     setGpsStaleSeconds(0);
-    await releaseWakeLock();
+    void releaseWakeLock();
     setActiveRun((run) =>
       run
         ? {
@@ -1152,7 +1168,8 @@ export default function App() {
           }
         : run,
     );
-    runStartPerfRef.current = null;
+    lastTickWallRef.current = null;
+    lastTickPerfRef.current = null;
     setElapsedSeconds(elapsed);
     setScreen("stop");
 
@@ -1177,6 +1194,8 @@ export default function App() {
         : run,
     );
     runStartPerfRef.current = performance.now() - elapsedSeconds * 1000;
+    lastTickWallRef.current = Date.now();
+    lastTickPerfRef.current = performance.now();
     setScreen("live");
     startGpsWatch();
     if (permissions.wake_lock_used) {
@@ -1205,6 +1224,8 @@ export default function App() {
         : run,
     );
     runStartPerfRef.current = performance.now() - offset * 1000;
+    lastTickWallRef.current = Date.now();
+    lastTickPerfRef.current = performance.now();
     setElapsedSeconds(offset);
     setScreen("live");
     startGpsWatch();
@@ -1246,6 +1267,7 @@ export default function App() {
         : run,
     );
     runStartPerfRef.current = null;
+    elapsedSecondsRef.current = stopElapsed;
     setElapsedSeconds(stopElapsed);
     setScreen("post");
     setActionMessage("Recovered run finalized.");
@@ -1263,6 +1285,7 @@ export default function App() {
     recoverySuppressedRef.current = true;
     localStorage.removeItem(STORAGE_KEY);
     void deleteRunFromIndexedDb();
+    activeRunRef.current = null;
     setActiveRun(null);
     setPreRun((current) => ({ ...defaultPreRun, active_patch_id: current.active_patch_id }));
     setPermissions(defaultPermissions());
@@ -1291,8 +1314,10 @@ export default function App() {
   };
 
   const finishRunToHome = () => {
-    // The run is already in history (and the draft deleted) by the time the
-    // export screen shows; going home needs no confirmation.
+    if (activeRun && !runAlreadyExported(activeRun)) {
+      setActionMessage("Local history has not saved this run yet. Keep the draft, retry export, or download it before explicitly discarding.");
+      return;
+    }
     resetRunState();
   };
 
@@ -1361,15 +1386,17 @@ export default function App() {
       saveRouteMemory(payload);
       void saveCompletedRunToHistory(payload, filename).then((nextHistory) => {
         setRunHistory(nextHistory);
-        // The run now lives in history: the crash-recovery draft is obsolete.
-        recoverySuppressedRef.current = true;
-        try {
-          localStorage.removeItem(STORAGE_KEY);
-        } catch {
-          // Draft cleanup is best effort.
+        if (activeRunRef.current?.run_metadata.run_id === activeRun.run_metadata.run_id) {
+          // Only this run's successful archive may retire its recovery draft.
+          recoverySuppressedRef.current = true;
+          try {
+            localStorage.removeItem(STORAGE_KEY);
+          } catch {
+            // Draft cleanup is best effort.
+          }
+          void deleteRunFromIndexedDb();
+          setActionMessage("Export ready. Run saved to local history.");
         }
-        void deleteRunFromIndexedDb();
-        setActionMessage("Export ready. Run saved to local history.");
         void syncRunsToLab();
       }).catch(() => setActionMessage("Export ready. Local history save failed; download still works."));
     }
@@ -1553,6 +1580,7 @@ export default function App() {
   const labSyncBusyRef = useRef(false);
   const [voiceNotes, setVoiceNotes] = useState<VoiceNoteEntry[]>(() => loadVoiceNotesIndex());
   const [recordingNote, setRecordingNote] = useState(false);
+  const [scanningLab, setScanningLab] = useState(false);
 
   const handleLabEndpointChange = useCallback((value: string) => {
     setLabEndpoint(value);
@@ -1569,8 +1597,11 @@ export default function App() {
     }
     labSyncBusyRef.current = true;
     try {
-      const pending = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc && !entry.sync_error);
-      const pendingNotes = loadVoiceNotesIndex().filter((note) => !note.synced_at_utc && !note.sync_error);
+      const unsyncedRuns = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
+      const unsyncedNotes = loadVoiceNotesIndex().filter((note) => !note.synced_at_utc);
+      const pending = unsyncedRuns.filter((entry) => announce || !entry.sync_error);
+      const pendingNotes = unsyncedNotes.filter((note) => announce || !note.sync_error);
+      const deferredErrors = unsyncedRuns.length + unsyncedNotes.length - pending.length - pendingNotes.length;
       const pendingTotal = pending.length + pendingNotes.length;
       const itemsLabel = describePendingItems(pending.length, pendingNotes.length);
       const protocolStale = Date.now() - (loadCoachProtocolFetchedAt() ?? 0) > PROTOCOL_REFRESH_MS;
@@ -1593,13 +1624,14 @@ export default function App() {
           }
         }
       }
-      if (pendingTotal === 0) {
-        if (announce || direct) {
-          setLabSync({ status: direct ? "ok" : "offline", detail: direct ? "Everything is in the lab." : "Lab not reachable from this network." });
-        }
-        if (announce) {
-          setActionMessage(direct ? "Everything is in the lab." : "Lab is not reachable from this network.");
-        }
+      const protocolOnlyHandover = pendingTotal === 0 && announce && probe === "blocked" &&
+        endpoint.startsWith("http://") && window.location.protocol === "https:";
+      if (pendingTotal === 0 && !protocolOnlyHandover) {
+        const detail = direct
+          ? deferredErrors > 0 ? `${deferredErrors} items need attention — tap Sync to retry.` : "Everything is in the lab."
+          : "Lab not reachable from this network.";
+        if (announce || direct) setLabSync({ status: direct && deferredErrors === 0 ? "ok" : "offline", detail });
+        if (announce) setActionMessage(detail);
         return;
       }
       if (direct) {
@@ -1668,27 +1700,30 @@ export default function App() {
         });
         return;
       }
-      setLabSync({ status: "syncing", detail: `Packing ${itemsLabel}…` });
+      setLabSync({ status: "syncing", detail: protocolOnlyHandover ? "Fetching coach protocol through the lab page…" : `Packing ${itemsLabel}…` });
       const handover = await packRunsForLabHandover(endpoint, pending, pendingNotes);
-      for (const id of handover?.oversized ?? []) {
-        markRunSyncError(id, "too large for the handover link — sync on WiFi with local network access allowed");
+      for (const issue of handover.issues) {
+        if (issue.kind === "run") markRunSyncError(issue.id, issue.reason);
+        else markVoiceNoteSyncError(issue.id, issue.reason);
       }
-      if (handover?.oversized.length) {
+      if (handover.issues.length > 0) {
         setRunHistory(loadRunHistoryIndex());
+        setVoiceNotes(loadVoiceNotesIndex());
       }
-      if (!handover || handover.count === 0) {
+      if (!handover.url) {
         setLabSync({
           status: "offline",
-          detail: "Nothing packable: the pending items are too large for the handover link. Grant local network access when Chrome asks, then retry.",
+          detail: "Pending items could not be prepared. Check the sync errors; oversized items need a direct connection with local network access allowed.",
         });
         return;
       }
       setLabSync({
         status: "syncing",
-        detail: `Opening the lab page with ${handover.count} item${handover.count === 1 ? "" : "s"}…`,
+        detail: protocolOnlyHandover ? "Opening the lab page for the coach protocol…" : `Opening the lab page with ${handover.count} item${handover.count === 1 ? "" : "s"}…`,
       });
       // If this navigation commits, the page unloads and nothing below matters.
       const watchdog = window.setTimeout(() => {
+        window.stop(); // Cancel a stalled navigation before allowing another capture.
         setLabSync({
           status: "offline",
           detail: "The lab page didn't open automatically. Tap \"Open lab page\" to finish syncing.",
@@ -1713,8 +1748,11 @@ export default function App() {
           protocol?: unknown;
         };
         const protocol = parseCoachProtocol(result.protocol);
-        if (protocol && saveCoachProtocol(protocol)) {
-          setActionMessage(`New coach protocol ${protocol.protocol_id}: ${protocol.expectation}`);
+        if (protocol) {
+          markCoachProtocolFetched();
+          if (saveCoachProtocol(protocol)) {
+            setActionMessage(`New coach protocol ${protocol.protocol_id}: ${protocol.expectation}`);
+          }
         }
         const acks = Array.isArray(result.acks) ? result.acks : [];
         const noteAcks = Array.isArray(result.noteAcks) ? result.noteAcks : [];
@@ -1771,21 +1809,39 @@ export default function App() {
     return () => document.removeEventListener("visibilitychange", refreshOnReturn);
   }, []);
 
+  const serviceWorkerUpdateSafe =
+    (screen === "home" || screen === "setup" || (screen === "export" && recoverySuppressedRef.current)) &&
+    (!activeRun || screen === "export") &&
+    !recordingNote &&
+    !scanningLab &&
+    !pendingStart &&
+    countdownSeconds === null &&
+    labSync.status !== "syncing";
+  serviceWorkerUpdateSafeRef.current = serviceWorkerUpdateSafe;
+
   useEffect(() => {
-    // Background update: apply a waiting version automatically, but only when
-    // it cannot interrupt anything: home screen, no run, no recording, no upload.
+    if (
+      serviceWorkerReloadPending &&
+      serviceWorkerUpdateSafe &&
+      serviceWorkerUpdateSafeRef.current &&
+      runStartPerfRef.current === null &&
+      countdownIntervalRef.current === null
+    ) {
+      window.location.reload();
+    }
+  }, [serviceWorkerReloadPending, serviceWorkerUpdateSafe]);
+
+  useEffect(() => {
     if (
       serviceWorkerUpdateReady &&
       screen === "home" &&
-      !activeRun &&
-      !recordingNote &&
-      labSync.status !== "syncing" &&
+      serviceWorkerUpdateSafe &&
       !autoUpdateAppliedRef.current
     ) {
       autoUpdateAppliedRef.current = true;
       applyServiceWorkerUpdate();
     }
-  }, [activeRun, screen, serviceWorkerUpdateReady, recordingNote, labSync.status]);
+  }, [screen, serviceWorkerUpdateReady, serviceWorkerUpdateSafe]);
 
   const historyActions: RunHistoryActions = {
     onDownloadJson: downloadHistoryJson,
@@ -1821,6 +1877,9 @@ export default function App() {
   };
 
   const applyServiceWorkerUpdate = () => {
+    if (!serviceWorkerUpdateSafeRef.current || countdownIntervalRef.current !== null) {
+      return;
+    }
     const waiting = serviceWorkerRegistrationRef.current?.waiting;
     if (!waiting) {
       window.location.reload();
@@ -1829,7 +1888,7 @@ export default function App() {
     navigator.serviceWorker.addEventListener(
       "controllerchange",
       () => {
-        window.location.reload();
+        setServiceWorkerReloadPending(true);
       },
       { once: true },
     );
@@ -1872,6 +1931,7 @@ export default function App() {
     }
 
     const intervalId = window.setInterval(() => {
+      reconcileElapsedClock();
       const elapsed = getElapsedSeconds();
       setElapsedSeconds(elapsed);
       lastTickWallRef.current = Date.now();
@@ -1908,7 +1968,7 @@ export default function App() {
     }, 500);
 
     return () => window.clearInterval(intervalId);
-  }, [tickerActive, appendLifecycleEvent, getElapsedSeconds, startGpsWatch]);
+  }, [tickerActive, appendLifecycleEvent, getElapsedSeconds, reconcileElapsedClock, startGpsWatch]);
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (event: Event) => {
@@ -1933,6 +1993,9 @@ export default function App() {
         scope: import.meta.env.BASE_URL,
       }).then((registration) => {
         serviceWorkerRegistrationRef.current = registration;
+        if (registration.waiting && navigator.serviceWorker.controller) {
+          setServiceWorkerUpdateReady(true);
+        }
         setPwaState((current) => detectPwaState(current.storage_persisted));
         registration.addEventListener("updatefound", () => {
           const installing = registration.installing;
@@ -1982,18 +2045,27 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (activeRun || recoverySuppressedRef.current) {
+    if (recoverySuppressedRef.current) {
       return;
     }
     let canceled = false;
     void loadRunFromIndexedDb().then((storedRun) => {
-      if (canceled || !storedRun) {
+      if (canceled || !storedRun || recoverySuppressedRef.current) {
+        return;
+      }
+      const currentRun = activeRunRef.current;
+      if (currentRun && (
+        screenRef.current !== "recovery" ||
+        currentRun.run_metadata.run_id !== storedRun.run_metadata.run_id ||
+        Date.parse(storedRun.last_saved_at_utc) <= Date.parse(currentRun.last_saved_at_utc)
+      )) {
         return;
       }
       if (runAlreadyExported(storedRun)) {
         void deleteRunFromIndexedDb();
         return;
       }
+      activeRunRef.current = storedRun;
       setActiveRun(storedRun);
       setPreRun(storedRun.pre_run);
       setPermissions(storedRun.permissions);
@@ -2006,7 +2078,7 @@ export default function App() {
     return () => {
       canceled = true;
     };
-  }, [activeRun]);
+  }, []);
 
   useEffect(() => {
     if (
@@ -2030,7 +2102,18 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (screen !== "setup") {
+      clearStartTimers();
+      setPendingStart(false);
+      setCountdownSeconds(null);
+      setGpsStartTimedOut(false);
+    }
+  }, [clearStartTimers, screen]);
+
+  useEffect(() => {
     if (
+      screen !== "setup" ||
+      activeRun !== null ||
       !pendingStart ||
       countdownSeconds !== null ||
       !isWarmupGpsReady(warmupStatus.latestPoint, warmupStatus.latestAccuracy)
@@ -2039,6 +2122,8 @@ export default function App() {
     }
     beginStartCountdown();
   }, [
+    activeRun,
+    screen,
     beginStartCountdown,
     countdownSeconds,
     pendingStart,
@@ -2201,17 +2286,20 @@ export default function App() {
   }, [appendLifecycleEvent, getElapsedSeconds, permissions.wake_lock_available, reconcileElapsedClock, requestWakeLock, screen]);
 
   useEffect(() => {
-    if (!activeRun || screen === "export") {
+    if (!activeRun || screen === "recovery") {
       return;
     }
     const persistDraft = () => {
       const run = activeRunRef.current;
-      if (!run) {
+      if (!run || recoverySuppressedRef.current) {
         return;
       }
+      reconcileElapsedClock();
       const savedRun: ActiveRun = {
         ...run,
-        elapsed_offset_seconds: screen === "live" ? elapsedSecondsRef.current : run.elapsed_offset_seconds,
+        elapsed_offset_seconds: screen === "live" && run.status === "running"
+          ? getElapsedSeconds()
+          : run.elapsed_offset_seconds,
         last_saved_at_utc: new Date().toISOString(),
       };
       try {
@@ -2221,13 +2309,23 @@ export default function App() {
       }
       void saveRunToIndexedDb(savedRun);
     };
-    const timeoutId = window.setTimeout(persistDraft, 500);
+    const persistWhenHidden = () => {
+      if (document.visibilityState === "hidden") {
+        persistDraft();
+      }
+    };
+    persistDraft();
+    document.addEventListener("visibilitychange", persistWhenHidden);
+    window.addEventListener("pagehide", persistDraft);
+    document.addEventListener("freeze", persistDraft);
     const intervalId = window.setInterval(persistDraft, 2000);
     return () => {
-      window.clearTimeout(timeoutId);
+      document.removeEventListener("visibilitychange", persistWhenHidden);
+      window.removeEventListener("pagehide", persistDraft);
+      document.removeEventListener("freeze", persistDraft);
       window.clearInterval(intervalId);
     };
-  }, [activeRun !== null, activeRun?.status, screen]);
+  }, [activeRun !== null, activeRun?.status, getElapsedSeconds, reconcileElapsedClock, screen]);
 
   useEffect(() => {
     setActiveRun((run) => (run ? { ...run, pwa_state: pwaState } : run));
@@ -2262,7 +2360,7 @@ export default function App() {
       </header> : null}
 
       {actionMessage && screen !== "live" ? <div className="notice">{actionMessage}</div> : null}
-      {serviceWorkerUpdateReady && (screen === "home" || screen === "setup" || screen === "export") ? (
+      {serviceWorkerUpdateReady && serviceWorkerUpdateSafe ? (
         <button type="button" className="update-banner" onClick={applyServiceWorkerUpdate}>
           New version ready. Tap to update.
         </button>
@@ -2281,7 +2379,9 @@ export default function App() {
           onLabEndpointChange={handleLabEndpointChange}
           onPaired={() => void syncRunsToLab(true)}
           onStartNew={() => setScreen("setup")}
-          pendingNoteCount={voiceNotes.filter((note) => !note.synced_at_utc && !note.sync_error).length}
+          scanning={scanningLab}
+          setScanning={setScanningLab}
+          pendingNoteCount={voiceNotes.filter((note) => !note.synced_at_utc).length}
           onRecordNote={() => setRecordingNote(true)}
         />
       ) : null}
@@ -2505,6 +2605,8 @@ function HomeScreen({
   onStartNew,
   pendingNoteCount,
   onRecordNote,
+  scanning,
+  setScanning,
 }: {
   runHistory: RunHistoryEntry[];
   historyActions: RunHistoryActions;
@@ -2514,9 +2616,9 @@ function HomeScreen({
   onStartNew: () => void;
   pendingNoteCount: number;
   onRecordNote: () => void;
+  scanning: boolean;
+  setScanning: (value: boolean) => void;
 }) {
-  const [scanning, setScanning] = useState(false);
-  const [scanMessage, setScanMessage] = useState("");
   const handleScanResult = useCallback(
     (text: string) => {
       const endpoint = extractLabEndpoint(text);
@@ -2529,11 +2631,11 @@ function HomeScreen({
       onPaired();
       return true;
     },
-    [onLabEndpointChange, onPaired],
+    [onLabEndpointChange, onPaired, setScanning],
   );
 
   const paired = labEndpoint.trim().length > 0;
-  const pendingRuns = runHistory.filter((entry) => !entry.synced_at_utc && !entry.sync_error).length;
+  const pendingRuns = runHistory.filter((entry) => !entry.synced_at_utc).length;
   const pendingCount = pendingRuns + pendingNoteCount;
   const syncBusy = historyActions.labSync.status === "syncing";
 
@@ -2541,7 +2643,7 @@ function HomeScreen({
     <section className="screen-stack">
       <div className="home-actions">
         {!paired ? (
-          <button type="button" className="primary-button" onClick={() => setScanning(true)}>
+          <button type="button" className="primary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
             <Camera size={20} />
             Pair with the lab
           </button>
@@ -2563,12 +2665,13 @@ function HomeScreen({
           type="button"
           className={!paired || pendingCount > 0 ? "secondary-button" : "primary-button"}
           onClick={onStartNew}
+          disabled={syncBusy}
         >
           <Play size={20} />
           Start run
         </button>
 
-        <button type="button" className="secondary-button" onClick={onRecordNote}>
+        <button type="button" className="secondary-button" onClick={onRecordNote} disabled={syncBusy}>
           <Mic size={18} />
           Voice note
         </button>
@@ -2587,7 +2690,7 @@ function HomeScreen({
 
       <details className="preflight-panel">
         <summary>Lab settings</summary>
-        <button type="button" className="secondary-button" onClick={() => setScanning(true)}>
+        <button type="button" className="secondary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
           <Camera size={18} />
           Scan lab QR
         </button>
@@ -2601,6 +2704,7 @@ function HomeScreen({
           Lab endpoint URL
           <input
             value={labEndpoint}
+            disabled={syncBusy}
             inputMode="url"
             placeholder="http://192.168.1.11:8787"
             onChange={(event) => onLabEndpointChange(event.target.value)}
@@ -2646,11 +2750,16 @@ function VoiceNoteRecorder({ onSaved, onClose }: { onSaved: () => void; onClose:
   const [error, setError] = useState("");
   const [seconds, setSeconds] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [ready, setReady] = useState(false);
   const [micEnded, setMicEnded] = useState(false);
+  const [noteId] = useState(() => `note_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
-  const startedAtRef = useRef(Date.now());
+  const startedAtRef = useRef(0);
+  const endedAtRef = useRef<number | null>(null);
+  const finishedRef = useRef(false);
+  const saveRequestedRef = useRef(false);
   const timerRef = useRef(0);
 
   const releaseMic = () => {
@@ -2659,109 +2768,115 @@ function VoiceNoteRecorder({ onSaved, onClose }: { onSaved: () => void; onClose:
     streamRef.current = null;
   };
 
-  useEffect(() => {
-    let unmounted = false;
-    void (async () => {
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch (err) {
-        if (!unmounted) {
-          setError(
-            err instanceof Error && err.name === "NotAllowedError"
-              ? "Microphone permission was denied. Allow it and try again."
-              : "Microphone unavailable on this device/browser.",
-          );
-        }
-        return;
-      }
-      if (unmounted) {
-        // Discarded while the permission prompt was up: never leave the mic hot.
-        stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
-      streamRef.current = stream;
-      const recorder = new MediaRecorder(stream);
-      recorderRef.current = recorder;
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-        }
-      };
-      // The OS took the mic (call, another app): keep what we have, stop the clock.
-      stream.getTracks()[0]?.addEventListener("ended", () => {
-        if (recorder.state !== "inactive") {
-          recorder.stop();
-        }
-        window.clearInterval(timerRef.current);
-        setMicEnded(true);
-      });
-      recorder.start(1000);
-      startedAtRef.current = Date.now();
-      timerRef.current = window.setInterval(
-        () => setSeconds(Math.round((Date.now() - startedAtRef.current) / 1000)),
-        500,
-      );
-    })();
-    return () => {
-      unmounted = true;
-      const recorder = recorderRef.current;
-      if (recorder && recorder.state !== "inactive") {
-        recorder.onstop = null;
-        recorder.stop();
-      }
-      releaseMic();
-    };
-  }, []);
+  const stopClock = () => {
+    endedAtRef.current ??= Date.now();
+    window.clearInterval(timerRef.current);
+    setSeconds(Math.round((endedAtRef.current - startedAtRef.current) / 1000));
+  };
 
   const persist = async (recorder: MediaRecorder) => {
     const mime = recorder.mimeType || "audio/webm";
     const blob = new Blob(chunksRef.current, { type: mime });
+    let saved = false;
     if (blob.size === 0) {
       setError("Nothing was captured.");
-      setSaving(false);
-      return;
+    } else if (await putRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`, blob)) {
+      const duration = Math.max(1, Math.round(((endedAtRef.current ?? Date.now()) - startedAtRef.current) / 1000));
+      saved = saveVoiceNotesIndex([
+        { note_id: noteId, created_at_utc: new Date(startedAtRef.current).toISOString(), duration_seconds: duration, mime },
+        ...loadVoiceNotesIndex().filter((note) => note.note_id !== noteId),
+      ]);
+      if (!saved) await deleteRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`);
     }
-    const duration = Math.max(1, Math.round((Date.now() - startedAtRef.current) / 1000));
-    const noteId = `note_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const stored = await putRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`, blob);
-    if (!stored) {
-      setError("Could not store the note on this device. Try again or discard.");
+    if (saved) {
+      onSaved();
+    } else {
+      if (blob.size > 0) setError("Could not store the note on this device. Try again or discard.");
+      saveRequestedRef.current = false;
       setSaving(false);
-      return;
     }
-    saveVoiceNotesIndex([
-      { note_id: noteId, created_at_utc: new Date().toISOString(), duration_seconds: duration, mime },
-      ...loadVoiceNotesIndex(),
-    ]);
-    onSaved();
   };
+
+  useEffect(() => {
+    let unmounted = false;
+    void (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (unmounted) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        streamRef.current = stream;
+        const recorder = new MediaRecorder(stream);
+        recorderRef.current = recorder;
+        recorder.ondataavailable = (event) => {
+          if (!unmounted && event.data.size > 0) chunksRef.current.push(event.data);
+        };
+        recorder.onstop = () => {
+          if (unmounted) return;
+          stopClock();
+          releaseMic();
+          finishedRef.current = true;
+          setMicEnded(true);
+          if (saveRequestedRef.current) void persist(recorder);
+        };
+        recorder.onerror = () => {
+          if (unmounted) return;
+          stopClock();
+          setError("Audio recording failed — save any captured audio or discard.");
+        };
+        stream.getTracks()[0]?.addEventListener("ended", () => {
+          if (unmounted) return;
+          stopClock();
+          setMicEnded(true);
+          if (recorder.state !== "inactive") recorder.stop();
+        });
+        recorder.start(1000);
+        startedAtRef.current = Date.now();
+        setReady(true);
+        timerRef.current = window.setInterval(
+          () => setSeconds(Math.round((Date.now() - startedAtRef.current) / 1000)),
+          500,
+        );
+      } catch (err) {
+        if (!unmounted) {
+          releaseMic();
+          setError(
+            err instanceof Error && err.name === "NotAllowedError"
+              ? "Microphone permission was denied. Allow it and try again."
+              : "Audio recording unavailable on this device/browser.",
+          );
+        }
+      }
+    })();
+    return () => {
+      unmounted = true;
+      const recorder = recorderRef.current;
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+      releaseMic();
+    };
+  }, []);
 
   const saveNote = () => {
     const recorder = recorderRef.current;
-    if (!recorder) {
-      onClose();
-      return;
-    }
+    if (!ready || !recorder || saveRequestedRef.current) return;
+    saveRequestedRef.current = true;
     setSaving(true);
-    if (recorder.state === "inactive") {
-      releaseMic();
-      void persist(recorder); // mic ended early; save whatever was captured
-      return;
-    }
-    // Stop the recorder first so the final chunk flushes; only then drop the tracks.
-    recorder.onstop = () => {
-      releaseMic();
+    stopClock();
+    if (finishedRef.current) {
       void persist(recorder);
-    };
-    recorder.stop();
+    } else if (recorder.state !== "inactive") {
+      recorder.stop();
+    }
+    // An inactive recorder may still have its final data/stop events queued.
+    // Its onstop handler saves only after those final bytes arrive.
   };
 
-  const canSave = !saving && (!error || chunksRef.current.length > 0);
+  const canSave = ready && !saving && (!error || chunksRef.current.length > 0);
   return (
     <div className="scanner-overlay">
       <div className="recorder-pulse">{error ? "!" : formatDuration(seconds)}</div>
-      <p>{error || (micEnded ? "Microphone was taken by another app — save what you have." : "Recording voice note for the lab…")}</p>
+      <p>{error || (!ready ? "Requesting microphone…" : micEnded ? "Recording ended — save what you have." : "Recording voice note for the lab…")}</p>
       <div className="button-grid">
         <button type="button" className="secondary-button" onClick={onClose} disabled={saving}>
           Discard
@@ -4765,16 +4880,26 @@ function loadRunHistoryIndex(): RunHistoryEntry[] {
     if (!Array.isArray(entries)) {
       return [];
     }
-    return entries
-      .filter((entry): entry is RunHistoryEntry => Boolean(entry.history_id && entry.filename && entry.created_at_utc))
-      .slice(0, MAX_RUN_HISTORY_ITEMS);
+    return entries.filter((entry): entry is RunHistoryEntry =>
+      Boolean(entry && typeof entry === "object" && entry.history_id && entry.filename && entry.created_at_utc),
+    );
   } catch {
     return [];
   }
 }
 
-function saveRunHistoryIndex(entries: RunHistoryEntry[]) {
-  localStorage.setItem(RUN_HISTORY_INDEX_KEY, JSON.stringify(entries.slice(0, MAX_RUN_HISTORY_ITEMS)));
+function saveRunHistoryIndex(entries: RunHistoryEntry[]): RunHistoryEntry[] {
+  let syncedCount = 0;
+  const pruned: string[] = [];
+  const kept = entries.filter((entry) => {
+    if (!entry.synced_at_utc || syncedCount++ < MAX_RUN_HISTORY_ITEMS) return true;
+    pruned.push(entry.history_id);
+    return false;
+  });
+  // Never evict a run whose only copy is still on this device.
+  localStorage.setItem(RUN_HISTORY_INDEX_KEY, JSON.stringify(kept));
+  for (const historyId of pruned) void deleteCompletedRunPayload(historyId);
+  return kept;
 }
 
 interface LabSyncSettings {
@@ -4826,8 +4951,11 @@ async function probeLabEndpoint(endpoint: string, timeoutMs = 4000): Promise<Pro
   const startedAt = performance.now();
   try {
     const response = await fetch(`${endpoint}/api/runs/ping`, { signal: controller.signal });
-    return response.ok ? "reachable" : "unreachable";
+    if (!response.ok) return "unreachable";
+    const acknowledgement = await response.json();
+    return acknowledgement?.ok === true ? "reachable" : "unreachable";
   } catch (error) {
+    if (error instanceof SyntaxError) return "unreachable";
     if (error instanceof DOMException && error.name === "AbortError") {
       return "unreachable";
     }
@@ -4851,9 +4979,11 @@ async function postToLab(url: string, body: string, timeoutMs = 60000): Promise<
       signal: controller.signal,
     });
     if (response.ok) {
-      return "stored";
+      const acknowledgement = await response.json();
+      return acknowledgement?.ok === true ? "stored" : "failed";
     }
-    // 4xx is the lab saying "never": retrying the same bytes cannot help.
+    // Rate limits and request timeouts are transient, not permanent rejection.
+    if (response.status === 408 || response.status === 425 || response.status === 429) return "failed";
     return response.status >= 400 && response.status < 500 ? "rejected" : "failed";
   } catch {
     return "failed";
@@ -4891,13 +5021,15 @@ function loadVoiceNotesIndex(): VoiceNoteEntry[] {
     if (!Array.isArray(entries)) {
       return [];
     }
-    return entries.filter((entry): entry is VoiceNoteEntry => Boolean(entry.note_id && entry.created_at_utc));
+    return entries.filter((entry): entry is VoiceNoteEntry =>
+      Boolean(entry && typeof entry === "object" && entry.note_id && entry.created_at_utc),
+    );
   } catch {
     return [];
   }
 }
 
-function saveVoiceNotesIndex(entries: VoiceNoteEntry[]) {
+function saveVoiceNotesIndex(entries: VoiceNoteEntry[]): boolean {
   try {
     // Cap only what the lab already holds; an unsynced note is never dropped.
     const synced = entries.filter((entry) => entry.synced_at_utc);
@@ -4906,19 +5038,20 @@ function saveVoiceNotesIndex(entries: VoiceNoteEntry[]) {
       VOICE_NOTES_INDEX_KEY,
       JSON.stringify(entries.filter((entry) => !entry.synced_at_utc || kept.has(entry.note_id))),
     );
+    return true;
   } catch {
-    // Voice note index is best effort.
+    return false;
   }
 }
 
 function markVoiceNoteSynced(noteId: string) {
-  saveVoiceNotesIndex(
+  const marked = saveVoiceNotesIndex(
     loadVoiceNotesIndex().map((entry) =>
       entry.note_id === noteId ? { ...entry, synced_at_utc: new Date().toISOString(), sync_error: null } : entry,
     ),
   );
-  // The lab holds the audio now; the phone copy has no reader and only fills storage.
-  void deleteRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`);
+  // Keep the audio retryable if the local acknowledgement could not be saved.
+  if (marked) void deleteRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`);
 }
 
 function describePendingItems(runCount: number, noteCount: number): string {
@@ -4984,11 +5117,17 @@ interface HandoverNote {
   data_base64: string;
 }
 
+interface HandoverIssue {
+  kind: "run" | "note";
+  id: string;
+  reason: string;
+}
+
 async function packRunsForLabHandover(
   endpoint: string,
   pending: RunHistoryEntry[],
   pendingNotes: VoiceNoteEntry[] = [],
-): Promise<{ url: string; count: number; oversized: string[] } | null> {
+): Promise<{ url: string; count: number; issues: HandoverIssue[] }> {
   // The payload rides the URL fragment: unlike window.name it survives every
   // navigation context (installed-PWA Custom Tabs clear window.name).
   const returnTo = `${window.location.origin}${window.location.pathname}`;
@@ -4997,10 +5136,12 @@ async function packRunsForLabHandover(
   let encoded = "";
   const pack = () =>
     bytesToBase64Url(deflateSync(strToU8(JSON.stringify({ v: 1, returnTo, runs, notes }))));
-  const oversized: string[] = [];
+  const issues: HandoverIssue[] = [];
+  const tooLarge = "too large for the handover link — retry with local network access allowed";
   for (const entry of pending) {
     const payload = await loadCompletedRunFromHistory(entry.history_id);
     if (!payload) {
+      issues.push({ kind: "run", id: entry.history_id, reason: "run data missing on this device" });
       continue;
     }
     runs.push({ id: entry.history_id, payload });
@@ -5011,7 +5152,7 @@ async function packRunsForLabHandover(
     }
     if (packed.length > LAB_HANDOVER_FRAGMENT_MAX) {
       runs.pop(); // This single run is too large even alone: report it so the runner isn't left guessing.
-      oversized.push(entry.history_id);
+      issues.push({ kind: "run", id: entry.history_id, reason: tooLarge });
       continue;
     }
     encoded = packed;
@@ -5019,6 +5160,7 @@ async function packRunsForLabHandover(
   for (const note of pendingNotes) {
     const blob = await getRunDatabaseValue<Blob>(`${IDB_VOICE_PREFIX}${note.note_id}`);
     if (!blob) {
+      issues.push({ kind: "note", id: note.note_id, reason: "audio data missing on this device" });
       continue;
     }
     const bytes = new Uint8Array(await blob.arrayBuffer());
@@ -5036,15 +5178,18 @@ async function packRunsForLabHandover(
     }
     if (packed.length > LAB_HANDOVER_FRAGMENT_MAX) {
       notes.pop();
+      issues.push({ kind: "note", id: note.note_id, reason: tooLarge });
       continue;
     }
     encoded = packed;
   }
   const count = runs.length + notes.length;
-  if (count === 0 || !encoded) {
-    return oversized.length > 0 ? { url: "", count: 0, oversized } : null;
+  if (count === 0 && pending.length + pendingNotes.length > 0) {
+    return { url: "", count: 0, issues };
   }
-  return { url: `${endpoint}/web/lab-receiver.html#lab=v1.${encoded}`, count, oversized };
+  // An empty batch is a valid protocol-only check-in with the receiver.
+  if (!encoded) encoded = pack();
+  return { url: `${endpoint}/web/lab-receiver.html#lab=v1.${encoded}`, count, issues };
 }
 
 async function saveCompletedRunToHistory(payload: ExportPayload, filename: string): Promise<RunHistoryEntry[]> {
@@ -5063,17 +5208,13 @@ async function saveCompletedRunToHistory(payload: ExportPayload, filename: strin
       localStorage.setItem(`${RUN_HISTORY_PAYLOAD_PREFIX}${historyId}`, json);
       storageKind = "localstorage";
     } catch {
-      return loadRunHistoryIndex();
+      throw new Error("Run history storage is full or unavailable.");
     }
   }
 
   const entry = buildRunHistoryEntry(payload, filename, historyId, storageKind, new TextEncoder().encode(json).byteLength);
   const existing = loadRunHistoryIndex();
-  const next = [entry, ...existing.filter((item) => item.history_id !== historyId)].slice(0, MAX_RUN_HISTORY_ITEMS);
-  const pruned = [entry, ...existing.filter((item) => item.history_id !== historyId)].slice(MAX_RUN_HISTORY_ITEMS);
-  saveRunHistoryIndex(next);
-  await Promise.all(pruned.map((item) => deleteCompletedRunPayload(item.history_id)));
-  return next;
+  return saveRunHistoryIndex([entry, ...existing.filter((item) => item.history_id !== historyId)]);
 }
 
 async function loadCompletedRunFromHistory(historyId: string): Promise<ExportPayload | null> {
@@ -5858,7 +5999,7 @@ const PROTOCOL_REFRESH_MS = 6 * 3600 * 1000;
 function loadCoachProtocol(): CoachProtocol | null {
   try {
     const raw = localStorage.getItem(PROTOCOL_KEY);
-    return raw ? parseCoachProtocol(JSON.parse(raw)) : null;
+    return raw ? parseCoachProtocol(JSON.parse(raw), "stored") : null;
   } catch {
     return null;
   }
@@ -5895,21 +6036,20 @@ function markCoachProtocolFetched() {
 }
 
 async function fetchCoachProtocol(endpoint: string): Promise<CoachProtocol | null> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 4000);
   try {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 4000);
     const response = await fetch(`${endpoint}/api/protocol`, { signal: controller.signal });
-    window.clearTimeout(timeoutId);
-    if (!response.ok) {
-      return null;
-    }
+    if (!response.ok) return null;
     return parseCoachProtocol(await response.json());
   } catch {
     return null;
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 }
 
-function parseCoachProtocol(value: unknown): CoachProtocol | null {
+function parseCoachProtocol(value: unknown, format: "wire" | "stored" = "wire"): CoachProtocol | null {
   if (!value || typeof value !== "object") {
     return null;
   }
@@ -5930,8 +6070,8 @@ function parseCoachProtocol(value: unknown): CoachProtocol | null {
     if (km === null) {
       continue;
     }
-    const min = numberFromUnknown(band.min_seconds_per_km);
-    const max = numberFromUnknown(band.max_seconds_per_km);
+    const min = numberFromUnknown(band[format === "stored" ? "minSecondsPerKm" : "min_seconds_per_km"]);
+    const max = numberFromUnknown(band[format === "stored" ? "maxSecondsPerKm" : "max_seconds_per_km"]);
     bands.push({
       km,
       label: stringFromUnknown(band.label) ?? `Km ${km}`,

@@ -1,20 +1,34 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.3.1-live-overlays";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.3.2-reliability";
 const APP_SCOPE = self.registration.scope;
-const APP_SHELL = [APP_SCOPE];
+const CACHE_PREFIX = "greenlake-autoresearch-logger-";
+
+async function cacheAppShell() {
+  const response = await fetch(APP_SCOPE, { cache: "reload" });
+  if (!response.ok) throw new Error("App shell download failed");
+  const html = await response.clone().text();
+  const assets = [];
+  for (const tag of html.matchAll(/<(?:script|link)\b[^>]*>/gi)) {
+    if (!/^<script\b/i.test(tag[0]) && !/\brel=["']stylesheet["']/i.test(tag[0])) continue;
+    const source = tag[0].match(/\b(?:src|href)=["']([^"']+)["']/i)?.[1];
+    if (!source) continue;
+    const url = new URL(source, APP_SCOPE);
+    if (url.origin === self.location.origin) assets.push(url.href);
+  }
+  const cache = await caches.open(CACHE_NAME);
+  // Installation must finish the whole bootable shell before the old cache retires.
+  await cache.addAll(assets);
+  await cache.put(APP_SCOPE, response);
+}
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches
-      .open(CACHE_NAME)
-      .then((cache) => cache.addAll(APP_SHELL)),
-  );
+  event.waitUntil(cacheAppShell());
 });
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
+      .then((keys) => Promise.all(keys.filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME).map((key) => caches.delete(key))))
       .then(() => self.clients.claim()),
   );
 });
@@ -39,12 +53,11 @@ self.addEventListener("fetch", (event) => {
   if (request.mode === "navigate") {
     event.respondWith(
       fetch(request)
-        .then((response) => {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(APP_SCOPE, copy));
-          return response;
+        .then(async (response) => {
+          if (response.ok) return response;
+          return (await caches.match(APP_SCOPE)) ?? response;
         })
-        .catch(() => caches.match(APP_SCOPE)),
+        .catch(async () => (await caches.match(APP_SCOPE)) ?? Response.error()),
     );
     return;
   }
@@ -57,7 +70,7 @@ self.addEventListener("fetch", (event) => {
       return fetch(request).then((response) => {
         if (response.ok) {
           const copy = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+          event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.put(request, copy)).catch(() => {}));
         }
         return response;
       });

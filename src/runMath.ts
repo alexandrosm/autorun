@@ -178,7 +178,7 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     schema_version: "0.3.0",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.3.1",
+      version: "0.3.2",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -701,7 +701,7 @@ function computeActivityWindow(points: GpsPoint[], run: ActiveRun, track: TrackP
         notes.push("Activity start inferred from sustained plausible GPS speed.");
         break;
       }
-    } else if (speed === null || speed <= 0.8) {
+    } else {
       sustainedStart = null;
     }
   }
@@ -714,7 +714,7 @@ function computeActivityWindow(points: GpsPoint[], run: ActiveRun, track: TrackP
       }
       if (point.cumulative_meters > 30) {
         let startIndex = i;
-        while (startIndex > 0 && track[startIndex - 1].cumulative_meters > 5) {
+        while (startIndex > 0 && track[startIndex].cumulative_meters > 5) {
           startIndex -= 1;
         }
         startElapsed = track[startIndex].t_elapsed_seconds;
@@ -870,12 +870,13 @@ function computeInterpolationFeatures(points: GpsPoint[], rawRecordedDistanceMet
     const surroundingSpeed = surroundingPlausibleSpeed(points, i);
     const speedBasedDistance =
       surroundingSpeed !== null && surroundingSpeed <= SUSPICIOUS_SPEED_MPS ? surroundingSpeed * dt : null;
+    const excluded = isExcludedSegment(current);
     const useSpeedBased =
       speedBasedDistance !== null &&
-      speedBasedDistance > straightLineDistance &&
+      (excluded || speedBasedDistance > straightLineDistance) &&
       speedBasedDistance <= SUSPICIOUS_SPEED_MPS * dt;
-    const chosenDistance = useSpeedBased ? speedBasedDistance : straightLineDistance;
-    const rawContribution = isExcludedSegment(current) ? 0 : straightLineDistance;
+    const chosenDistance = useSpeedBased ? speedBasedDistance : excluded ? 0 : straightLineDistance;
+    const rawContribution = excluded ? 0 : straightLineDistance;
 
     estimatedMissingDistance += Math.max(0, chosenDistance - rawContribution);
     missingGpsTime += dt;
@@ -889,7 +890,7 @@ function computeInterpolationFeatures(points: GpsPoint[], rawRecordedDistanceMet
       surrounding_speed_mps: surroundingSpeed === null ? null : round(surroundingSpeed, 3),
       speed_based_distance_estimate_meters: speedBasedDistance === null ? null : round(speedBasedDistance, 2),
       chosen_distance_estimate_meters: round(chosenDistance, 2),
-      method: useSpeedBased ? "speed_based" : "straight_line",
+      method: useSpeedBased ? "speed_based" : excluded ? "excluded" : "straight_line",
       confidence: "low",
     });
   }
@@ -923,12 +924,12 @@ function computeRecordingReliability(
 }
 
 function surroundingPlausibleSpeed(points: GpsPoint[], gapEndIndex: number): number | null {
-  const candidates = [
-    points[gapEndIndex - 1]?.segment_speed_mps,
-    points[gapEndIndex + 1]?.segment_speed_mps,
-    points[gapEndIndex - 2]?.segment_speed_mps,
-    points[gapEndIndex + 2]?.segment_speed_mps,
-  ].filter((value): value is number => value !== null && value !== undefined && value > 0 && value <= SUSPICIOUS_SPEED_MPS);
+  const candidates = [gapEndIndex - 1, gapEndIndex + 1, gapEndIndex - 2, gapEndIndex + 2]
+    .map((index) => {
+      const point = points[index];
+      return point && !isExcludedSegment(point) ? point.segment_speed_mps : null;
+    })
+    .filter((value): value is number => isNumber(value) && value > 0 && value <= SUSPICIOUS_SPEED_MPS);
 
   return mean(candidates);
 }
@@ -1128,20 +1129,15 @@ function computeActiveTargetDistanceResult(
     recordingTargetDistanceResult.target_reached &&
     recordingTargetDistanceResult.elapsed_at_target_distance_seconds !== null &&
     recordingTargetDistanceResult.elapsed_at_target_distance_seconds >= activeStartElapsed;
-  const targetReached = activeCrossed || activeWithinTolerance || recordingTargetAfterActivityStart;
+  const targetReached = activeCrossed || (activeWithinTolerance && recordingTargetAfterActivityStart);
   const targetState = activeCrossed ? stateAtDistance(track, intendedDistanceMeters) : null;
   let recordingElapsed = targetState?.elapsed ?? null;
   let method: ActiveTargetDistanceResult["target_detection_method"] = "not_reached";
 
   if (activeCrossed) {
     method = "active_cumulative_crossing";
-  } else if (recordingTargetAfterActivityStart && recordingTargetDistanceResult.elapsed_at_target_distance_seconds !== null) {
+  } else if (targetReached && recordingTargetDistanceResult.elapsed_at_target_distance_seconds !== null) {
     recordingElapsed = recordingTargetDistanceResult.elapsed_at_target_distance_seconds;
-    method = activeWithinTolerance
-      ? "recording_target_with_active_tolerance"
-      : "recording_target_minus_activity_start";
-  } else if (activeWithinTolerance && track.length > 0) {
-    recordingElapsed = track[track.length - 1].t_elapsed_seconds;
     method = "recording_target_with_active_tolerance";
   }
 
@@ -1174,11 +1170,9 @@ function computeActiveTargetDistanceResult(
     target_detection_method: method,
     target_distance_tolerance_meters: TARGET_DISTANCE_TOLERANCE_METERS,
     diagnostic_note:
-      method === "recording_target_minus_activity_start"
-        ? "Active target time was derived from recording target crossing minus inferred activity start."
-        : method === "recording_target_with_active_tolerance"
-          ? "Active track ended within tolerance of target and recording target crossing was used."
-          : null,
+      method === "recording_target_with_active_tolerance"
+        ? "Active track ended within tolerance of target and recording target crossing was used."
+        : null,
   };
 }
 
@@ -1311,7 +1305,7 @@ function stateAtDistance(track: TrackPoint[], distanceMeters: number): TrackStat
   }
 
   const final = track[track.length - 1];
-  if (distanceMeters >= final.cumulative_meters) {
+  if (distanceMeters > final.cumulative_meters) {
     return {
       elapsed: final.t_elapsed_seconds,
       altitude: final.altitude_meters,
@@ -2998,7 +2992,7 @@ function buildPatchExecutionAssessment(
     let status: PatchExecutionAssessment["actual_splits"][number]["status"] = "unknown";
     if (!band || band.minSecondsPerKm === null || band.maxSecondsPerKm === null) {
       status = "not_applicable";
-    } else if (paceSecondsPerKm === null) {
+    } else if (paceSecondsPerKm === null || split.distance_meters === null || split.distance_meters < METERS_PER_KM) {
       status = "unknown";
     } else if (paceSecondsPerKm < band.minSecondsPerKm) {
       status = "too_fast";
