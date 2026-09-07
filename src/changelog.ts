@@ -5,6 +5,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.3.1",
+    notes: [
+      "Live overlays and map tiles now occupy separate layers, with explicit light text on the dark panels.",
+      "Recording uses the whole viewport: no title or install banner pushes Stop offscreen, including in landscape.",
+      "The map remeasures itself after resizing or returning to the browser, without restarting recording.",
+      "In-run notes scroll separately from Stop and the other recording controls.",
+    ],
+  },
+  {
     version: "0.3.0",
     notes: [
       "The coach now runs the experiment: bands, pre-run expectation, live display, and post-run questions arrive as a protocol from the lab.",

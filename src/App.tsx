@@ -3,7 +3,6 @@ import {
   Camera,
   Clipboard,
   Download,
-  Map as MapIcon,
   Lock,
   MapPin,
   Mic,
@@ -56,7 +55,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.3.0";
+const APP_VERSION = "0.3.1";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_DB_NAME = "greenlake_autoresearch_logger";
@@ -2251,8 +2250,8 @@ export default function App() {
   }, [clearStartTimers, releaseWakeLock, stopGpsWatch, stopWarmupWatch]);
 
   return (
-    <main className="app-shell">
-      <header className="app-header">
+    <main className={screen === "live" ? "app-shell app-shell-live" : "app-shell"}>
+      {screen !== "live" ? <header className="app-header">
         <div>
           <button type="button" className="eyebrow version-button" onClick={() => setChangelogOpen(true)}>
             v{APP_VERSION}
@@ -2260,7 +2259,7 @@ export default function App() {
           <h1>{APP_NAME}</h1>
         </div>
         <div className="screen-chip">{screenLabel(screen)}</div>
-      </header>
+      </header> : null}
 
       {actionMessage && screen !== "live" ? <div className="notice">{actionMessage}</div> : null}
       {serviceWorkerUpdateReady && (screen === "home" || screen === "setup" || screen === "export") ? (
@@ -2268,7 +2267,7 @@ export default function App() {
           New version ready. Tap to update.
         </button>
       ) : null}
-      {installPrompt ? (
+      {installPrompt && screen !== "live" ? (
         <button type="button" className="install-banner" onClick={() => void installPwa()}>
           Install app
         </button>
@@ -3346,6 +3345,7 @@ function LiveScreen({
   units: Units;
   onToggleUnits: () => void;
 }) {
+  const [noteOpen, setNoteOpen] = useState(false);
   const remainingMeters = Math.max(0, run.pre_run.intended_distance_meters - liveStats.distanceMeters);
   const gpsStale = gpsStaleSeconds > 10;
   const planBands =
@@ -3358,9 +3358,12 @@ function LiveScreen({
 
   return (
     <section className="live-wrap">
-      <LiveMap run={run} liveStats={liveStats} />
+      <LiveMap run={run} />
 
       <div className="live-top">
+        {noteOpen ? (
+          <LiveNoteForm onAddNote={onAddNote} onClose={() => setNoteOpen(false)} />
+        ) : <Fragment>
         <div className="live-chips">
           {targetReached ? <span className="live-chip ok">Target reached — you can stop</span> : null}
           {gpsStale ? <span className="live-chip warn">GPS stale — keep app visible</span> : null}
@@ -3414,6 +3417,7 @@ function LiveScreen({
             {formatDistance(remainingMeters, units)} to go
           </div>
         ) : null}
+        </Fragment>}
       </div>
 
       <div className="live-bottom">
@@ -3422,7 +3426,10 @@ function LiveScreen({
             <Clipboard size={18} />
             Checkpoint
           </button>
-          <LiveNoteControl onAddNote={onAddNote} />
+          <button type="button" className="secondary-button" aria-expanded={noteOpen} onClick={() => setNoteOpen(!noteOpen)}>
+            <Clipboard size={18} />
+            {noteOpen ? "Close note" : "Note"}
+          </button>
         </div>
         <button type="button" className="danger-button live-stop" onClick={onStop}>
           <Square size={20} />
@@ -3436,13 +3443,7 @@ function LiveScreen({
   );
 }
 
-function LiveMap({
-  run,
-  liveStats,
-}: {
-  run: ActiveRun;
-  liveStats: LiveStats;
-}) {
+function LiveMap({ run }: { run: ActiveRun }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
@@ -3457,7 +3458,7 @@ function LiveMap({
 
     const map = L.map(containerRef.current, {
       attributionControl: false,
-      zoomControl: true,
+      zoomControl: false,
       dragging: true,
       touchZoom: true,
       scrollWheelZoom: false,
@@ -3479,7 +3480,27 @@ function LiveMap({
     layerGroupRef.current = L.layerGroup().addTo(map);
     mapRef.current = map;
 
+    // Leaflet watches window resize, not container changes or a suspended page.
+    // Re-measure after layout, without remounting the map or touching recording.
+    let resizeFrame: number | undefined;
+    const refreshSize = () => {
+      if (document.visibilityState !== "visible") return;
+      if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = undefined;
+        map.invalidateSize({ animate: false, debounceMoveend: true });
+      });
+    };
+    const resizeObserver = new ResizeObserver(refreshSize);
+    resizeObserver.observe(containerRef.current);
+    document.addEventListener("visibilitychange", refreshSize);
+    window.addEventListener("pageshow", refreshSize);
+
     return () => {
+      resizeObserver.disconnect();
+      document.removeEventListener("visibilitychange", refreshSize);
+      window.removeEventListener("pageshow", refreshSize);
+      if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
       map.remove();
       mapRef.current = null;
       layerGroupRef.current = null;
@@ -3569,15 +3590,13 @@ function LiveMap({
   }, [followLocked, run.checkpoints, run.gps_points]);
 
   return (
-    <section className="map-panel">
-      <div className="map-toolbar">
-        <span>
-          <MapIcon size={15} />
-          Track
-        </span>
-        <strong>{formatMeters(liveStats.distanceMeters)}</strong>
-      </div>
+    <Fragment>
       <div className="map-controls">
+        {tileFailure ? (
+          <div className="map-fallback-message">
+            Map tiles unavailable. Recording still active.
+          </div>
+        ) : null}
         <button type="button" className={followLocked ? "map-control active" : "map-control"} onClick={() => setFollowLocked(true)}>
           Lock follow
         </button>
@@ -3594,13 +3613,8 @@ function LiveMap({
       </div>
       <div className="map-frame">
         <div ref={containerRef} className="live-map" />
-        {tileFailure ? (
-          <div className="map-fallback-message">
-            Map tiles unavailable. Recording still active.
-          </div>
-        ) : null}
       </div>
-    </section>
+    </Fragment>
   );
 }
 
@@ -3617,12 +3631,13 @@ const IN_RUN_NOTE_TAGS = [
   "app_bug",
 ] as const;
 
-function LiveNoteControl({
+function LiveNoteForm({
   onAddNote,
+  onClose,
 }: {
   onAddNote: (note: Pick<InRunNote, "note_type" | "tags" | "text">) => void;
+  onClose: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [noteType, setNoteType] = useState<InRunNote["note_type"]>("run_observation");
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [text, setText] = useState("");
@@ -3635,19 +3650,9 @@ function LiveNoteControl({
 
   const save = () => {
     onAddNote({ note_type: noteType, tags: selectedTags, text });
-    setText("");
-    setSelectedTags([]);
-    setOpen(false);
+    onClose();
   };
 
-  if (!open) {
-    return (
-      <button type="button" className="secondary-button" onClick={() => setOpen(true)}>
-        <Clipboard size={18} />
-        Note
-      </button>
-    );
-  }
 
   return (
     <section className="live-note-panel">
@@ -3684,7 +3689,7 @@ function LiveNoteControl({
         />
       </label>
       <section className="button-grid">
-        <button type="button" className="secondary-button" onClick={() => setOpen(false)}>
+        <button type="button" className="secondary-button" onClick={onClose}>
           Cancel
         </button>
         <button type="button" className="primary-button" onClick={save} disabled={!text.trim()}>

@@ -797,7 +797,7 @@ export interface ExportPayload {
   schema_version: "0.3.0";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.3.0";
+    version: "0.3.1";
     platform: "web";
     user_agent: string;
     created_at_utc: string;

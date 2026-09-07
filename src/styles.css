@@ -43,6 +43,17 @@ button {
   padding: max(14px, env(safe-area-inset-top)) 14px max(18px, env(safe-area-inset-bottom));
 }
 
+.app-shell.app-shell-live {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
 .app-header {
   display: flex;
   align-items: flex-start;
@@ -524,71 +535,50 @@ button {
   line-height: 1;
 }
 
-.map-panel {
-  overflow: hidden;
-  border: 1px solid #cfddd5;
-  border-radius: 8px;
-  background: #ffffff;
-}
-
-.map-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px 11px;
-  border-bottom: 1px solid #cfddd5;
-  background: #ffffff;
-  color: #17372a;
-  font-weight: 900;
-}
-
-.map-toolbar span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
 
 .map-controls {
+  position: relative;
+  grid-row: 2;
+  grid-column: 1;
+  z-index: 1;
+  justify-self: end;
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  padding: 8px 10px;
-  border-bottom: 1px solid #cfddd5;
-  background: #f6faf8;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  max-width: 100%;
 }
 
 .map-control {
-  min-height: 36px;
-  border: 1px solid #b8ccc2;
+  min-height: 44px;
+  padding: 6px 10px;
+  border: 1px solid transparent;
   border-radius: 8px;
-  background: #ffffff;
-  color: #17372a;
+  background: rgba(8, 16, 12, 0.9);
+  color: #e6f4ec;
   font-weight: 900;
 }
 
 .map-control.active {
-  border-color: #12683f;
-  background: #e5f5ec;
+  color: #2dd078;
 }
 
 .live-map {
   width: 100%;
-  height: 220px;
+  height: 100%;
   background: #dfe8e2;
   touch-action: pan-x pan-y;
 }
 
 .map-frame {
-  position: relative;
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  isolation: isolate;
 }
 
 .map-fallback-message {
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  left: 10px;
-  z-index: 500;
+  grid-column: 1 / -1;
   padding: 8px 10px;
   border-radius: 8px;
   background: rgb(255 255 255 / 92%);
@@ -605,13 +595,14 @@ button {
   padding: 12px;
   border: 1px solid #cfddd5;
   border-radius: 8px;
-  background: #ffffff;
+  background: rgba(8, 16, 12, 0.94);
+  color: #e6f4ec;
 }
 
 .live-note-panel label {
   display: grid;
   gap: 6px;
-  color: #17372a;
+  color: #e6f4ec;
   font-size: 0.82rem;
   font-weight: 900;
 }
@@ -622,6 +613,7 @@ button {
   border: 1px solid #b8ccc2;
   border-radius: 8px;
   padding: 10px;
+  background: #f8fbf9;
   color: #10231b;
   font: inherit;
 }
@@ -759,72 +751,29 @@ button {
 
 .live-wrap {
   position: relative;
-  /* The live view owns the viewport: the map is the page, the HUD floats.
-     dvh tracks the URL bar; the bottom bar is inside this box, so Stop is
-     always on-screen regardless of notices or banners above. */
-  height: calc(100dvh - 120px);
-  min-height: 380px;
-  border-radius: 16px;
-  overflow: hidden;
-  color: #e6f4ec; /* everything painted over the dark HUD panels is light */
-  isolation: isolate; /* stacking context: Leaflet's z-1000 controls stay under our HUD */
-}
-
-.live-wrap .map-panel {
-  position: absolute;
-  inset: 0;
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  border-radius: 0;
-}
-
-/* The map's own toolbar/controls are replaced by the HUD in live mode. */
-.live-wrap .map-toolbar {
-  display: none;
-}
-
-.live-wrap .map-controls {
-  position: absolute;
-  right: 8px;
-  bottom: 200px;
-  z-index: 600;
   display: grid;
-  gap: 6px;
-}
-
-.live-wrap .map-control {
-  min-height: 44px;
-  min-width: 44px;
-  background: rgba(8, 16, 12, 0.85);
-  color: #e6f4ec;
-  border-color: transparent;
-}
-
-.live-wrap .map-control.active {
-  color: #2dd078;
-}
-
-.live-wrap .leaflet-control-zoom {
-  display: none; /* pinch zooms; +/- only steals space and unlocks follow */
-}
-
-.live-wrap .map-frame {
-  flex: 1;
-  min-height: 0;
-}
-
-.live-wrap .live-map {
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
   height: 100%;
   min-height: 0;
+  padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right))
+    max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  overflow: hidden;
+  color: #e6f4ec;
+  isolation: isolate;
 }
 
+
 .live-top {
-  position: absolute;
-  top: 8px;
-  left: 8px;
-  right: 8px;
-  z-index: 500;
+  position: relative;
+  grid-row: 1;
+  grid-column: 1;
+  z-index: 1;
+  align-self: start;
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
   display: grid;
   gap: 8px;
   pointer-events: none;
@@ -842,6 +791,7 @@ button {
 
 .live-chip {
   background: rgba(8, 16, 12, 0.85);
+  color: #e6f4ec;
   border-radius: 999px;
   padding: 6px 12px;
   font-size: 12px;
@@ -854,15 +804,17 @@ button {
 .live-hero-cards {
   display: grid;
   grid-auto-flow: column;
-  grid-auto-columns: 1fr; /* 2, 3 or 4 cards share the row evenly */
+  grid-auto-columns: minmax(0, 1fr);
   gap: 6px;
   cursor: pointer;
 }
 
 .live-hero-cards > div {
   background: rgba(8, 16, 12, 0.85);
+  color: #e6f4ec;
   border-radius: 12px;
-  padding: 8px 10px;
+  min-width: 0;
+  padding: 8px;
   display: grid;
   gap: 2px;
 }
@@ -876,30 +828,33 @@ button {
 
 .live-hero-cards strong {
   font-size: 18px;
+  color: #e6f4ec;
+  overflow-wrap: anywhere;
   font-variant-numeric: tabular-nums;
 }
 
 .live-band {
   background: rgba(8, 16, 12, 0.85);
+  color: #e6f4ec;
   border-radius: 10px;
   padding: 8px 12px;
   font-size: 13px;
   font-weight: 600;
   width: fit-content;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .live-band.ok { color: #2dd078; }
 .live-band.warn { color: #ffb35b; }
 
 .live-bottom {
-  position: absolute;
-  bottom: 8px;
-  left: 8px;
-  right: 8px;
-  z-index: 700;
+  position: relative;
+  grid-row: 3;
+  grid-column: 1;
+  z-index: 1;
   display: grid;
   gap: 8px;
-  max-height: calc(100% - 16px);
 }
 
 .live-secondary {
@@ -914,47 +869,24 @@ button {
   border-color: transparent;
 }
 
-/* The note panel is a sheet, not a bar: scroll inside it, never clip it. */
-.live-secondary .live-note-panel {
-  grid-column: 1 / -1;
-  max-height: calc(100dvh - 320px);
-  overflow-y: auto;
-  background: rgba(8, 16, 12, 0.94);
-  color: #e6f4ec;
-  border-radius: 12px;
-  padding: 10px;
-}
 
-.live-secondary .live-note-panel label {
-  color: #e6f4ec;
-}
-
-/* While the sheet is open, the Checkpoint button yields its row to it. */
-.live-secondary:has(.live-note-panel) > .secondary-button {
-  display: none;
-}
-
-.live-secondary .live-note-panel .tag-button {
+.live-note-panel .tag-button {
   min-height: 44px;
   color: #e6f4ec;
   background: rgba(230, 244, 236, 0.08);
   border-color: rgba(230, 244, 236, 0.2);
 }
 
-.live-secondary .live-note-panel .tag-button.active {
+.live-note-panel .tag-button.active {
   background: #2dd078;
   color: #08100c;
 }
 
-.live-secondary .live-note-panel .secondary-button {
+.live-note-panel .secondary-button {
   color: #e6f4ec;
   background: rgba(230, 244, 236, 0.08);
 }
 
-.live-secondary .live-note-panel select,
-.live-secondary .live-note-panel textarea {
-  color: #10231b;
-}
 
 .live-stop {
   min-height: 60px;
@@ -969,6 +901,27 @@ button {
   border-radius: 8px;
   padding: 4px 10px;
   min-height: 44px;
+}
+
+@media (min-width: 600px) and (max-height: 500px) {
+  .live-wrap {
+    grid-template-columns: minmax(0, 1fr) minmax(240px, 0.7fr);
+  }
+
+  .live-top {
+    grid-row: 1 / -1;
+  }
+
+  .map-controls {
+    grid-row: 1;
+    grid-column: 2;
+    align-self: end;
+  }
+
+  .live-bottom {
+    grid-row: 2 / -1;
+    grid-column: 2;
+  }
 }
 
 .history-table {

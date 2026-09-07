@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.3.0`
+Current version: `0.3.1`
+
+## v0.3.1 focus
+
+- Live overlays have their own foreground layer; Leaflet's transformed map panes stay in a separate background stacking context. Dark panels explicitly set light text.
+- The live screen fills the viewport with safe-area padding, rather than subtracting a guessed header height. Title/install banners stay outside recording; landscape puts controls beside the metrics.
+- Container resizing, visibility return, and page restoration remeasure the existing map without restarting the recorder. Notes scroll within the space above the recording controls.
+- Export data schema remains `0.3.0`; the app version is `0.3.1`.
 
 ## v0.3.0 focus
 
