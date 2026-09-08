@@ -18,10 +18,16 @@ import { Component, Fragment, useCallback, useEffect, useLayoutEffect, useMemo, 
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { CHANGELOG } from "./changelog";
-import { buildExportPayload, computeLiveStats, createGpsPointFromPosition } from "./runMath";
-import type { LiveStats } from "./runMath";
+import { buildExportPayload, computeLiveKilometers, computeLiveStats, createGpsPointFromPosition } from "./runMath";
+import type { LiveKilometers, LiveStats } from "./runMath";
 import { RunRouteMap } from "./RunRouteMap";
 import { PostRunSelfie } from "./PostRunSelfie";
+import { deleteRunDatabaseValue, getRunDatabaseValue, IDB_STORE_NAME, openRunDatabase, putRunDatabaseValue } from "./storage";
+import { getDetailedRecordingEnabled, listSessionChunks, markSessionChunkSynced, SessionRecorder } from "./sessionLog";
+import { CoachSensorRecorder } from "./coachSensors";
+import type { AppSessionChunk, CaptureContext, SessionRecordingStatus } from "./captureTypes";
+import { clearLabHandoverBatch, createLabHandoverBatch, labHandoverPendingCount, loadLabHandoverBatch, saveLabHandoverBatch } from "./labHandover";
+import type { LabHandoverBatch } from "./labHandover";
 import type {
   ActiveRun,
   BreathingRecoveredAfter,
@@ -57,11 +63,9 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.4.0";
+const APP_VERSION = "0.5.0";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
-const IDB_DB_NAME = "greenlake_autoresearch_logger";
-const IDB_STORE_NAME = "runs";
 const IDB_ACTIVE_RUN_KEY = "active_run";
 const IDB_HISTORY_PREFIX = "completed_run:";
 const RUN_HISTORY_INDEX_KEY = "greenlake_autoresearch_logger_run_history_index_v0_1";
@@ -190,6 +194,12 @@ interface RunHistoryActions {
   labSync: LabSyncStatus;
   units: Units;
   onToggleUnits: () => void;
+}
+
+interface RunArchiveSave {
+  runId: string;
+  postRun: PostRunState;
+  status: "saving" | "saved" | "failed";
 }
 
 const defaultPreRun: PreRunState = {
@@ -391,6 +401,13 @@ export default function App() {
   const [units, setUnits] = useState<Units>(() => loadUnits());
   const [changelogOpen, setChangelogOpen] = useState(false);
   const autoUpdateAppliedRef = useRef(false);
+  const [sessionStatus, setSessionStatus] = useState<SessionRecordingStatus>(() => ({
+    enabled: getDetailedRecordingEnabled(), paused: false, pending_chunks: 0, pending_bytes: 0,
+    dropped_records: 0, persistence_error: null,
+  }));
+  const sessionRecorderRef = useRef<SessionRecorder | null>(null);
+  const coachSensorsRef = useRef<CoachSensorRecorder | null>(null);
+  const bootLabSyncRef = useRef(false);
 
   const gpsWatchIdRef = useRef<number | null>(null);
   const gpsWatchIdsRef = useRef<Set<number>>(new Set());
@@ -412,6 +429,8 @@ export default function App() {
   const serviceWorkerRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
   const startWeatherRetryTimeoutRef = useRef<number | null>(null);
   const recoverySuppressedRef = useRef(false);
+  const archiveSaveRef = useRef<RunArchiveSave | null>(null);
+  const archiveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const countdownIntervalRef = useRef<number | null>(null);
   const startRunRef = useRef<() => void>(() => {});
   const startGpsTimeoutRef = useRef<number | null>(null);
@@ -456,6 +475,58 @@ export default function App() {
     }
     return Math.max(0, (performance.now() - runStartPerfRef.current) / 1000);
   }, []);
+
+  const recordSelfiePhase = useCallback((phase: string) => sessionRecorderRef.current?.record("selfie_phase", { phase }), []);
+
+  useEffect(() => {
+    const getContext = (): CaptureContext => ({
+      screen: screenRef.current,
+      run_id: activeRunRef.current?.run_metadata.run_id ?? null,
+      elapsed_seconds: activeRunRef.current ? round(getElapsedSeconds(), 3) : null,
+    });
+    const recorder = sessionRecorderRef.current ??= new SessionRecorder({
+      appVersion: APP_VERSION, getContext, onStatus: setSessionStatus,
+    });
+    coachSensorsRef.current ??= new CoachSensorRecorder({
+      getContext, sink: recorder,
+      getMotionPermission: () => activeRunRef.current?.permissions.device_motion_permission ?? "unknown",
+      onSummary: (summary) => {
+        const run = activeRunRef.current;
+        if (!run || run.status !== "running" || summary.run_id !== run.run_metadata.run_id) return;
+        const updated = { ...run, coach_sensors: { ...run.coach_sensors, [recorder.sessionId]: summary } };
+        activeRunRef.current = updated;
+        setActiveRun((current) => current?.run_metadata.run_id === summary.run_id
+          ? { ...current, coach_sensors: { ...current.coach_sensors, [recorder.sessionId]: summary } } : current);
+      },
+    });
+    recorder.start();
+    return () => {
+      coachSensorsRef.current?.stop();
+      recorder.stop();
+    };
+  }, [getElapsedSeconds]);
+
+  useEffect(() => {
+    const recorder = sessionRecorderRef.current;
+    recorder?.record("screen_view", { status: activeRun?.status ?? "none" });
+    if (sessionStatus.enabled && recorder && activeRun && !activeRun.app_session_ids?.includes(recorder.sessionId)) {
+      setActiveRun((run) => run ? { ...run, app_session_ids: [...(run.app_session_ids ?? []), recorder.sessionId] } : run);
+    }
+  }, [screen, activeRun?.run_metadata.run_id, activeRun?.status, sessionStatus.enabled]);
+
+  useEffect(() => {
+    if (screen !== "live" || activeRun?.status !== "running" || !sessionStatus.enabled || sessionStatus.paused) return;
+    coachSensorsRef.current?.start();
+    return () => coachSensorsRef.current?.stop();
+  }, [screen, activeRun?.run_metadata.run_id, activeRun?.status, sessionStatus.enabled, sessionStatus.paused]);
+
+  useEffect(() => {
+    const recorder = sessionRecorderRef.current;
+    recorder?.record("capability", { sensor: "gps", permission: permissions.geolocation_permission });
+    recorder?.record("capability", { sensor: "motion", permission: permissions.device_motion_permission });
+    recorder?.record("capability", { sensor: "wake_lock", status: permissions.wake_lock_status });
+    recorder?.record("capability", { sensor: "weather", status: permissions.weather_status });
+  }, [permissions.geolocation_permission, permissions.device_motion_permission, permissions.wake_lock_status, permissions.weather_status]);
 
   const updatePermissions = useCallback((patch: Partial<PermissionState>) => {
     const patchChanges = (target: PermissionState) =>
@@ -1047,6 +1118,7 @@ export default function App() {
 
   const handleStartPressed = useCallback(() => {
     void requestMotionPermission(true);
+    if (getDetailedRecordingEnabled()) void coachSensorsRef.current?.requestPermissions();
     void requestWakeLock(true);
 
     if (isWarmupGpsReady(warmupStatus.latestPoint, warmupStatus.latestAccuracy)) {
@@ -1084,6 +1156,8 @@ export default function App() {
     }
     reconcileElapsedClock();
     const elapsed = getElapsedSeconds();
+    coachSensorsRef.current?.stop();
+    sessionRecorderRef.current?.record("run_stop", { gps_points: activeRunRef.current.gps_points.length });
     runStartPerfRef.current = null;
     elapsedSecondsRef.current = elapsed;
     const stopClickedAt = new Date();
@@ -1183,6 +1257,7 @@ export default function App() {
     lastTickPerfRef.current = null;
     setElapsedSeconds(elapsed);
     setScreen("stop");
+    void sessionRecorderRef.current?.flush("run_stop");
 
     if (stopPoint) {
       void fetchWeatherForRun("finish", stopPoint.lat, stopPoint.lon);
@@ -1190,6 +1265,7 @@ export default function App() {
   };
 
   const resumeRun = () => {
+    if (getDetailedRecordingEnabled()) void coachSensorsRef.current?.requestPermissions();
     setActiveRun((run) =>
       run
         ? {
@@ -1215,6 +1291,7 @@ export default function App() {
   };
 
   const resumeRecoveredRun = () => {
+    if (getDetailedRecordingEnabled()) void coachSensorsRef.current?.requestPermissions();
     if (!activeRun) {
       setScreen("home");
       return;
@@ -1294,9 +1371,14 @@ export default function App() {
     }
     void releaseWakeLock();
     recoverySuppressedRef.current = true;
-    localStorage.removeItem(STORAGE_KEY);
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // A blocked localStorage must not prevent leaving the recording screen.
+    }
     void deleteRunFromIndexedDb();
     activeRunRef.current = null;
+    archiveSaveRef.current = null;
     setActiveRun(null);
     setPreRun((current) => ({ ...defaultPreRun, active_patch_id: current.active_patch_id }));
     setPermissions(defaultPermissions());
@@ -1325,7 +1407,9 @@ export default function App() {
   };
 
   const finishRunToHome = () => {
-    if (activeRun && !runAlreadyExported(activeRun)) {
+    const archive = archiveSaveRef.current;
+    if (activeRun && (!archive || archive.runId !== activeRun.run_metadata.run_id ||
+      archive.postRun !== activeRun.post_run || archive.status !== "saved")) {
       setActionMessage("Local history has not saved this run yet. Keep the draft, retry export, or download it before explicitly discarding.");
       return;
     }
@@ -1391,15 +1475,28 @@ export default function App() {
   };
 
   const continueToExport = () => {
+    sessionRecorderRef.current?.record("export_run");
+    void sessionRecorderRef.current?.flush("export");
     const createdAt = new Date().toISOString();
     if (activeRun) {
       const payload = buildExportPayload(activeRun, createdAt);
       const filename = buildExportFilename(activeRun.run_metadata.start_time_utc);
       saveRouteMemory(payload);
-      void saveCompletedRunToHistory(payload, filename).then((nextHistory) => {
+      const archive: RunArchiveSave = {
+        runId: activeRun.run_metadata.run_id,
+        postRun: activeRun.post_run,
+        status: "saving",
+      };
+      archiveSaveRef.current = archive;
+      recoverySuppressedRef.current = false;
+      // Serial writes keep an older export from overwriting a newer debrief.
+      archiveQueueRef.current = archiveQueueRef.current.then(() => saveCompletedRunToHistory(payload, filename)).then((nextHistory) => {
+        archive.status = "saved";
         setRunHistory(nextHistory);
-        if (activeRunRef.current?.run_metadata.run_id === activeRun.run_metadata.run_id) {
-          // Only this run's successful archive may retire its recovery draft.
+        if (archiveSaveRef.current === archive && screenRef.current === "export" &&
+          activeRunRef.current?.run_metadata.run_id === archive.runId &&
+          activeRunRef.current.post_run === archive.postRun) {
+          // Retire only the draft revision that was actually archived.
           recoverySuppressedRef.current = true;
           try {
             localStorage.removeItem(STORAGE_KEY);
@@ -1410,21 +1507,33 @@ export default function App() {
           setActionMessage("Export ready. Run saved to local history.");
         }
         void syncRunsToLab();
-      }).catch(() => setActionMessage("Export ready. Local history save failed; download still works."));
+      }).catch(() => {
+        archive.status = "failed";
+        if (archiveSaveRef.current === archive) {
+          setActionMessage("Export ready. Local history save failed; download still works.");
+        }
+      });
     }
     setExportCreatedAt(createdAt);
     setScreen("export");
   };
 
   const updatePostRun = (patch: Partial<PostRunState>) => {
-    setActiveRun((run) => (run ? { ...run, post_run: { ...run.post_run, ...patch } } : run));
+    recoverySuppressedRef.current = false;
+    setActiveRun((run) => (run ? {
+      ...run,
+      post_run: { ...run.post_run, ...patch },
+      last_saved_at_utc: new Date().toISOString(),
+    } : run));
   };
 
   const updatePostRunPain = (patch: Partial<PostRunState["pain_after_run"]>) => {
+    recoverySuppressedRef.current = false;
     setActiveRun((run) =>
       run
         ? {
             ...run,
+            last_saved_at_utc: new Date().toISOString(),
             post_run: {
               ...run.post_run,
               pain_after_run: { ...run.post_run.pain_after_run, ...patch },
@@ -1595,6 +1704,13 @@ export default function App() {
   const [scanningLab, setScanningLab] = useState(false);
   const [voiceContext, setVoiceContext] = useState<RunVoiceContext | null>(null);
 
+  useEffect(() => {
+    sessionRecorderRef.current?.record("capture_ui", {
+      voice_recording: recordingNote, pairing_camera: scanningLab, countdown: countdownSeconds,
+      waiting_for_gps: pendingStart, gps_start_timeout: gpsStartTimedOut,
+    });
+  }, [recordingNote, scanningLab, countdownSeconds, pendingStart, gpsStartTimedOut]);
+
   const startVoiceNote = () => {
     if (recordingNote || labSyncBusyRef.current) return;
     const run = activeRunRef.current;
@@ -1615,32 +1731,42 @@ export default function App() {
     saveLabSyncSettings({ endpoint: value });
   }, []);
 
-  const syncRunsToLab = useCallback(async (announce = false) => {
+  const syncRunsToLab = useCallback(async (announce = false, continuation?: LabHandoverBatch) => {
     const endpoint = normalizeLabEndpoint(loadLabSyncSettings().endpoint);
     if (!endpoint || labSyncBusyRef.current) {
       return;
     }
-    if (!announce && activeRunRef.current) {
-      return; // never do multi-MB work on the main thread during a live run
+    if (activeRunRef.current?.status === "running" || activeRunRef.current?.status === "stopping" || screenRef.current === "selfie") {
+      return; // Never upload or navigate away during recording or the camera scan.
     }
     labSyncBusyRef.current = true;
+    setLabSync({ status: "syncing", detail: "Preparing pending data…" });
     try {
+      if (announce && !continuation) clearLabHandoverBatch();
+      if (continuation && (continuation.endpoint !== endpoint || continuation.expires_at < Date.now())) {
+        setLabSync({ status: "idle", detail: "The sync batch expired. Tap Sync to start a new batch." });
+        return;
+      }
+      await sessionRecorderRef.current?.flush("lab_sync");
+      // Snapshot this queue, not a moving drain of interactions created during sync.
+      const pendingSessions = (await listSessionChunks(Infinity)).filter((chunk) => !continuation || continuation.session_ids.includes(chunk.chunk_id));
       const unsyncedRuns = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
       const unsyncedNotes = loadVoiceNotesIndex().filter((note) => !note.synced_at_utc);
-      const pending = unsyncedRuns.filter((entry) => announce || !entry.sync_error);
-      const pendingNotes = unsyncedNotes.filter((note) => announce || !note.sync_error);
+      const pending = unsyncedRuns.filter((entry) => (announce || !entry.sync_error) && (!continuation || continuation.run_ids.includes(entry.history_id)));
+      const pendingNotes = unsyncedNotes.filter((note) => (announce || !note.sync_error) && (!continuation || continuation.note_ids.includes(note.note_id)));
       const deferredErrors = unsyncedRuns.length + unsyncedNotes.length - pending.length - pendingNotes.length;
-      const pendingTotal = pending.length + pendingNotes.length;
-      const itemsLabel = describePendingItems(pending.length, pendingNotes.length);
+      const pendingTotal = pending.length + pendingNotes.length + pendingSessions.length;
+      const itemsLabel = describePendingItems(pending.length, pendingNotes.length, pendingSessions.length);
       const protocolStale = Date.now() - (loadCoachProtocolFetchedAt() ?? 0) > PROTOCOL_REFRESH_MS;
       if (pendingTotal === 0 && !announce && !protocolStale) {
+        setLabSync({ status: "ok", detail: "Nothing pending; the coach protocol is current." });
         return; // nothing to send and the protocol is fresh: no network, no flicker
       }
       if (announce || pendingTotal > 0) {
         setLabSync({ status: "syncing", detail: "Contacting lab…" });
       }
       const probe = await probeLabEndpoint(endpoint, announce ? 15000 : 4000); // long enough for the LNA prompt on a tap
-      const direct = probe === "reachable";
+      const direct = probe.status === "reachable";
       if (direct) {
         // The coach's channel into the phone: pull the current protocol on
         // every direct contact, whether or not anything needs uploading.
@@ -1652,7 +1778,7 @@ export default function App() {
           }
         }
       }
-      const protocolOnlyHandover = pendingTotal === 0 && announce && probe === "blocked" &&
+      const protocolOnlyHandover = pendingTotal === 0 && announce && probe.status === "blocked" &&
         endpoint.startsWith("http://") && window.location.protocol === "https:";
       if (pendingTotal === 0 && !protocolOnlyHandover) {
         const detail = direct
@@ -1693,17 +1819,28 @@ export default function App() {
             failed += 1;
           }
         }
+        for (const chunk of pendingSessions) {
+          const result = probe.sessionSchema === "1"
+            ? await postToLab(`${endpoint}/api/app-sessions`, JSON.stringify(chunk), 60000, chunk)
+            : "failed";
+          if (result === "stored" && await markSessionChunkSynced(chunk.chunk_id)) sent += 1;
+          else if (result === "rejected") rejected += 1;
+          else failed += 1;
+        }
+        await sessionRecorderRef.current?.refreshStatus();
         setRunHistory(loadRunHistoryIndex());
         setVoiceNotes(loadVoiceNotesIndex());
         const parts = [`Sent ${sent} of ${pendingTotal} (${itemsLabel}) to the lab.`];
+        if (pendingSessions.length > 0 && probe.sessionSchema !== "1") parts.push("The lab bridge needs an update to accept session details.");
         if (failed > 0) {
           parts.push(`${failed} failed — will retry.`);
         }
         if (rejected > 0) {
-          parts.push(`${rejected} can't sync — see the run list.`);
+          parts.push(`${rejected} items were rejected and remain on this device.`);
         }
+        if (continuation) clearLabHandoverBatch();
         const detail = parts.join(" ");
-        setLabSync({ status: failed > 0 ? "offline" : "ok", detail });
+        setLabSync({ status: failed > 0 || rejected > 0 ? "offline" : "ok", detail });
         if (announce) {
           setActionMessage(detail);
         }
@@ -1712,7 +1849,7 @@ export default function App() {
       // Not directly reachable. Only a *policy* block (mixed content / LNA denied)
       // justifies the top-level handover; a dead host would just hang the runner.
       const handoverPossible =
-        probe === "blocked" && endpoint.startsWith("http://") && window.location.protocol === "https:";
+        probe.status === "blocked" && endpoint.startsWith("http://") && window.location.protocol === "https:";
       if (!handoverPossible) {
         setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
         if (announce) {
@@ -1724,15 +1861,16 @@ export default function App() {
         // Handover navigates away; background flushes just report what's waiting.
         setLabSync({
           status: "idle",
-          detail: `${itemsLabel} waiting — tap "Sync to lab".`,
+          detail: "Details stay queued — tap \"Sync to lab\" to use the lab-page transfer.",
         });
         return;
       }
       setLabSync({ status: "syncing", detail: protocolOnlyHandover ? "Fetching coach protocol through the lab page…" : `Packing ${itemsLabel}…` });
-      const handover = await packRunsForLabHandover(endpoint, pending, pendingNotes);
+      const batch = continuation ?? createLabHandoverBatch(endpoint, pending.map((entry) => entry.history_id), pendingNotes.map((note) => note.note_id), pendingSessions.map((chunk) => chunk.chunk_id));
+      const handover = await packRunsForLabHandover(endpoint, pending, pendingNotes, pendingSessions, batch.id);
       for (const issue of handover.issues) {
         if (issue.kind === "run") markRunSyncError(issue.id, issue.reason);
-        else markVoiceNoteSyncError(issue.id, issue.reason);
+        else if (issue.kind === "note") markVoiceNoteSyncError(issue.id, issue.reason);
       }
       if (handover.issues.length > 0) {
         setRunHistory(loadRunHistoryIndex());
@@ -1764,65 +1902,92 @@ export default function App() {
       setLabSync({ status: "offline", detail: `Sync failed: ${error instanceof Error ? error.message : String(error)}` });
     } finally {
       labSyncBusyRef.current = false;
+      void sessionRecorderRef.current?.refreshStatus();
     }
   }, []);
 
   useEffect(() => {
-    if (window.location.hash.startsWith("#labsync=")) {
-      try {
-        const result = JSON.parse(base64UrlToUtf8(window.location.hash.slice("#labsync=".length))) as {
-          acks?: Array<{ id?: string; ok?: boolean }>;
-          noteAcks?: Array<{ id?: string; ok?: boolean }>;
-          protocol?: unknown;
-        };
-        const protocol = parseCoachProtocol(result.protocol);
-        if (protocol) {
-          markCoachProtocolFetched();
-          if (saveCoachProtocol(protocol)) {
-            setActionMessage(`New coach protocol ${protocol.protocol_id}: ${protocol.expectation}`);
+    if (bootLabSyncRef.current) return;
+    bootLabSyncRef.current = true;
+    const initializeLabSync = async () => {
+      let continuation: LabHandoverBatch | undefined;
+      const hash = window.location.hash;
+      if (hash.startsWith("#labsync=")) {
+        // Remove the receipt before awaiting IndexedDB; never leave it in history.
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        try {
+          const result = JSON.parse(base64UrlToUtf8(hash.slice("#labsync=".length))) as {
+            handover_id?: string;
+            acks?: Array<{ id?: string; ok?: boolean }>;
+            noteAcks?: Array<{ id?: string; ok?: boolean }>;
+            sessionAcks?: Array<{ id?: string; ok?: boolean }>;
+            protocol?: unknown;
+          };
+          const batch = loadLabHandoverBatch();
+          if (batch && result.handover_id === batch.id && batch.endpoint === normalizeLabEndpoint(loadLabSyncSettings().endpoint)) {
+            const protocol = parseCoachProtocol(result.protocol);
+            if (protocol) {
+              markCoachProtocolFetched();
+              if (saveCoachProtocol(protocol)) setActionMessage(`New coach protocol ${protocol.protocol_id}: ${protocol.expectation}`);
+            }
+            const acks = Array.isArray(result.acks) ? result.acks : [];
+            const noteAcks = Array.isArray(result.noteAcks) ? result.noteAcks : [];
+            const sessionAcks = Array.isArray(result.sessionAcks) ? result.sessionAcks : [];
+            let stored = 0;
+            for (const ack of acks) {
+              if (ack.ok && typeof ack.id === "string" && batch.run_ids.includes(ack.id)) {
+                markRunSynced(ack.id);
+                batch.run_ids = batch.run_ids.filter((id) => id !== ack.id);
+                stored += 1;
+              }
+            }
+            for (const ack of noteAcks) {
+              if (ack.ok && typeof ack.id === "string" && batch.note_ids.includes(ack.id)) {
+                markVoiceNoteSynced(ack.id);
+                batch.note_ids = batch.note_ids.filter((id) => id !== ack.id);
+                stored += 1;
+              }
+            }
+            for (const ack of sessionAcks) {
+              if (ack.ok && typeof ack.id === "string" && batch.session_ids.includes(ack.id) && await markSessionChunkSynced(ack.id)) {
+                batch.session_ids = batch.session_ids.filter((id) => id !== ack.id);
+                stored += 1;
+              }
+            }
+            await sessionRecorderRef.current?.refreshStatus();
+            setRunHistory(loadRunHistoryIndex());
+            setVoiceNotes(loadVoiceNotesIndex());
+            const total = acks.length + noteAcks.length + sessionAcks.length;
+            const remaining = labHandoverPendingCount(batch);
+            // Only continue a successful, shrinking, explicitly requested snapshot.
+            // New interactions from these round trips belong to a later sync.
+            if (stored > 0 && stored === total && remaining > 0) {
+              saveLabHandoverBatch(batch);
+              continuation = batch;
+            } else {
+              clearLabHandoverBatch();
+            }
+            if (total > 0) {
+              const detail = `Lab stored ${stored} of ${total} items.${continuation ? ` Continuing with ${remaining} remaining…` : ""}`;
+              setLabSync({ status: stored === total ? "ok" : "offline", detail });
+              setActionMessage(detail);
+            }
           }
+        } catch {
+          setLabSync({ status: "offline", detail: "The lab receipt could not be applied. Unacknowledged data remains queued." });
         }
-        const acks = Array.isArray(result.acks) ? result.acks : [];
-        const noteAcks = Array.isArray(result.noteAcks) ? result.noteAcks : [];
-        let stored = 0;
-        for (const ack of acks) {
-          if (ack.ok && typeof ack.id === "string") {
-            markRunSynced(ack.id);
-            stored += 1;
-          }
-        }
-        for (const ack of noteAcks) {
-          if (ack.ok && typeof ack.id === "string") {
-            markVoiceNoteSynced(ack.id);
-            stored += 1;
-          }
-        }
-        setRunHistory(loadRunHistoryIndex());
-        setVoiceNotes(loadVoiceNotesIndex());
-        const total = acks.length + noteAcks.length;
-        if (total > 0) {
-          const detail = `Lab stored ${stored} of ${total} item${total === 1 ? "" : "s"}.`;
-          setLabSync({ status: stored === total ? "ok" : "offline", detail });
-          setActionMessage(detail);
-        }
-      } catch {
-        // Malformed result; items stay pending and retry on the next sync.
       }
-      window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    }
-    const lab = new URLSearchParams(window.location.search).get("lab");
-    if (lab) {
-      const normalized = normalizeLabEndpoint(lab);
-      saveLabSyncSettings({ endpoint: normalized });
-      setLabEndpoint(normalized);
-      setActionMessage("Lab sync endpoint saved from link.");
-      // One-shot provisioning: a refresh must not re-save the QR endpoint over
-      // an edit the runner made by hand.
-      window.history.replaceState(null, "", window.location.pathname);
-    }
-    if (loadLabSyncSettings().endpoint) {
-      void syncRunsToLab();
-    }
+      const lab = new URLSearchParams(window.location.search).get("lab");
+      if (lab) {
+        const normalized = normalizeLabEndpoint(lab);
+        saveLabSyncSettings({ endpoint: normalized });
+        setLabEndpoint(normalized);
+        setActionMessage("Lab sync endpoint saved from link.");
+        window.history.replaceState(null, "", window.location.pathname);
+      }
+      if (loadLabSyncSettings().endpoint) void syncRunsToLab(Boolean(continuation), continuation);
+    };
+    void initializeLabSync().catch(() => setLabSync({ status: "offline", detail: "Session acknowledgements could not be saved. Details remain queued." }));
   }, [syncRunsToLab]);
 
   useEffect(() => {
@@ -1831,6 +1996,7 @@ export default function App() {
         // A lab-page round trip in another surface may have marked runs synced.
         setRunHistory(loadRunHistoryIndex());
         setVoiceNotes(loadVoiceNotesIndex());
+        void sessionRecorderRef.current?.refreshStatus();
       }
     };
     document.addEventListener("visibilitychange", refreshOnReturn);
@@ -1966,10 +2132,7 @@ export default function App() {
       lastTickPerfRef.current = performance.now();
       const currentRun = activeRunRef.current;
       const latestPoint = currentRun?.gps_points[currentRun.gps_points.length - 1] ?? null;
-      if (!latestPoint) {
-        return;
-      }
-      const staleSeconds = Math.max(0, elapsed - latestPoint.t_elapsed_seconds);
+      const staleSeconds = Math.max(0, elapsed - (latestPoint?.t_elapsed_seconds ?? 0));
       setGpsStaleSeconds(staleSeconds);
       if (staleSeconds > 5 && !stale5LoggedRef.current) {
         stale5LoggedRef.current = true;
@@ -1978,7 +2141,7 @@ export default function App() {
           timestamp_utc: new Date().toISOString(),
           t_elapsed_seconds: round(elapsed, 2),
           stale_seconds: round(staleSeconds, 2),
-          last_gps_elapsed_seconds: latestPoint.t_elapsed_seconds,
+          last_gps_elapsed_seconds: latestPoint?.t_elapsed_seconds ?? null,
           threshold_seconds: 5,
         });
       }
@@ -1989,7 +2152,7 @@ export default function App() {
           timestamp_utc: new Date().toISOString(),
           t_elapsed_seconds: round(elapsed, 2),
           stale_seconds: round(staleSeconds, 2),
-          last_gps_elapsed_seconds: latestPoint.t_elapsed_seconds,
+          last_gps_elapsed_seconds: latestPoint?.t_elapsed_seconds ?? null,
           threshold_seconds: 10,
         });
       }
@@ -2016,6 +2179,12 @@ export default function App() {
     const handleControllerChange = () => {
       setPwaState((current) => detectPwaState(current.storage_persisted));
     };
+    const handleWorkerMessage = (event: MessageEvent) => {
+      if (event.data?.type === "UPDATE_DEFERRED_OTHER_CLIENTS") {
+        autoUpdateAppliedRef.current = false;
+        setActionMessage("Update waiting: close the other Green Lake app tabs or windows, then tap Update.");
+      }
+    };
     if ("serviceWorker" in navigator) {
       void navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`, {
         scope: import.meta.env.BASE_URL,
@@ -2038,12 +2207,14 @@ export default function App() {
         });
       });
       navigator.serviceWorker.addEventListener("controllerchange", handleControllerChange);
+      navigator.serviceWorker.addEventListener("message", handleWorkerMessage);
     }
 
     return () => {
       window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
       if ("serviceWorker" in navigator) {
         navigator.serviceWorker.removeEventListener("controllerchange", handleControllerChange);
+        navigator.serviceWorker.removeEventListener("message", handleWorkerMessage);
       }
     };
   }, []);
@@ -2411,6 +2582,23 @@ export default function App() {
           setScanning={setScanningLab}
           pendingNoteCount={voiceNotes.filter((note) => !note.synced_at_utc).length}
           onRecordNote={startVoiceNote}
+          sessionStatus={sessionStatus}
+          onDetailedRecordingChange={(enabled) => {
+            sessionRecorderRef.current?.setEnabled(enabled);
+            if (!enabled) coachSensorsRef.current?.stop();
+          }}
+          onDownloadDetails={() => {
+            void (async () => {
+              await sessionRecorderRef.current?.flush("download");
+              const chunks = await listSessionChunks(Infinity);
+              downloadBlob(new Blob([JSON.stringify({ schema_version: "1", chunks })], { type: "application/json" }), "greenlake_pending_session_details.json");
+            })().catch(() => setActionMessage("Session details could not be downloaded; they remain queued."));
+          }}
+          onClearDetails={() => {
+            if (window.confirm("Delete unsent session and extra sensor details from this device? Saved runs and voice notes are not affected.")) {
+              void sessionRecorderRef.current?.clear();
+            }
+          }}
         />
       ) : null}
 
@@ -2470,6 +2658,8 @@ export default function App() {
           onDiscard={discardRun}
           units={units}
           onToggleUnits={toggleUnits}
+          captureWarning={sessionStatus.persistence_error}
+          detailsEnabled={sessionStatus.enabled && !sessionStatus.paused}
         />
       ) : null}
 
@@ -2489,11 +2679,13 @@ export default function App() {
       {screen === "selfie" && activeRun ? (
         <PostRunSelfie
           stoppedAtUtc={activeRun.run_metadata.end_time_utc}
+          onPhaseChange={recordSelfiePhase}
           onComplete={(result) => {
+            sessionRecorderRef.current?.record("selfie_result", { status: result.status, heart_rate_bpm: result.heart_rate_bpm });
             updatePostRun({ selfie_biometrics: result });
             setScreen("post");
           }}
-          onSkip={() => setScreen("post")}
+          onSkip={() => { sessionRecorderRef.current?.record("selfie_skipped"); setScreen("post"); }}
         />
       ) : null}
 
@@ -2647,19 +2839,16 @@ function RecoveryScreen({
 
       <section className="button-grid vertical">
         {!isStopped ? (
-          <button type="button" className="primary-button" onClick={onResume}>
-            <Play size={18} />
-            Resume recording
-          </button>
+          <button data-session-target="resume-run" type="button" className="primary-button" onClick={onResume} ><Play size={18} />
+          Resume recording
+                    </button>
         ) : null}
-        <button type="button" className={isStopped ? "primary-button" : "secondary-button"} onClick={onFinalize}>
-          <Clipboard size={18} />
-          Finalize previous run
-        </button>
-        <button type="button" className="danger-button" onClick={onDiscard}>
-          <Trash2 size={18} />
-          Discard previous run
-        </button>
+        <button data-session-target="finalize-run" type="button" className={isStopped ? "primary-button" : "secondary-button"} onClick={onFinalize} ><Clipboard size={18} />
+        Finalize previous run
+                </button>
+        <button data-session-target="discard-run" type="button" className="danger-button" onClick={onDiscard} ><Trash2 size={18} />
+        Discard previous run
+                </button>
       </section>
     </section>
   );
@@ -2676,6 +2865,10 @@ function HomeScreen({
   onRecordNote,
   scanning,
   setScanning,
+  sessionStatus,
+  onDetailedRecordingChange,
+  onDownloadDetails,
+  onClearDetails,
 }: {
   runHistory: RunHistoryEntry[];
   historyActions: RunHistoryActions;
@@ -2687,6 +2880,10 @@ function HomeScreen({
   onRecordNote: () => void;
   scanning: boolean;
   setScanning: (value: boolean) => void;
+  sessionStatus: SessionRecordingStatus;
+  onDetailedRecordingChange: (enabled: boolean) => void;
+  onDownloadDetails: () => void;
+  onClearDetails: () => void;
 }) {
   const handleScanResult = useCallback(
     (text: string) => {
@@ -2705,7 +2902,7 @@ function HomeScreen({
 
   const paired = labEndpoint.trim().length > 0;
   const pendingRuns = runHistory.filter((entry) => !entry.synced_at_utc).length;
-  const pendingCount = pendingRuns + pendingNoteCount;
+  const pendingCount = pendingRuns + pendingNoteCount + sessionStatus.pending_chunks;
   const syncBusy = historyActions.labSync.status === "syncing";
 
   return (
@@ -2722,28 +2919,20 @@ function HomeScreen({
             Open lab page to finish sync
           </a>
         ) : pendingCount > 0 ? (
-          <button type="button" className="primary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}>
-            <RefreshCw size={20} />
-            {syncBusy
-              ? "Syncing…"
-              : `Sync ${describePendingItems(pendingRuns, pendingNoteCount)} to lab`}
-          </button>
+          <button data-session-target="sync-lab" type="button" className="primary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}><RefreshCw size={20} />
+          {syncBusy
+            ? "Syncing…"
+            : `Sync ${describePendingItems(pendingRuns, pendingNoteCount, sessionStatus.pending_chunks)} to lab`}</button>
         ) : null}
 
-        <button
-          type="button"
-          className={!paired || pendingCount > 0 ? "secondary-button" : "primary-button"}
-          onClick={onStartNew}
-          disabled={syncBusy}
-        >
-          <Play size={20} />
-          Start run
-        </button>
+        <button data-session-target="start-setup" type="button"
+        className={!paired || pendingCount > 0 ? "secondary-button" : "primary-button"} onClick={onStartNew} disabled={syncBusy}><Play size={20} />
+        Start run
+                </button>
 
-        <button type="button" className="secondary-button" onClick={onRecordNote} disabled={syncBusy}>
-          <Mic size={18} />
-          Voice note
-        </button>
+        <button data-session-target="record-voice" type="button" className="secondary-button" onClick={onRecordNote} disabled={syncBusy}><Mic size={18} />
+        Voice note
+                </button>
 
         <p className="home-status">
           {!paired
@@ -2751,9 +2940,27 @@ function HomeScreen({
             : historyActions.labSync.detail ||
               (pendingCount === 0
                 ? "Everything is in the lab."
-                : `${describePendingItems(pendingRuns, pendingNoteCount)} waiting to sync.`)}
+                : `${describePendingItems(pendingRuns, pendingNoteCount, sessionStatus.pending_chunks)} waiting to sync.`)}
         </p>
       </div>
+
+      <details className="preflight-panel session-details" data-session-target="session-details">
+        <summary>Detailed recording {sessionStatus.enabled ? "on" : "off"} · {sessionStatus.pending_chunks} pending chunks</summary>
+        <label className="switch-label">
+          <input type="checkbox" data-session-target="detailed-recording" checked={sessionStatus.enabled}
+            onChange={(event) => onDetailedRecordingChange(event.target.checked)} disabled={syncBusy} />
+          Record session interactions and extra run sensors
+        </label>
+        <p>Screen transitions, controls, safe numeric/choice values, errors and device state. During runs: motion up to 20 Hz, orientation up to 5 Hz, and ambient light where supported. No raw typing, free-text contents, clipboard, screenshots, or background microphone/camera capture.</p>
+        <p>Details stay on this device until the paired lab receives them. Sync on home Wi-Fi; browser restrictions may require the lab-page round trip. Acknowledged chunks are removed here. {formatBytes(sessionStatus.pending_bytes)} queued; a 20 MB limit pauses new detail capture rather than deleting unsent data.</p>
+        <p>Phone movement is not a validated gait measurement. Unsupported, denied, hidden-page and missing-sample periods are reported, not filled in.</p>
+        {sessionStatus.persistence_error ? <p role="alert" className="notice">{sessionStatus.persistence_error}</p> : null}
+        {sessionStatus.dropped_records > 0 ? <p role="alert">{sessionStatus.dropped_records} detail records could not be retained.</p> : null}
+        <div className="button-grid">
+          <button type="button" className="secondary-button" data-session-target="download-session-details" onClick={onDownloadDetails} disabled={syncBusy}>Download pending details</button>
+          <button type="button" className="danger-button" data-session-target="clear-session-details" onClick={onClearDetails} disabled={syncBusy}>Clear pending details</button>
+        </div>
+      </details>
 
       <RunHistoryPanel entries={runHistory} actions={historyActions} />
 
@@ -2764,14 +2971,14 @@ function HomeScreen({
           Scan lab QR
         </button>
         {paired ? (
-          <button type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}>
-            <RefreshCw size={18} />
-            Check in with the lab
-          </button>
+          <button data-session-target="sync-lab" type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}><RefreshCw size={18} />
+          Check in with the lab
+                    </button>
         ) : null}
         <label>
           Lab endpoint URL
           <input
+            data-session-target="lab-endpoint"
             value={labEndpoint}
             disabled={syncBusy}
             inputMode="url"
@@ -2969,7 +3176,7 @@ function VoiceNoteRecorder({
       <div className="recorder-pulse">{error ? "!" : formatDuration(seconds)}</div>
       <p role="status">{error || (!ready ? "Requesting microphone…" : micEnded ? "Recording ended — save what you have." : "Recording audio…")}</p>
       <div className="button-grid">
-        <button type="button" className="secondary-button" onClick={onClose} disabled={saving}>
+        <button data-session-target="close" type="button" className="secondary-button" onClick={onClose} disabled={saving}>
           Discard voice note
         </button>
         <button type="button" className="primary-button" onClick={saveNote} disabled={!canSave}>
@@ -3091,7 +3298,7 @@ function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean;
     <div className="scanner-overlay">
       <video ref={videoRef} className="scanner-video" muted playsInline />
       <p>{error || "Point the camera at the lab pairing QR."}</p>
-      <button type="button" className="secondary-button" onClick={onClose}>
+      <button data-session-target="close" type="button" className="secondary-button" onClick={onClose} >
         Cancel
       </button>
     </div>
@@ -3367,106 +3574,65 @@ function SetupScreen({
 
         <label>
           Run mode
-          <select
-            value={preRun.mode}
-            onChange={(event) => setPreRun(applyRunModeDefaults(preRun, event.target.value as RunMode))}
-          >
-            {RUN_MODE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+          <select data-session-target="pre_run.mode"  value={preRun.mode} onChange={(event) => setPreRun(applyRunModeDefaults(preRun, event.target.value as RunMode))}>{RUN_MODE_OPTIONS.map((option) => (
+            <option data-session-value={option.value} key={option.value} value={option.value} >{option.label}</option>
+          ))}</select>
         </label>
 
         <label>
           Active patch
-          <select
-            value={preRun.active_patch_id}
-            onChange={(event) => setPreRun({ ...preRun, active_patch_id: event.target.value })}
-          >
-            <option value="baseline_calibration_v1">baseline_calibration_v1</option>
-            <option value={CONTROLLED_START_PATCH_ID}>controlled_start_v1</option>
-          </select>
+          <select data-session-target="pre_run.active_patch_id"  value={preRun.active_patch_id} onChange={(event) => setPreRun({ ...preRun, active_patch_id: event.target.value })}><option data-session-value="baseline_calibration_v1"  value="baseline_calibration_v1" >baseline_calibration_v1</option>
+          <option data-session-value={CONTROLLED_START_PATCH_ID}  value={CONTROLLED_START_PATCH_ID} >controlled_start_v1</option></select>
         </label>
 
         <label>
           Route
-          <input
-            value={preRun.route_name}
-            onChange={(event) => setPreRun({ ...preRun, route_name: event.target.value })}
-          />
+          <input data-session-target="pre_run.route_name"  value={preRun.route_name} onChange={(event) => setPreRun({ ...preRun, route_name: event.target.value })}/>
         </label>
 
         <label>
           Route direction
-          <select
-            value={preRun.route_direction}
-            onChange={(event) =>
-              setPreRun({ ...preRun, route_direction: event.target.value as RouteDirection })
-            }
-          >
-            <option value="unknown">unknown</option>
-            <option value="clockwise">clockwise</option>
-            <option value="counterclockwise">counterclockwise</option>
-          </select>
+          <select data-session-target="pre_run.route_direction"  value={preRun.route_direction} onChange={(event) =>
+            setPreRun({ ...preRun, route_direction: event.target.value as RouteDirection })
+          }><option data-session-value="unknown"  value="unknown" >unknown</option>
+          <option data-session-value="clockwise"  value="clockwise" >clockwise</option>
+          <option data-session-value="counterclockwise"  value="counterclockwise" >counterclockwise</option></select>
         </label>
 
         <label>
           Phone position
-          <select
-            value={preRun.phone_position}
-            onChange={(event) => setPreRun({ ...preRun, phone_position: event.target.value as PhonePosition })}
-          >
-            <option value="unknown">unknown</option>
-            <option value="waist_belt">waist belt</option>
-            <option value="shorts_pocket">shorts pocket</option>
-            <option value="armband">armband</option>
-            <option value="handheld">handheld</option>
-            <option value="other">other</option>
-          </select>
+          <select data-session-target="pre_run.phone_position"  value={preRun.phone_position} onChange={(event) => setPreRun({ ...preRun, phone_position: event.target.value as PhonePosition })}><option data-session-value="unknown"  value="unknown" >unknown</option>
+          <option data-session-value="waist_belt"  value="waist_belt" >waist belt</option>
+          <option data-session-value="shorts_pocket"  value="shorts_pocket" >shorts pocket</option>
+          <option data-session-value="armband"  value="armband" >armband</option>
+          <option data-session-value="handheld"  value="handheld" >handheld</option>
+          <option data-session-value="other"  value="other" >other</option></select>
         </label>
 
         <label>
           Target distance, meters
-          <input
-            type="number"
-            min="100"
-            inputMode="numeric"
-            value={preRun.intended_distance_meters}
-            onChange={(event) =>
-              setPreRun({ ...preRun, intended_distance_meters: numberFromInput(event.target.value) ?? 5000 })
-            }
-          />
+          <input data-session-target="pre_run.intended_distance_meters" type="number"
+          min="100"
+          inputMode="numeric" value={preRun.intended_distance_meters} onChange={(event) =>
+            setPreRun({ ...preRun, intended_distance_meters: numberFromInput(event.target.value) ?? 5000 })
+          }/>
         </label>
 
         <label>
           Energy before
-          <select
-            value={preRun.energy_before_run_1_to_5 ?? ""}
-            onChange={(event) =>
-              setPreRun({ ...preRun, energy_before_run_1_to_5: numberFromInput(event.target.value) })
-            }
-          >
-            <option value="">unknown</option>
-            {[1, 2, 3, 4, 5].map((value) => (
-              <option key={value} value={value}>
-                {value}
-              </option>
-            ))}
-          </select>
+          <select data-session-target="pre_run.energy_before_run_1_to_5"  value={preRun.energy_before_run_1_to_5 ?? ""} onChange={(event) =>
+            setPreRun({ ...preRun, energy_before_run_1_to_5: numberFromInput(event.target.value) })
+          }><option data-session-value=""  value="" >unknown</option>
+          {[1, 2, 3, 4, 5].map((value) => (
+            <option data-session-value={value} key={value} value={value} >{value}</option>
+          ))}</select>
         </label>
 
         <label>
           Soreness before
-          <select
-            value={preRun.soreness_before_run}
-            onChange={(event) =>
-              setPreRun({ ...preRun, soreness_before_run: event.target.value as SorenessLevel })
-            }
-          >
-            <SorenessOptions includeUnknown />
-          </select>
+          <select data-session-target="pre_run.soreness_before_run"  value={preRun.soreness_before_run} onChange={(event) =>
+            setPreRun({ ...preRun, soreness_before_run: event.target.value as SorenessLevel })
+          }><SorenessOptions includeUnknown /></select>
         </label>
 
         <div className="toggle-row">
@@ -3485,44 +3651,31 @@ function SetupScreen({
           <div className="paired-fields">
             <label>
               Pain location
-              <input
-                value={preRun.pain_before_run.location ?? ""}
-                onChange={(event) => setPain({ location: event.target.value || null })}
-              />
+              <input data-session-target="pre_run.pain_before_run.location"  value={preRun.pain_before_run.location ?? ""} onChange={(event) => setPain({ location: event.target.value || null })}/>
             </label>
             <label>
               Pain severity
-              <input
-                type="number"
-                min="1"
-                max="10"
-                inputMode="numeric"
-                value={preRun.pain_before_run.severity_1_to_10 ?? ""}
-                onChange={(event) => setPain({ severity_1_to_10: numberFromInput(event.target.value) })}
-              />
+              <input data-session-target="pre_run.pain_before_run.severity_1_to_10" type="number"
+              min="1"
+              max="10"
+              inputMode="numeric" value={preRun.pain_before_run.severity_1_to_10 ?? ""} onChange={(event) => setPain({ severity_1_to_10: numberFromInput(event.target.value) })}/>
             </label>
           </div>
         ) : null}
 
         <label>
           Pre-run note
-          <textarea
-            rows={3}
-            value={preRun.free_text}
-            onChange={(event) => setPreRun({ ...preRun, free_text: event.target.value })}
-          />
+          <textarea data-session-target="pre_run.free_text" rows={3} value={preRun.free_text} onChange={(event) => setPreRun({ ...preRun, free_text: event.target.value })}/>
         </label>
       </section>
       </details>
 
-      <button type="button" className="link-button" onClick={onBack}>
+      <button data-session-target="back" type="button" className="link-button" onClick={onBack} >
         Back to runs
       </button>
 
-      <button type="button" className="primary-button sticky-action" onClick={onStart} disabled={!canStart}>
-        <Play size={20} />
-        {startLabel}
-      </button>
+      <button data-session-target="start-run" type="button" className="primary-button sticky-action" onClick={onStart} disabled={!canStart}><Play size={20} />
+      {startLabel}</button>
     </section>
   );
 }
@@ -3530,6 +3683,7 @@ function SetupScreen({
 function LiveScreen({
   run, elapsedSeconds, liveStats, targetReached, gpsStaleSeconds,
   onCheckpoint, onAddNote, voiceRecording, onRecordVoice, onStop, onDiscard, units, onToggleUnits,
+  captureWarning, detailsEnabled,
 }: {
   run: ActiveRun;
   elapsedSeconds: number;
@@ -3544,21 +3698,24 @@ function LiveScreen({
   onDiscard: () => void;
   units: Units;
   onToggleUnits: () => void;
+  captureWarning: string | null;
+  detailsEnabled: boolean;
 }) {
   const [noteOpen, setNoteOpen] = useState(false);
   const remainingMeters = Math.max(0, run.pre_run.intended_distance_meters - liveStats.distanceMeters);
   const planBands = run.pre_run.plan_bands?.length ? run.pre_run.plan_bands : CONTROLLED_START_BANDS;
   const liveUi = run.pre_run.protocol_live_ui ?? { show_pace_band: true, show_current_pace: true, show_average_pace: true };
+  const kilometers = useMemo(() => computeLiveKilometers(run.gps_points, 0), [run.gps_points]);
   const strategyStatus = useMemo(
     () => liveUi.show_pace_band && run.pre_run.intended_distance_meters >= 3000
-      ? computeControlledStartStatus(run.gps_points, planBands) : null,
-    [liveUi.show_pace_band, run.pre_run.intended_distance_meters, run.gps_points, planBands],
+      ? computeControlledStartStatus(kilometers, planBands) : null,
+    [liveUi.show_pace_band, run.pre_run.intended_distance_meters, kilometers, planBands],
   );
   const latest = run.gps_points[run.gps_points.length - 1];
-  const paceUncertain = gpsStaleSeconds > 5 || Boolean(latest && (
+  const paceUncertain = !latest || gpsStaleSeconds > 5 ||
     latest.horizontal_accuracy_meters === null || latest.horizontal_accuracy_meters > 25 ||
-    latest.impossible_speed || latest.possible_gps_jump || latest.tiny_dt_segment
-  ));
+    !Number.isFinite(latest.lat) || !Number.isFinite(latest.lon) ||
+    Boolean(latest.impossible_speed || latest.possible_gps_jump || latest.tiny_dt_segment);
   const paceState = !strategyStatus ? "hidden" : paceUncertain ? "uncertain" : strategyStatus.status;
 
   return (
@@ -3571,6 +3728,8 @@ function LiveScreen({
           <Fragment>
             <div className="live-chips">
               <span className="live-chip">Recording</span>
+              {captureWarning ? <span className="live-chip warn">Detail storage needs attention</span> :
+                !detailsEnabled ? <span className="live-chip">Extra details off</span> : null}
               {targetReached ? <span className="live-chip ok">Target reached — you can stop</span> : null}
               {gpsStaleSeconds > 10 ? <span className="live-chip warn">GPS stale — keep app visible</span> : null}
               {run.in_run_notes.length > 0 ? <span className="live-chip">{run.in_run_notes.length} notes saved</span> : null}
@@ -3578,16 +3737,21 @@ function LiveScreen({
                 <span className="live-chip warn">Wake lock inactive</span>
               ) : null}
             </div>
-            <div className="live-hero-cards" onClick={onToggleUnits}>
+            <div className="live-hero-cards" data-session-target="toggle-units" onClick={onToggleUnits}>
               <div><span>Elapsed</span><strong>{formatDuration(elapsedSeconds)}</strong></div>
               <div><span>Distance</span><strong>{formatDistance(liveStats.distanceMeters, units)}</strong></div>
               {liveUi.show_average_pace ? (
                 <div><span>Avg</span><strong>{formatPaceForUnits(liveStats.averagePaceSecondsPerMile, units)}</strong></div>
               ) : null}
               {liveUi.show_current_pace ? (
-                <div><span>Now</span><strong>{formatPaceForUnits(liveStats.currentPaceSecondsPerMile, units)}</strong></div>
+                <div><span>Now</span><strong>{paceUncertain ? "--" : formatPaceForUnits(liveStats.currentPaceSecondsPerMile, units)}</strong></div>
               ) : null}
             </div>
+            <KilometerSplits
+              kilometers={kilometers}
+              elapsedSeconds={elapsedSeconds}
+              showTimes={liveUi.show_current_pace || liveUi.show_average_pace}
+            />
             {strategyStatus ? (
               <div className={`live-pace-status pace-${paceState}`} role="status">
                 <span>{strategyStatus.band.label} · kilometre average</span>
@@ -3612,23 +3776,76 @@ function LiveScreen({
       </div>
       <div className="live-bottom">
         <div className="live-secondary">
-          <button type="button" className="secondary-button" onClick={onCheckpoint}>
+          <button type="button" className="secondary-button" data-session-target="checkpoint" onClick={onCheckpoint}>
             <Clipboard size={18} />Checkpoint
           </button>
           <button type="button" className="secondary-button" aria-expanded={noteOpen} disabled={voiceRecording}
+            data-session-target="toggle-text-note"
             onClick={() => setNoteOpen(!noteOpen)}>
             <Clipboard size={18} />{noteOpen ? "Close note" : "Text note"}
           </button>
           <button type="button" className="secondary-button" disabled={voiceRecording}
+            data-session-target="record-voice"
             onClick={() => { setNoteOpen(false); onRecordVoice(); }}>
             <Mic size={18} />{voiceRecording ? "Recording…" : "Voice note"}
           </button>
         </div>
-        <button type="button" className="danger-button live-stop" onClick={onStop}>
-          <Square size={20} />Stop run
-        </button>
-        <button type="button" className="link-button live-discard" onClick={onDiscard}>Emergency discard</button>
+        <button data-session-target="stop-run" type="button" className="danger-button live-stop" onClick={onStop} ><Square size={20} />Stop run
+                </button>
+        <button data-session-target="discard-run" type="button" className="link-button live-discard" onClick={onDiscard} >Emergency discard</button>
       </div>
+    </section>
+  );
+}
+
+function KilometerSplits({
+  kilometers,
+  elapsedSeconds,
+  showTimes,
+}: {
+  kilometers: LiveKilometers;
+  elapsedSeconds: number;
+  showTimes: boolean;
+}) {
+  const completedListRef = useRef<HTMLOListElement | null>(null);
+  const lastCompleted = kilometers.completed[kilometers.completed.length - 1];
+  const currentElapsed = Math.max(kilometers.current.elapsedSeconds, elapsedSeconds - (lastCompleted?.elapsedSeconds ?? 0));
+  const remainingMeters = Math.max(0, Math.ceil(1000 - kilometers.current.distanceMeters));
+
+  useEffect(() => {
+    const list = completedListRef.current;
+    if (list) list.scrollLeft = list.scrollWidth;
+  }, [kilometers.completed.length]);
+
+  return (
+    <section className="live-kilometers" aria-label="Kilometre splits">
+      <div className="kilometer-current">
+        <div>
+          <span>Current kilometre</span>
+          <strong>KM {kilometers.current.km}</strong>
+          <small>{remainingMeters} m to next km</small>
+        </div>
+        {showTimes ? <div className="kilometer-clock">
+          <span>This km elapsed</span>
+          <strong>{formatDuration(currentElapsed)}</strong>
+        </div> : null}
+      </div>
+      <progress
+        max={1000}
+        value={kilometers.current.distanceMeters}
+        aria-label={`Kilometre ${kilometers.current.km} progress`}
+      />
+      {kilometers.completed.length ? (
+        <ol className="kilometer-completed" ref={completedListRef} aria-label="Completed kilometres" tabIndex={0}>
+          {kilometers.completed.map((split) => (
+            <li key={split.km}>
+              <span>KM {split.km}</span>
+              <strong>{showTimes ? formatDuration(Math.round(split.durationSeconds)) : "Complete"}</strong>
+              {showTimes ? <small>{formatDuration(Math.round(split.elapsedSeconds))} total</small> : null}
+            </li>
+          ))}
+        </ol>
+      ) : <small>Completed kilometres appear here automatically.</small>}
     </section>
   );
 }
@@ -3675,12 +3892,10 @@ function LiveNoteForm({
       <div className="paired-fields">
         <label>
           Type
-          <select value={noteType} onChange={(event) => setNoteType(event.target.value as InRunNote["note_type"])}>
-            <option value="run_observation">run observation</option>
-            <option value="app_feedback">app feedback</option>
-            <option value="route_note">route note</option>
-            <option value="other">other</option>
-          </select>
+          <select data-session-target="note-type"  value={noteType} onChange={(event) => setNoteType(event.target.value as InRunNote["note_type"])}><option data-session-value="run_observation"  value="run_observation" >run observation</option>
+          <option data-session-value="app_feedback"  value="app_feedback" >app feedback</option>
+          <option data-session-value="route_note"  value="route_note" >route note</option>
+          <option data-session-value="other"  value="other" >other</option></select>
         </label>
       </div>
       <div className="tag-grid">
@@ -3705,7 +3920,7 @@ function LiveNoteForm({
         />
       </label>
       <section className="button-grid">
-        <button type="button" className="secondary-button" onClick={onClose}>
+        <button data-session-target="close" type="button" className="secondary-button" onClick={onClose} >
           Cancel
         </button>
         <button type="button" className="primary-button" onClick={save} disabled={!text.trim()}>
@@ -3799,17 +4014,15 @@ function StopScreen({
       </section>
 
       <section className="button-grid vertical">
-        <button type="button" className="primary-button" onClick={onContinue}>
+        <button data-session-target="continue" type="button" className="primary-button" onClick={onContinue} >
           Finish run
         </button>
-        <button type="button" className="secondary-button" onClick={onResume}>
-          <RefreshCw size={18} />
-          Resume run
-        </button>
-        <button type="button" className="danger-button" onClick={onDiscard}>
-          <Trash2 size={18} />
-          Discard run
-        </button>
+        <button data-session-target="resume-run" type="button" className="secondary-button" onClick={onResume} ><RefreshCw size={18} />
+        Resume run
+                </button>
+        <button data-session-target="discard-run" type="button" className="danger-button" onClick={onDiscard} ><Trash2 size={18} />
+        Discard run
+                </button>
       </section>
     </section>
   );
@@ -3898,25 +4111,20 @@ function PostRunScreen({
       <section className="form-panel">
         <label>
           How did it feel?
-          <select
-            value={postRun.perceived_effort_simple}
-            onChange={(event) => {
-              const effort = event.target.value as SimpleEffort;
-              const fallbackRpe = rpeFromSimpleEffort(effort);
-              updatePostRun({
-                perceived_effort_simple: effort,
-                rpe_1_to_10: fallbackRpe,
-                rpe_estimation_source: fallbackRpe === null ? "not_answered" : "simple_effort_fallback",
-              });
-            }}
-          >
-            <option value="unknown">not sure</option>
-            <option value="easy">easy</option>
-            <option value="moderate">moderate</option>
-            <option value="hard">hard</option>
-            <option value="very_hard">very hard</option>
-            <option value="max">max</option>
-          </select>
+          <select data-session-target="post_run.perceived_effort_simple"  value={postRun.perceived_effort_simple} onChange={(event) => {
+            const effort = event.target.value as SimpleEffort;
+            const fallbackRpe = rpeFromSimpleEffort(effort);
+            updatePostRun({
+              perceived_effort_simple: effort,
+              rpe_1_to_10: fallbackRpe,
+              rpe_estimation_source: fallbackRpe === null ? "not_answered" : "simple_effort_fallback",
+            });
+          }}><option data-session-value="unknown"  value="unknown" >not sure</option>
+          <option data-session-value="easy"  value="easy" >easy</option>
+          <option data-session-value="moderate"  value="moderate" >moderate</option>
+          <option data-session-value="hard"  value="hard" >hard</option>
+          <option data-session-value="very_hard"  value="very_hard" >very hard</option>
+          <option data-session-value="max"  value="max" >max</option></select>
         </label>
 
         <details className="preflight-panel">
@@ -3938,50 +4146,31 @@ function PostRunScreen({
 
         <label>
           RPE
-          <select
-            value={postRun.rpe_1_to_10 ?? ""}
-            onChange={(event) => {
-              const value = numberFromInput(event.target.value);
-              updatePostRun({
-                rpe_1_to_10: value,
-                rpe_estimation_source: value === null ? "not_answered" : "manual",
-              });
-            }}
-          >
-            <option value="">unknown</option>
-            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((value) => (
-              <option key={value} value={value}>
-                {value}
-              </option>
-            ))}
-          </select>
+          <select data-session-target="post_run.rpe_1_to_10"  value={postRun.rpe_1_to_10 ?? ""} onChange={(event) => {
+            const value = numberFromInput(event.target.value);
+            updatePostRun({
+              rpe_1_to_10: value,
+              rpe_estimation_source: value === null ? "not_answered" : "manual",
+            });
+          }}><option data-session-value=""  value="" >unknown</option>
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((value) => (
+            <option data-session-value={value} key={value} value={value} >{value}</option>
+          ))}</select>
         </label>
 
         <label>
           Energy after
-          <select
-            value={postRun.energy_after_run_1_to_5 ?? ""}
-            onChange={(event) =>
-              updatePostRun({ energy_after_run_1_to_5: numberFromInput(event.target.value) })
-            }
-          >
-            <option value="">unknown</option>
-            {[1, 2, 3, 4, 5].map((value) => (
-              <option key={value} value={value}>
-                {value}
-              </option>
-            ))}
-          </select>
+          <select data-session-target="post_run.energy_after_run_1_to_5"  value={postRun.energy_after_run_1_to_5 ?? ""} onChange={(event) =>
+            updatePostRun({ energy_after_run_1_to_5: numberFromInput(event.target.value) })
+          }><option data-session-value=""  value="" >unknown</option>
+          {[1, 2, 3, 4, 5].map((value) => (
+            <option data-session-value={value} key={value} value={value} >{value}</option>
+          ))}</select>
         </label>
 
         <label>
           Soreness after
-          <select
-            value={postRun.soreness_after_run}
-            onChange={(event) => updatePostRun({ soreness_after_run: event.target.value as SorenessLevel })}
-          >
-            <SorenessOptions includeUnknown />
-          </select>
+          <select data-session-target="post_run.soreness_after_run"  value={postRun.soreness_after_run} onChange={(event) => updatePostRun({ soreness_after_run: event.target.value as SorenessLevel })}><SorenessOptions includeUnknown /></select>
         </label>
         </details>
 
@@ -4001,86 +4190,59 @@ function PostRunScreen({
           <div className="paired-fields">
             <label>
               Pain location
-              <input
-                value={postRun.pain_after_run.location ?? ""}
-                onChange={(event) => updatePostRunPain({ location: event.target.value || null })}
-              />
+              <input data-session-target="post_run.pain_after_run.location"  value={postRun.pain_after_run.location ?? ""} onChange={(event) => updatePostRunPain({ location: event.target.value || null })}/>
             </label>
             <label>
               Pain severity
-              <input
-                type="number"
-                min="1"
-                max="10"
-                inputMode="numeric"
-                value={postRun.pain_after_run.severity_1_to_10 ?? ""}
-                onChange={(event) =>
-                  updatePostRunPain({ severity_1_to_10: numberFromInput(event.target.value) })
-                }
-              />
+              <input data-session-target="post_run.pain_after_run.severity_1_to_10" type="number"
+              min="1"
+              max="10"
+              inputMode="numeric" value={postRun.pain_after_run.severity_1_to_10 ?? ""} onChange={(event) =>
+                updatePostRunPain({ severity_1_to_10: numberFromInput(event.target.value) })
+              }/>
             </label>
           </div>
         ) : null}
 
         <label>
           Primary limiter
-          <select
-            value={postRun.primary_limiter}
-            onChange={(event) => updatePostRun({ primary_limiter: event.target.value as PrimaryLimiter })}
-          >
-            <option value="unknown">unknown</option>
-            <option value="breathing">breathing</option>
-            <option value="legs">legs</option>
-            <option value="heat">heat</option>
-            <option value="hills">hills</option>
-            <option value="pacing">pacing</option>
-            <option value="motivation">motivation</option>
-            <option value="time">time</option>
-            <option value="other">other</option>
-          </select>
+          <select data-session-target="post_run.primary_limiter"  value={postRun.primary_limiter} onChange={(event) => updatePostRun({ primary_limiter: event.target.value as PrimaryLimiter })}><option data-session-value="unknown"  value="unknown" >unknown</option>
+          <option data-session-value="breathing"  value="breathing" >breathing</option>
+          <option data-session-value="legs"  value="legs" >legs</option>
+          <option data-session-value="heat"  value="heat" >heat</option>
+          <option data-session-value="hills"  value="hills" >hills</option>
+          <option data-session-value="pacing"  value="pacing" >pacing</option>
+          <option data-session-value="motivation"  value="motivation" >motivation</option>
+          <option data-session-value="time"  value="time" >time</option>
+          <option data-session-value="other"  value="other" >other</option></select>
         </label>
 
         <label>
           Interruptions
-          <select
-            value={postRun.interruption}
-            onChange={(event) => updatePostRun({ interruption: event.target.value as Interruption })}
-          >
-            <option value="none">none</option>
-            <option value="traffic">traffic</option>
-            <option value="crowd">crowd</option>
-            <option value="GPS issue">GPS issue</option>
-            <option value="bathroom">bathroom</option>
-            <option value="other">other</option>
-          </select>
+          <select data-session-target="post_run.interruption"  value={postRun.interruption} onChange={(event) => updatePostRun({ interruption: event.target.value as Interruption })}><option data-session-value="none"  value="none" >none</option>
+          <option data-session-value="traffic"  value="traffic" >traffic</option>
+          <option data-session-value="crowd"  value="crowd" >crowd</option>
+          <option data-session-value="GPS issue"  value="GPS issue" >GPS issue</option>
+          <option data-session-value="bathroom"  value="bathroom" >bathroom</option>
+          <option data-session-value="other"  value="other" >other</option></select>
         </label>
 
         <div className="paired-fields">
           <label>
             Started too fast?
-            <select
-              value={postRun.started_too_fast}
-              onChange={(event) => updatePostRun({ started_too_fast: event.target.value as YesNoUnsure })}
-            >
-              <option value="unknown">unknown</option>
-              <option value="yes">yes</option>
-              <option value="no">no</option>
-              <option value="unsure">unsure</option>
-            </select>
+            <select data-session-target="post_run.started_too_fast"  value={postRun.started_too_fast} onChange={(event) => updatePostRun({ started_too_fast: event.target.value as YesNoUnsure })}><option data-session-value="unknown"  value="unknown" >unknown</option>
+            <option data-session-value="yes"  value="yes" >yes</option>
+            <option data-session-value="no"  value="no" >no</option>
+            <option data-session-value="unsure"  value="unsure" >unsure</option></select>
           </label>
           <label>
             Final third harder?
-            <select
-              value={postRun.final_third_harder_than_expected}
-              onChange={(event) =>
-                updatePostRun({ final_third_harder_than_expected: event.target.value as YesNoUnsure })
-              }
-            >
-              <option value="unknown">unknown</option>
-              <option value="yes">yes</option>
-              <option value="no">no</option>
-              <option value="unsure">unsure</option>
-            </select>
+            <select data-session-target="post_run.final_third_harder_than_expected"  value={postRun.final_third_harder_than_expected} onChange={(event) =>
+              updatePostRun({ final_third_harder_than_expected: event.target.value as YesNoUnsure })
+            }><option data-session-value="unknown"  value="unknown" >unknown</option>
+            <option data-session-value="yes"  value="yes" >yes</option>
+            <option data-session-value="no"  value="no" >no</option>
+            <option data-session-value="unsure"  value="unsure" >unsure</option></select>
           </label>
         </div>
 
@@ -4105,11 +4267,9 @@ function PostRunScreen({
                       value={typeof value === "number" ? String(value) : ""}
                       onChange={(event) => answer(event.target.value === "" ? null : Number(event.target.value))}
                     >
-                      <option value="">—</option>
+                      <option data-session-value=""  value="" >—</option>
                       {[1, 2, 3, 4, 5].map((n) => (
-                        <option key={n} value={n}>
-                          {n}
-                        </option>
+                        <option data-session-value={n} key={n} value={n} >{n}</option>
                       ))}
                     </select>
                   ) : (
@@ -4117,10 +4277,10 @@ function PostRunScreen({
                       value={typeof value === "string" ? value : ""}
                       onChange={(event) => answer(event.target.value === "" ? null : event.target.value)}
                     >
-                      <option value="">—</option>
-                      <option value="yes">yes</option>
-                      <option value="no">no</option>
-                      <option value="unsure">unsure</option>
+                      <option data-session-value=""  value="" >—</option>
+                      <option data-session-value="yes"  value="yes" >yes</option>
+                      <option data-session-value="no"  value="no" >no</option>
+                      <option data-session-value="unsure"  value="unsure" >unsure</option>
                     </select>
                   )}
                 </label>
@@ -4134,52 +4294,35 @@ function PostRunScreen({
         <div className="paired-fields">
           <label>
             Immediate pulse
-            <input
-              type="number"
-              min="1"
-              inputMode="numeric"
-              value={postRun.immediate_pulse_bpm_manual ?? ""}
-              onChange={(event) => updatePostRun({ immediate_pulse_bpm_manual: numberFromInput(event.target.value) })}
-            />
+            <input data-session-target="post_run.immediate_pulse_bpm_manual" type="number"
+            min="1"
+            inputMode="numeric" value={postRun.immediate_pulse_bpm_manual ?? ""} onChange={(event) => updatePostRun({ immediate_pulse_bpm_manual: numberFromInput(event.target.value) })}/>
           </label>
           <label>
             Pulse 3-5 min
-            <input
-              type="number"
-              min="1"
-              inputMode="numeric"
-              value={postRun.pulse_after_3_to_5_min_bpm_manual ?? ""}
-              onChange={(event) =>
-                updatePostRun({ pulse_after_3_to_5_min_bpm_manual: numberFromInput(event.target.value) })
-              }
-            />
+            <input data-session-target="post_run.pulse_after_3_to_5_min_bpm_manual" type="number"
+            min="1"
+            inputMode="numeric" value={postRun.pulse_after_3_to_5_min_bpm_manual ?? ""} onChange={(event) =>
+              updatePostRun({ pulse_after_3_to_5_min_bpm_manual: numberFromInput(event.target.value) })
+            }/>
           </label>
         </div>
 
         <label>
           Breathing recovered after
-          <select
-            value={postRun.breathing_recovered_after}
-            onChange={(event) =>
-              updatePostRun({ breathing_recovered_after: event.target.value as BreathingRecoveredAfter })
-            }
-          >
-            <option value="unknown">unknown</option>
-            <option value="<1 min">&lt;1 min</option>
-            <option value="1-3 min">1-3 min</option>
-            <option value="3-5 min">3-5 min</option>
-            <option value=">5 min">&gt;5 min</option>
-          </select>
+          <select data-session-target="post_run.breathing_recovered_after"  value={postRun.breathing_recovered_after} onChange={(event) =>
+            updatePostRun({ breathing_recovered_after: event.target.value as BreathingRecoveredAfter })
+          }><option data-session-value="unknown"  value="unknown" >unknown</option>
+          <option data-session-value="<1 min"  value="<1 min" >&lt;1 min</option>
+          <option data-session-value="1-3 min"  value="1-3 min" >1-3 min</option>
+          <option data-session-value="3-5 min"  value="3-5 min" >3-5 min</option>
+          <option data-session-value=">5 min"  value=">5 min" >&gt;5 min</option></select>
         </label>
         </details>
 
         <label>
           Post-run note
-          <textarea
-            rows={4}
-            value={postRun.free_text}
-            onChange={(event) => updatePostRun({ free_text: event.target.value })}
-          />
+          <textarea data-session-target="post_run.free_text" rows={4} value={postRun.free_text} onChange={(event) => updatePostRun({ free_text: event.target.value })}/>
         </label>
 
       </section>
@@ -4259,20 +4402,15 @@ function ExportScreen({
         <button type="button" className="primary-button full-width-button" onClick={onDone}>Done — back to runs</button>
       </section>
       {historyActions.labConfigured ? (
-        <button type="button" className="secondary-button" onClick={historyActions.onSyncToLab}
-          disabled={historyActions.labSync.status === "syncing"}>
-          <RefreshCw size={18} />{historyActions.labSync.status === "syncing" ? "Syncing…" : "Sync to lab"}
-        </button>
+        <button data-session-target="sync-lab" type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={historyActions.labSync.status === "syncing"}><RefreshCw size={18} />{historyActions.labSync.status === "syncing" ? "Syncing…" : "Sync to lab"}</button>
       ) : null}
       <section className="form-panel export-actions-panel">
         <h3>Download a copy</h3>
         <label>File format
-          <select value={format} onChange={(event) => setFormat(event.target.value as typeof format)}>
-            <option value="json">JSON — full run{exportArtifacts ? ` (${formatBytes(exportArtifacts.json_bytes)})` : ""}</option>
-            <option value="zip">ZIP — compressed bundle{exportArtifacts ? ` (${formatBytes(exportArtifacts.zip_bytes.byteLength)})` : ""}</option>
-            <option value="msgpack">MessagePack — compact data{exportArtifacts ? ` (${formatBytes(exportArtifacts.msgpack_bytes.byteLength)})` : ""}</option>
-            <option value="summary">Coach summary{exportArtifacts ? ` (${formatBytes(exportArtifacts.coach_summary_bytes)})` : ""}</option>
-          </select>
+          <select data-session-target="export-format"  value={format} onChange={(event) => setFormat(event.target.value as typeof format)}><option data-session-value="json"  value="json" >JSON — full run{exportArtifacts ? ` (${formatBytes(exportArtifacts.json_bytes)})` : ""}</option>
+          <option data-session-value="zip"  value="zip" >ZIP — compressed bundle{exportArtifacts ? ` (${formatBytes(exportArtifacts.zip_bytes.byteLength)})` : ""}</option>
+          <option data-session-value="msgpack"  value="msgpack" >MessagePack — compact data{exportArtifacts ? ` (${formatBytes(exportArtifacts.msgpack_bytes.byteLength)})` : ""}</option>
+          <option data-session-value="summary"  value="summary" >Coach summary{exportArtifacts ? ` (${formatBytes(exportArtifacts.coach_summary_bytes)})` : ""}</option></select>
         </label>
         <button type="button" className="secondary-button" onClick={download}><Download size={18} />Download {label}</button>
         <details className="export-more">
@@ -4312,7 +4450,7 @@ function ExportScreen({
       <RunHistoryPanel entries={runHistory} actions={historyActions} currentHistoryId={exportPayload?.run_metadata.run_id as string | undefined} />
       <div className="button-grid">
         <button type="button" className="secondary-button" onClick={onBackToPost}>Edit post-run</button>
-        <button type="button" className="link-button" onClick={onDiscard}>Clear local draft</button>
+        <button data-session-target="discard-run" type="button" className="link-button" onClick={onDiscard} >Clear local draft</button>
       </div>
     </section>
   );
@@ -4579,11 +4717,11 @@ function ReadonlyField({ label, value }: { label: string; value: string }) {
 function SorenessOptions({ includeUnknown = false }: { includeUnknown?: boolean }) {
   return (
     <>
-      {includeUnknown ? <option value="unknown">unknown</option> : null}
-      <option value="none">none</option>
-      <option value="mild">mild</option>
-      <option value="moderate">moderate</option>
-      <option value="severe">severe</option>
+      {includeUnknown ? <option data-session-value="unknown"  value="unknown" >unknown</option> : null}
+      <option data-session-value="none"  value="none" >none</option>
+      <option data-session-value="mild"  value="mild" >mild</option>
+      <option data-session-value="moderate"  value="moderate" >moderate</option>
+      <option data-session-value="severe"  value="severe" >severe</option>
     </>
   );
 }
@@ -4622,7 +4760,10 @@ function applyRunModeDefaults(preRun: PreRunState, mode: RunMode): PreRunState {
 }
 
 function runAlreadyExported(run: ActiveRun): boolean {
-  return loadRunHistoryIndex().some((entry) => entry.run_id === run.run_metadata.run_id);
+  const draftSavedAt = Date.parse(run.last_saved_at_utc);
+  return loadRunHistoryIndex().some((entry) =>
+    entry.run_id === run.run_metadata.run_id && Date.parse(entry.created_at_utc) >= draftSavedAt,
+  );
 }
 
 function loadStoredRun(): ActiveRun | null {
@@ -4641,23 +4782,6 @@ function loadStoredRun(): ActiveRun | null {
   }
 }
 
-function openRunDatabase(): Promise<IDBDatabase | null> {
-  if (!("indexedDB" in window)) {
-    return Promise.resolve(null);
-  }
-  return new Promise((resolve) => {
-    const request = indexedDB.open(IDB_DB_NAME, 1);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(IDB_STORE_NAME)) {
-        db.createObjectStore(IDB_STORE_NAME);
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => resolve(null);
-    request.onblocked = () => resolve(null);
-  });
-}
 
 async function saveRunToIndexedDb(run: ActiveRun): Promise<void> {
   const db = await openRunDatabase();
@@ -4680,25 +4804,8 @@ async function saveRunToIndexedDb(run: ActiveRun): Promise<void> {
 }
 
 async function loadRunFromIndexedDb(): Promise<ActiveRun | null> {
-  const db = await openRunDatabase();
-  if (!db) {
-    return null;
-  }
-  try {
-    const value = await new Promise<Partial<ActiveRun> | null>((resolve) => {
-      const transaction = db.transaction(IDB_STORE_NAME, "readonly");
-      transaction.onerror = () => resolve(null);
-      transaction.onabort = () => resolve(null);
-      const request = transaction.objectStore(IDB_STORE_NAME).get(IDB_ACTIVE_RUN_KEY);
-      request.onsuccess = () => resolve((request.result as Partial<ActiveRun> | undefined) ?? null);
-      request.onerror = () => resolve(null);
-    });
-    return value ? normalizeStoredRun(value) : null;
-  } catch {
-    return null;
-  } finally {
-    db.close();
-  }
+  const value = await getRunDatabaseValue<Partial<ActiveRun>>(IDB_ACTIVE_RUN_KEY);
+  return value ? normalizeStoredRun(value) : null;
 }
 
 async function deleteRunFromIndexedDb(): Promise<void> {
@@ -4721,66 +4828,8 @@ async function deleteRunFromIndexedDb(): Promise<void> {
   }
 }
 
-async function putRunDatabaseValue(key: string, value: unknown): Promise<boolean> {
-  const db = await openRunDatabase();
-  if (!db) {
-    return false;
-  }
-  try {
-    return await new Promise<boolean>((resolve) => {
-      const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
-      transaction.objectStore(IDB_STORE_NAME).put(value, key);
-      transaction.oncomplete = () => resolve(true);
-      transaction.onerror = () => resolve(false);
-      transaction.onabort = () => resolve(false);
-    });
-  } catch {
-    return false;
-  } finally {
-    db.close();
-  }
-}
 
-async function getRunDatabaseValue<T>(key: string): Promise<T | null> {
-  const db = await openRunDatabase();
-  if (!db) {
-    return null;
-  }
-  try {
-    return await new Promise<T | null>((resolve) => {
-      const transaction = db.transaction(IDB_STORE_NAME, "readonly");
-      transaction.onerror = () => resolve(null);
-      transaction.onabort = () => resolve(null);
-      const request = transaction.objectStore(IDB_STORE_NAME).get(key);
-      request.onsuccess = () => resolve((request.result as T | undefined) ?? null);
-      request.onerror = () => resolve(null);
-    });
-  } catch {
-    return null;
-  } finally {
-    db.close();
-  }
-}
 
-async function deleteRunDatabaseValue(key: string): Promise<boolean> {
-  const db = await openRunDatabase();
-  if (!db) {
-    return false;
-  }
-  try {
-    return await new Promise<boolean>((resolve) => {
-      const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
-      transaction.objectStore(IDB_STORE_NAME).delete(key);
-      transaction.oncomplete = () => resolve(true);
-      transaction.onerror = () => resolve(false);
-      transaction.onabort = () => resolve(false);
-    });
-  } catch {
-    return false;
-  } finally {
-    db.close();
-  }
-}
 
 function loadRunHistoryIndex(): RunHistoryEntry[] {
   try {
@@ -4849,7 +4898,7 @@ function normalizeLabEndpoint(value: string): string {
   }
 }
 
-type ProbeResult = "reachable" | "blocked" | "unreachable";
+type ProbeResult = { status: "reachable" | "blocked" | "unreachable"; sessionSchema: string | null };
 
 /**
  * "blocked": the browser refused the request outright (mixed content, CORS,
@@ -4863,16 +4912,16 @@ async function probeLabEndpoint(endpoint: string, timeoutMs = 4000): Promise<Pro
   const startedAt = performance.now();
   try {
     const response = await fetch(`${endpoint}/api/runs/ping`, { signal: controller.signal });
-    if (!response.ok) return "unreachable";
+    if (!response.ok) return { status: "unreachable", sessionSchema: null };
     const acknowledgement = await response.json();
-    return acknowledgement?.ok === true ? "reachable" : "unreachable";
+    return { status: acknowledgement?.ok === true ? "reachable" : "unreachable", sessionSchema: acknowledgement?.app_session_schema ?? null };
   } catch (error) {
-    if (error instanceof SyntaxError) return "unreachable";
+    if (error instanceof SyntaxError) return { status: "unreachable", sessionSchema: null };
     if (error instanceof DOMException && error.name === "AbortError") {
-      return "unreachable";
+      return { status: "unreachable", sessionSchema: null };
     }
     // A policy refusal is synchronous-ish; a dead host takes the TCP timeout.
-    return performance.now() - startedAt < 1500 ? "blocked" : "unreachable";
+    return { status: performance.now() - startedAt < 1500 ? "blocked" : "unreachable", sessionSchema: null };
   } finally {
     window.clearTimeout(timeoutId);
   }
@@ -4880,7 +4929,7 @@ async function probeLabEndpoint(endpoint: string, timeoutMs = 4000): Promise<Pro
 
 type UploadResult = "stored" | "rejected" | "failed";
 
-async function postToLab(url: string, body: string, timeoutMs = 60000): Promise<UploadResult> {
+async function postToLab(url: string, body: string, timeoutMs = 60000, expectedSession?: Pick<AppSessionChunk, "chunk_id" | "session_id">): Promise<UploadResult> {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -4892,6 +4941,7 @@ async function postToLab(url: string, body: string, timeoutMs = 60000): Promise<
     });
     if (response.ok) {
       const acknowledgement = await response.json();
+      if (expectedSession && (acknowledgement?.chunk_id !== expectedSession.chunk_id || acknowledgement?.session_id !== expectedSession.session_id)) return "failed";
       return acknowledgement?.ok === true ? "stored" : "failed";
     }
     // Rate limits and request timeouts are transient, not permanent rejection.
@@ -4966,7 +5016,7 @@ function markVoiceNoteSynced(noteId: string) {
   if (marked) void deleteRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`);
 }
 
-function describePendingItems(runCount: number, noteCount: number): string {
+function describePendingItems(runCount: number, noteCount: number, sessionCount = 0): string {
   const parts: string[] = [];
   if (runCount > 0) {
     parts.push(`${runCount} run${runCount === 1 ? "" : "s"}`);
@@ -4974,6 +5024,7 @@ function describePendingItems(runCount: number, noteCount: number): string {
   if (noteCount > 0) {
     parts.push(`${noteCount} note${noteCount === 1 ? "" : "s"}`);
   }
+  if (sessionCount > 0) parts.push(`${sessionCount} detail chunk${sessionCount === 1 ? "" : "s"}`);
   return parts.join(" + ") || "nothing";
 }
 
@@ -5030,7 +5081,7 @@ interface HandoverNote {
 }
 
 interface HandoverIssue {
-  kind: "run" | "note";
+  kind: "run" | "note" | "session";
   id: string;
   reason: string;
 }
@@ -5039,15 +5090,18 @@ async function packRunsForLabHandover(
   endpoint: string,
   pending: RunHistoryEntry[],
   pendingNotes: VoiceNoteEntry[] = [],
+  pendingSessions: AppSessionChunk[] = [],
+  handoverId?: string,
 ): Promise<{ url: string; count: number; issues: HandoverIssue[] }> {
   // The payload rides the URL fragment: unlike window.name it survives every
   // navigation context (installed-PWA Custom Tabs clear window.name).
   const returnTo = `${window.location.origin}${window.location.pathname}`;
   const runs: Array<{ id: string; payload: ExportPayload }> = [];
   const notes: HandoverNote[] = [];
+  const sessions: Array<{ id: string; payload: AppSessionChunk }> = [];
   let encoded = "";
   const pack = () =>
-    bytesToBase64Url(deflateSync(strToU8(JSON.stringify({ v: 1, returnTo, runs, notes }))));
+    bytesToBase64Url(deflateSync(strToU8(JSON.stringify({ v: 1, returnTo, handover_id: handoverId, runs, notes, sessions }))));
   const issues: HandoverIssue[] = [];
   const tooLarge = "too large for the handover link — retry with local network access allowed";
   for (const entry of pending) {
@@ -5095,8 +5149,22 @@ async function packRunsForLabHandover(
     }
     encoded = packed;
   }
-  const count = runs.length + notes.length;
-  if (count === 0 && pending.length + pendingNotes.length > 0) {
+  for (const chunk of pendingSessions) {
+    sessions.push({ id: chunk.chunk_id, payload: chunk });
+    const packed = pack();
+    if (packed.length > LAB_HANDOVER_FRAGMENT_BUDGET && runs.length + notes.length + sessions.length > 1) {
+      sessions.pop();
+      break;
+    }
+    if (packed.length > LAB_HANDOVER_FRAGMENT_MAX) {
+      sessions.pop();
+      issues.push({ kind: "session", id: chunk.chunk_id, reason: tooLarge });
+      continue;
+    }
+    encoded = packed;
+  }
+  const count = runs.length + notes.length + sessions.length;
+  if (count === 0 && pending.length + pendingNotes.length + pendingSessions.length > 0) {
     return { url: "", count: 0, issues };
   }
   // An empty batch is a valid protocol-only check-in with the receiver.
@@ -5236,6 +5304,8 @@ function normalizeStoredRun(run: Partial<ActiveRun>): ActiveRun | null {
     },
     gps_points: run.gps_points ?? [],
     motion_windows: run.motion_windows ?? [],
+    app_session_ids: run.app_session_ids ?? [],
+    coach_sensors: run.coach_sensors ?? {},
     checkpoints: run.checkpoints ?? [],
     in_run_notes: run.in_run_notes ?? [],
     data_quality_notes: run.data_quality_notes ?? [],
@@ -5354,6 +5424,8 @@ function buildCompactCoachSummary(exportPayload: ExportPayload) {
     route_confirmation_prompt: exportPayload.route_confirmation_prompt,
     in_run_notes: exportPayload.in_run_notes,
     selfie_biometrics: exportPayload.post_run.selfie_biometrics ?? null,
+    app_session_ids: exportPayload.app_session_ids ?? [],
+    coach_sensors: exportPayload.coach_sensors ?? {},
     data_quality_notes: exportPayload.data_quality_notes,
   };
 }
@@ -5660,30 +5732,11 @@ function isWarmupGpsReady(point: GpsPoint | null, accuracy: number | null): bool
 }
 
 
-function computeControlledStartStatus(points: GpsPoint[], bands: readonly PlanBand[]) {
-  if (points.length < 2) {
-    return {
-      band: bands.find((band) => band.km === 1) ?? CONTROLLED_START_BANDS[0],
-      currentSplitSecondsPerKm: null,
-      status: "warming",
-      statusLabel: "Finding pace",
-    };
-  }
-  const track = buildAppTrack(points);
-  const latest = track[track.length - 1];
-  const currentKm = Math.max(1, Math.floor(latest.cumulative_meters / 1000) + 1);
+function computeControlledStartStatus(kilometers: LiveKilometers, bands: readonly PlanBand[]) {
+  const currentKm = kilometers.current.km;
   const band = bands.find((candidate) => candidate.km === currentKm) ??
     { km: currentKm, label: `Km ${currentKm}`, minSecondsPerKm: null, maxSecondsPerKm: null, text: "free pace" };
-  const kmStartDistance = (currentKm - 1) * 1000;
-  // Km 1 is measured from when the runner actually moved (first 10 m), not from
-  // the end of the countdown: a standing start must not read as "too slow".
-  const movingStart = currentKm === 1 ? track.find((point) => point.cumulative_meters >= 10) ?? track[0] : null;
-  const kmStartElapsed =
-    movingStart?.t_elapsed_seconds ?? elapsedAtDistanceForApp(track, kmStartDistance) ?? track[0].t_elapsed_seconds;
-  const kmStartMeters = movingStart?.cumulative_meters ?? kmStartDistance;
-  const splitDistance = Math.max(0, latest.cumulative_meters - kmStartMeters);
-  const splitElapsed = Math.max(0, latest.t_elapsed_seconds - kmStartElapsed);
-  const currentSplitSecondsPerKm = splitDistance >= 50 ? splitElapsed / (splitDistance / 1000) : null;
+  const currentSplitSecondsPerKm = kilometers.current.paceSecondsPerKm;
   const inBand =
     currentSplitSecondsPerKm !== null &&
     band.minSecondsPerKm !== null &&
@@ -5707,37 +5760,7 @@ function computeControlledStartStatus(points: GpsPoint[], bands: readonly PlanBa
   };
 }
 
-function buildAppTrack(points: GpsPoint[]): Array<GpsPoint & { cumulative_meters: number }> {
-  let cumulative = 0;
-  return points.map((point, index) => {
-    if (index > 0 && !point.impossible_speed && !point.possible_gps_jump) {
-      cumulative += haversineMetersForApp(points[index - 1], point);
-    }
-    return { ...point, cumulative_meters: cumulative };
-  });
-}
 
-function elapsedAtDistanceForApp(
-  track: Array<GpsPoint & { cumulative_meters: number }>,
-  distanceMeters: number,
-): number | null {
-  if (track.length === 0) {
-    return null;
-  }
-  if (distanceMeters <= 0) {
-    return track[0].t_elapsed_seconds;
-  }
-  for (let i = 1; i < track.length; i += 1) {
-    const previous = track[i - 1];
-    const current = track[i];
-    if (current.cumulative_meters < distanceMeters || current.cumulative_meters === previous.cumulative_meters) {
-      continue;
-    }
-    const ratio = (distanceMeters - previous.cumulative_meters) / (current.cumulative_meters - previous.cumulative_meters);
-    return previous.t_elapsed_seconds + (current.t_elapsed_seconds - previous.t_elapsed_seconds) * ratio;
-  }
-  return null;
-}
 
 function permissionLabel(value: string): string {
   return value === "ready" || value === "denied" || value === "unavailable" ? value : "unknown";

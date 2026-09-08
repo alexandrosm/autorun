@@ -73,11 +73,14 @@ function worker() {
       }
     },
   };
+  const windows = [{ id: "home", url: scope }];
+  let activatedEarly = false;
   vm.runInNewContext(source, {
     self: {
       registration: { scope },
       location: { origin: new URL(scope).origin },
-      clients: { claim: async () => {} },
+      clients: { claim: async () => {}, matchAll: async () => windows },
+      skipWaiting: async () => { activatedEarly = true; },
       addEventListener: (event, handler) => handlers.set(event, handler),
     },
     caches, fetch, URL, Response,
@@ -96,7 +99,7 @@ function worker() {
   };
   const request = (url, mode = "cors", headers = {}) =>
     dispatch("fetch", { request: { url, mode, method: "GET", headers: new Headers(headers) } });
-  return { dispatch, request, network, buckets };
+  return { dispatch, request, network, buckets, windows, activatedEarly: () => activatedEarly };
 }
 
 test("an activated update boots offline before any client has fetched its scripts or styles", async () => {
@@ -159,4 +162,41 @@ test("an incomplete shell download fails installation instead of retiring the ol
   app.network.delete(`${scope}models/blaze_face_short_range.tflite`);
   await assert.rejects(app.dispatch("install"));
   assert.equal(await app.buckets.get("greenlake-autoresearch-logger-vold").get(scope).text(), "old shell");
+});
+
+test("offline fetches use this worker's shell and assets, not another app's cache", async () => {
+  const app = worker();
+  const unrelated = app.buckets.get("other-app");
+  unrelated.set(scope, new Response("unrelated shell"));
+  unrelated.set(`${scope}assets/main.js`, new Response("unrelated script"));
+  await app.dispatch("install");
+  await app.dispatch("activate");
+  app.network.clear();
+  assert.equal(await (await app.request(scope, "navigate")).text(), shell);
+  assert.equal(await (await app.request(`${scope}assets/main.js`)).text(), "window.booted = true;");
+  assert.equal(await unrelated.get(scope).text(), "unrelated shell");
+});
+
+test("an active worker cannot borrow an uncached asset from a waiting update", async () => {
+  const app = worker();
+  await app.dispatch("install");
+  await app.dispatch("activate");
+  const url = `${scope}assets/next-release.js`;
+  app.buckets.set("greenlake-autoresearch-logger-vnext", new Map([[url, new Response("not active yet")]]));
+  app.network.clear();
+  await assert.rejects(app.request(url));
+  assert.equal(await (await app.request(scope, "navigate")).text(), shell);
+});
+
+test("a Home tab cannot activate an update while another app window remains open", async () => {
+  const app = worker();
+  const notices = [];
+  const source = { id: "home", postMessage: (message) => notices.push(message) };
+  app.windows.push({ id: "run", url: scope }, { id: "unrelated", url: "https://fixture.invalid/other/" });
+  await app.dispatch("message", { data: { type: "SKIP_WAITING" }, source });
+  assert.equal(app.activatedEarly(), false);
+  assert.equal(notices[0]?.type, "UPDATE_DEFERRED_OTHER_CLIENTS");
+  app.windows.splice(1, 1);
+  await app.dispatch("message", { data: { type: "SKIP_WAITING" }, source });
+  assert.equal(app.activatedEarly(), true);
 });

@@ -309,14 +309,14 @@ export function RunRouteMap({ points, checkpoints = EMPTY_CHECKPOINTS, units, li
     <div className={`${live ? "map-controls " : ""}route-map-controls`}>
       <div className="route-map-modes" role="group" aria-label="Route color">
         {(["plain", ...(allowSpeedColor ? ["speed" as const] : []), "elevation"] as const).map((option) => (
-          <button key={option} type="button" className="route-map-button" aria-pressed={mode === option} onClick={() => setSelectedMode(option)}>
+          <button key={option} type="button" data-session-target={`route-color.${option}`} className="route-map-button" aria-pressed={mode === option} onClick={() => setSelectedMode(option)}>
             {option === "plain" ? "Plain" : option === "speed" ? "Speed" : "Elevation"}
           </button>
         ))}
       </div>
       <div className="route-map-navigation">
-        {live ? <button type="button" className="route-map-button" aria-pressed={followLocked} onClick={resetViewport}>Lock follow</button> : null}
-        <button type="button" className="route-map-button" onClick={resetViewport}>{live ? "Reset map" : "Reset to fit"}</button>
+        {live ? <button type="button" data-session-target="map-follow" className="route-map-button" aria-pressed={followLocked} onClick={resetViewport}>Lock follow</button> : null}
+        <button type="button" data-session-target="map-reset" className="route-map-button" onClick={resetViewport}>{live ? "Reset map" : "Reset to fit"}</button>
       </div>
       <div className="route-map-legend" aria-live="polite">
         {mode !== "plain" ? <Fragment>

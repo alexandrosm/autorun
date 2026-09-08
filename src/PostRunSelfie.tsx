@@ -8,6 +8,7 @@ interface PostRunSelfieProps {
   stoppedAtUtc: string | null;
   onComplete: (result: SelfieBiometrics) => void;
   onSkip: () => void;
+  onPhaseChange?: (phase: Phase) => void;
 }
 
 type Phase = "starting" | "capturing" | "paused" | "result" | "error";
@@ -51,13 +52,15 @@ function cameraError(error: unknown): string {
   return "The camera could not start. Retry, or skip this scan.";
 }
 
-export function PostRunSelfie({ stoppedAtUtc, onComplete, onSkip }: PostRunSelfieProps) {
+export function PostRunSelfie({ stoppedAtUtc, onComplete, onSkip, onPhaseChange }: PostRunSelfieProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const samplesRef = useRef<SelfiePulseSample[]>([]);
   const sessionRef = useRef<{ stop: () => void; finish: () => void } | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [view, setView] = useState<View>(INITIAL_VIEW);
   const [result, setResult] = useState<SelfieBiometrics | null>(null);
+
+  useEffect(() => { onPhaseChange?.(view.phase); }, [view.phase, onPhaseChange]);
 
   useEffect(() => {
     const video = videoRef.current as FrameVideo | null;
@@ -379,10 +382,10 @@ export function PostRunSelfie({ stoppedAtUtc, onComplete, onSkip }: PostRunSelfi
         <p className="selfie-notice">Experimental, not a medical device. Stay seated or stand safely; do not scan while moving. No images are saved or uploaded.</p>
       </header>
       <div className="selfie-actions">
-        {done && result ? <button type="button" className="selfie-primary" onClick={() => onComplete(result)}>Continue{result.status === "estimated" ? " with reading" : " without a reading"}</button> :
-          <button type="button" className="selfie-primary" disabled={!usable} onClick={() => sessionRef.current?.finish()}>Use reading</button>}
-        {(done || failed) && <button type="button" onClick={() => { sessionRef.current?.stop(); setAttempt((value) => value + 1); }}>Retry camera scan</button>}
-        <button type="button" className="selfie-skip" onClick={skip}>{failed ? "Continue without scanning" : "Skip camera scan"}</button>
+        {done && result ? <button type="button" data-session-target="accept-selfie-result" className="selfie-primary" onClick={() => onComplete(result)}>Continue{result.status === "estimated" ? " with reading" : " without a reading"}</button> :
+          <button type="button" data-session-target="finish-selfie-scan" className="selfie-primary" disabled={!usable} onClick={() => sessionRef.current?.finish()}>Use reading</button>}
+        {(done || failed) && <button type="button" data-session-target="retry-selfie-scan" onClick={() => { sessionRef.current?.stop(); setAttempt((value) => value + 1); }}>Retry camera scan</button>}
+        <button type="button" data-session-target="skip-selfie-scan" className="selfie-skip" onClick={skip}>{failed ? "Continue without scanning" : "Skip camera scan"}</button>
       </div>
       <div className={`selfie-preview${done || failed ? " selfie-preview-ended" : ""}`}>
         <video ref={videoRef} autoPlay muted playsInline aria-label="Mirrored front-camera preview" />

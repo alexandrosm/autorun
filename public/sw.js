@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.4.0-run-feedback";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.5.0-session-capture";
 const APP_SCOPE = self.registration.scope;
 const CACHE_PREFIX = "greenlake-autoresearch-logger-";
 const STATIC_ASSET_PREFIXES = ["assets/", "mediapipe/", "models/"].map((path) => new URL(path, APP_SCOPE).href);
@@ -43,7 +43,17 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("message", (event) => {
   if (event.data?.type === "SKIP_WAITING") {
-    self.skipWaiting();
+    event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+      // A Home tab cannot retire caches underneath another tab's active run.
+      const otherAppClients = clients.some((client) =>
+        client.url.startsWith(APP_SCOPE) && client.id !== event.source?.id,
+      );
+      if (otherAppClients) {
+        event.source?.postMessage({ type: "UPDATE_DEFERRED_OTHER_CLIENTS" });
+        return;
+      }
+      return self.skipWaiting();
+    }));
   }
 });
 
@@ -63,9 +73,9 @@ self.addEventListener("fetch", (event) => {
       fetch(request)
         .then(async (response) => {
           if (response.ok) return response;
-          return (await caches.match(APP_SCOPE)) ?? response;
+          return (await (await caches.open(CACHE_NAME)).match(APP_SCOPE)) ?? response;
         })
-        .catch(async () => (await caches.match(APP_SCOPE)) ?? Response.error()),
+        .catch(async () => (await (await caches.open(CACHE_NAME)).match(APP_SCOPE)) ?? Response.error()),
     );
     return;
   }
@@ -73,9 +83,9 @@ self.addEventListener("fetch", (event) => {
   event.respondWith(
     // crossorigin scripts/styles send Origin, unlike the installer's requests.
     // These bundled files do not vary by headers; dynamic responses still may.
-    caches.match(request, {
+    caches.open(CACHE_NAME).then((cache) => cache.match(request, {
       ignoreVary: STATIC_ASSET_PREFIXES.some((prefix) => url.href.startsWith(prefix)),
-    }).then((cached) => {
+    })).then((cached) => {
       if (cached) {
         return cached;
       }

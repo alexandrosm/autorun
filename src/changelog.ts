@@ -5,6 +5,19 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.5.0",
+    notes: [
+      "Detailed session timelines link screen changes, named controls, safe choices, errors and device state to your runs. No raw typing, clipboard contents or screenshots are captured.",
+      "During runs, record phone acceleration and rotation up to 20 Hz, orientation up to 5 Hz, and ambient light where supported. Permission denials, gaps and actual sample rates remain explicit.",
+      "Session details use the existing lab sync. Large transfers continue through a finite set of lab-page trips; acknowledged chunks leave the phone.",
+      "Turn extra recording off, download pending details or clear them from Home. The bounded queue pauses capture instead of evicting unsent records; saved runs and voice notes are unaffected.",
+      "See the current kilometre, metres remaining, and each completed kilometre's split and total time while running.",
+      "Invalid GPS samples no longer inflate distance. No-fix and stale-GPS states withhold current pace.",
+      "Edited debriefs remain recoverable after a previous export; Done waits for the current revision to save.",
+      "Storage failures and blocked database opens are handled safely. Updates wait while another app window is open, and offline caches stay isolated.",
+    ],
+  },
+  {
     version: "0.4.0",
     notes: [
       "Record voice notes during a run. Notes keep their time, distance and GPS context; Stop stays reachable and saves audio already being recorded.",

@@ -178,7 +178,7 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     schema_version: "0.3.0",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.4.0",
+      version: "0.5.0",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,
@@ -261,10 +261,13 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     grounded_debrief_context: features.groundedDebriefContext,
     coach_ready_summary: features.coachReadySummary,
     patch_execution_assessment: features.patchExecutionAssessment,
+    app_session_ids: run.app_session_ids ?? [],
+    coach_sensors: run.coach_sensors ?? {},
     time_series: {
       gps_points: run.gps_points,
       analysis_points: features.analysisPoints,
       downsampled_points_5s: downsampleGps(features.analysisPoints, 5),
+      motion_windows: run.motion_windows,
     },
     post_run: exportPostRun(run.post_run),
     data_quality_notes: notes,
@@ -286,7 +289,7 @@ export function computeLiveStats(points: GpsPoint[], elapsedSeconds: number): Li
   const distanceMeters = track.length > 0 ? track[track.length - 1].cumulative_meters : 0;
   const averagePaceSecondsPerMile =
     distanceMeters > 5 && elapsedSeconds > 0 ? elapsedSeconds / (distanceMeters / METERS_PER_MILE) : null;
-  const currentPaceSecondsPerMile = computeCurrentPace(points);
+  const currentPaceSecondsPerMile = computeCurrentPace(track);
   const lastAccuracy =
     points.length > 0 ? points[points.length - 1].horizontal_accuracy_meters ?? null : null;
 
@@ -296,6 +299,52 @@ export function computeLiveStats(points: GpsPoint[], elapsedSeconds: number): Li
     averagePaceSecondsPerMile,
     currentPaceSecondsPerMile,
     lastAccuracy,
+  };
+}
+
+export interface LiveKilometers {
+  completed: Array<{ km: number; durationSeconds: number; elapsedSeconds: number }>;
+  current: { km: number; distanceMeters: number; elapsedSeconds: number; paceSecondsPerKm: number | null };
+}
+
+export function computeLiveKilometers(points: GpsPoint[], elapsedSeconds: number): LiveKilometers {
+  const track = buildTrack(points);
+  const last = track[track.length - 1];
+  const totalDistance = last?.cumulative_meters ?? 0;
+  const elapsed = Math.max(Number.isFinite(elapsedSeconds) ? elapsedSeconds : 0, last?.t_elapsed_seconds ?? 0);
+  const completed: Array<{ km: number; durationSeconds: number; elapsedSeconds: number }> = [];
+  let previousCrossing = 0;
+  let crossingIndex = 1;
+  let km = 1;
+
+  while (km * METERS_PER_KM <= totalDistance) {
+    const boundary = km * METERS_PER_KM;
+    while (crossingIndex < track.length && track[crossingIndex].cumulative_meters < boundary) {
+      crossingIndex += 1;
+    }
+    const crossing = stateAtDistance(track, boundary, crossingIndex);
+    if (!crossing) {
+      break;
+    }
+    completed.push({
+      km,
+      durationSeconds: crossing.elapsed - previousCrossing,
+      elapsedSeconds: crossing.elapsed,
+    });
+    previousCrossing = crossing.elapsed;
+    km += 1;
+  }
+
+  const distanceMeters = totalDistance - completed.length * METERS_PER_KM;
+  const currentElapsed = Math.max(0, elapsed - previousCrossing);
+  return {
+    completed,
+    current: {
+      km,
+      distanceMeters,
+      elapsedSeconds: currentElapsed,
+      paceSecondsPerKm: distanceMeters >= 50 && currentElapsed > 0 ? currentElapsed / (distanceMeters / METERS_PER_KM) : null,
+    },
   };
 }
 
@@ -552,19 +601,27 @@ function computeFeatures(run: ActiveRun) {
 }
 
 function buildTrack(points: GpsPoint[]): TrackPoint[] {
-  if (points.length === 0) {
-    return [];
-  }
-
   let cumulative = 0;
-  const track: TrackPoint[] = [{ ...points[0], cumulative_meters: 0 }];
+  let previous: GpsPoint | null = null;
+  const track: TrackPoint[] = [];
 
-  for (let i = 1; i < points.length; i += 1) {
-    const previous = points[i - 1];
-    const current = points[i];
-    const segmentMeters = isExcludedSegment(current) ? 0 : haversineMeters(previous, current);
-    cumulative += segmentMeters;
+  for (const current of points) {
+    const lastElapsed = track[track.length - 1]?.t_elapsed_seconds;
+    if (
+      !Number.isFinite(current.t_elapsed_seconds) || current.t_elapsed_seconds < 0 ||
+      !Number.isFinite(current.lat) || Math.abs(current.lat) > 90 ||
+      !Number.isFinite(current.lon) || Math.abs(current.lon) > 180 ||
+      (lastElapsed !== undefined && current.t_elapsed_seconds <= lastElapsed)
+    ) {
+      // Invalid samples cannot add distance or anchor the next segment.
+      previous = null;
+      continue;
+    }
+    if (previous && !isExcludedSegment(current)) {
+      cumulative += haversineMeters(previous, current);
+    }
     track.push({ ...current, cumulative_meters: cumulative });
+    previous = current;
   }
 
   return track;
@@ -1290,7 +1347,7 @@ function emptySplit(name: string): SplitFeature {
   };
 }
 
-function stateAtDistance(track: TrackPoint[], distanceMeters: number): TrackStateAtDistance | null {
+function stateAtDistance(track: TrackPoint[], distanceMeters: number, searchStartIndex = 1): TrackStateAtDistance | null {
   if (track.length === 0) {
     return null;
   }
@@ -1313,7 +1370,7 @@ function stateAtDistance(track: TrackPoint[], distanceMeters: number): TrackStat
     };
   }
 
-  for (let i = 1; i < track.length; i += 1) {
+  for (let i = searchStartIndex; i < track.length; i += 1) {
     const previous = track[i - 1];
     const current = track[i];
     if (current.cumulative_meters < distanceMeters || current.cumulative_meters === previous.cumulative_meters) {
@@ -3392,32 +3449,22 @@ function exportPermissions(permissions: PermissionState, weatherFetchSuccess: bo
   };
 }
 
-function computeCurrentPace(points: GpsPoint[]): number | null {
-  if (points.length < 2) {
+function computeCurrentPace(track: TrackPoint[]): number | null {
+  if (track.length < 2) {
     return null;
   }
 
-  const latest = points[points.length - 1];
+  const latest = track[track.length - 1];
   let startIndex = 0;
-  for (let i = points.length - 1; i >= 0; i -= 1) {
-    if (latest.t_elapsed_seconds - points[i].t_elapsed_seconds >= 20) {
+  for (let i = track.length - 1; i >= 0; i -= 1) {
+    if (latest.t_elapsed_seconds - track[i].t_elapsed_seconds >= 20) {
       startIndex = i;
       break;
     }
   }
-  const windowPoints = points.slice(startIndex);
-  if (windowPoints.length < 2) {
-    return null;
-  }
-
-  let distance = 0;
-  for (let i = 1; i < windowPoints.length; i += 1) {
-    if (!isExcludedSegment(windowPoints[i])) {
-      distance += haversineMeters(windowPoints[i - 1], windowPoints[i]);
-    }
-  }
-
-  const dt = latest.t_elapsed_seconds - windowPoints[0].t_elapsed_seconds;
+  const start = track[startIndex];
+  const distance = latest.cumulative_meters - start.cumulative_meters;
+  const dt = latest.t_elapsed_seconds - start.t_elapsed_seconds;
   if (dt < 10 || distance < 15) {
     return null;
   }

@@ -1,3 +1,5 @@
+import type { CoachSensorSummary } from "./coachSensors";
+
 export type Screen = "home" | "setup" | "recovery" | "live" | "stop" | "selfie" | "post" | "export";
 export type RunStatus = "idle" | "armed" | "running" | "stopping" | "stopped" | "discarded";
 
@@ -817,6 +819,8 @@ export interface ActiveRun {
   pwa_state: PwaState;
   finalization: FinalizationDiagnostics;
   elapsed_offset_seconds: number;
+  app_session_ids?: string[];
+  coach_sensors?: Record<string, CoachSensorSummary>;
   last_saved_at_utc: string;
 }
 
@@ -835,7 +839,7 @@ export interface ExportPayload {
   schema_version: "0.3.0";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.4.0";
+    version: "0.5.0";
     platform: "web";
     user_agent: string;
     created_at_utc: string;
@@ -901,6 +905,8 @@ export interface ExportPayload {
   elevation_grounding: ElevationGrounding;
   motion_features: Record<string, unknown>;
   route_features: Record<string, unknown>;
+  app_session_ids: string[];
+  coach_sensors: Record<string, CoachSensorSummary>;
   route_direction: RouteDirectionInference;
   run_classification: RunClassification;
   target_inference: TargetInference;
@@ -933,6 +939,7 @@ export interface ExportPayload {
     gps_points: GpsPoint[];
     analysis_points: GpsPoint[];
     downsampled_points_5s: GpsPoint[];
+    motion_windows: MotionWindow[];
   };
   post_run: Record<string, unknown>;
   data_quality_notes: string[];
