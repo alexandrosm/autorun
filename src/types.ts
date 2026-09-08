@@ -129,6 +129,23 @@ export interface SelfieBiometrics {
   notes: string[];
 }
 
+export interface SpokenPulseMeasurement {
+  measurement_id: string;
+  method: "palpated_spoken_beats";
+  status: "unconfirmed" | "confirmed" | "rejected" | "insufficient_signal";
+  started_at_utc: string;
+  ended_at_utc: string;
+  duration_seconds: number;
+  seconds_after_run_stop: number | null;
+  recovery_position: "seated" | "standing" | "walking" | "unknown";
+  voice_note_id: string;
+  recording_started_at_utc: string;
+  window_start_offset_seconds: number;
+  detected_beat_offsets_seconds: number[];
+  estimated_bpm: number | null;
+  reason: string | null;
+}
+
 export interface PostRunState {
   rpe_1_to_10: number | null;
   rpe_estimation_source: "manual" | "simple_effort_fallback" | "not_answered";
@@ -148,6 +165,7 @@ export interface PostRunState {
   free_text: string;
   protocol_answers: Record<string, string | number | null>;
   selfie_biometrics?: SelfieBiometrics | null;
+  spoken_pulse_measurements?: SpokenPulseMeasurement[];
 }
 
 export interface PermissionState {
@@ -839,7 +857,7 @@ export interface ExportPayload {
   schema_version: "0.3.0";
   app: {
     name: "Green Lake AutoResearch Logger";
-    version: "0.5.1";
+    version: "0.6.0";
     platform: "web";
     user_agent: string;
     created_at_utc: string;

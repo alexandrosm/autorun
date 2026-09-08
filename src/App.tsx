@@ -22,6 +22,7 @@ import { buildExportPayload, computeLiveKilometers, computeLiveStats, createGpsP
 import type { LiveKilometers, LiveStats } from "./runMath";
 import { RunRouteMap } from "./RunRouteMap";
 import { PostRunSelfie } from "./PostRunSelfie";
+import { SpokenPulseCapture } from "./SpokenPulseCapture";
 import { deleteRunDatabaseValue, getRunDatabaseValue, IDB_STORE_NAME, openRunDatabase, putRunDatabaseValue } from "./storage";
 import { getDetailedRecordingEnabled, listSessionChunks, markSessionChunkSynced, SessionRecorder } from "./sessionLog";
 import { CoachSensorRecorder } from "./coachSensors";
@@ -56,6 +57,7 @@ import type {
   Screen,
   SelfieBiometrics,
   SimpleEffort,
+  SpokenPulseMeasurement,
   SorenessLevel,
   WeatherStatusText,
   YesNoUnsure,
@@ -63,7 +65,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.5.1";
+const APP_VERSION = "0.6.0";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
@@ -478,6 +480,7 @@ export default function App() {
   }, []);
 
   const recordSelfiePhase = useCallback((phase: string) => sessionRecorderRef.current?.record("selfie_phase", { phase }), []);
+  const recordSpokenPulsePhase = useCallback((phase: string) => sessionRecorderRef.current?.record("spoken_pulse_phase", { phase }), []);
 
   useEffect(() => {
     const getContext = (): CaptureContext => ({
@@ -1475,7 +1478,7 @@ export default function App() {
 
   const finishRecording = () => {
     setActionMessage("");
-    setScreen("selfie");
+    setScreen("post");
   };
 
   const continueToExport = () => {
@@ -1705,18 +1708,21 @@ export default function App() {
   const labSyncBusyRef = useRef(false);
   const [voiceNotes, setVoiceNotes] = useState<VoiceNoteEntry[]>(() => loadVoiceNotesIndex());
   const [recordingNote, setRecordingNote] = useState(false);
+  const [recordingPulse, setRecordingPulse] = useState(false);
+  const recordingPulseRef = useRef(false);
+  const pulseSaveBusyRef = useRef(false);
   const [scanningLab, setScanningLab] = useState(false);
   const [voiceContext, setVoiceContext] = useState<RunVoiceContext | null>(null);
 
   useEffect(() => {
     sessionRecorderRef.current?.record("capture_ui", {
-      voice_recording: recordingNote, pairing_camera: scanningLab, countdown: countdownSeconds,
+      voice_recording: recordingNote, spoken_pulse: recordingPulse, pairing_camera: scanningLab, countdown: countdownSeconds,
       waiting_for_gps: pendingStart, gps_start_timeout: gpsStartTimedOut,
     });
-  }, [recordingNote, scanningLab, countdownSeconds, pendingStart, gpsStartTimedOut]);
+  }, [recordingNote, recordingPulse, scanningLab, countdownSeconds, pendingStart, gpsStartTimedOut]);
 
   const startVoiceNote = () => {
-    if (recordingNote || labSyncBusyRef.current) return;
+    if (recordingNote || recordingPulseRef.current || labSyncBusyRef.current) return;
     const run = activeRunRef.current;
     const point = run?.gps_points[run.gps_points.length - 1];
     setVoiceContext(screenRef.current === "live" && run ? {
@@ -1730,6 +1736,87 @@ export default function App() {
     setRecordingNote(true);
   };
 
+  const saveSpokenPulse = async (measurement: SpokenPulseMeasurement, audio: Blob): Promise<boolean> => {
+    if (pulseSaveBusyRef.current || !audio.size || !recordingPulseRef.current) return false;
+    pulseSaveBusyRef.current = true;
+    const db = await openRunDatabase();
+    if (!db) {
+      pulseSaveBusyRef.current = false;
+      return false;
+    }
+    const priorEntry = loadVoiceNotesIndex().find((entry) => entry.note_id === measurement.voice_note_id);
+    let indexed = false;
+    let committed = false;
+    try {
+      const run = activeRunRef.current;
+      if (!run || screenRef.current !== "post") return false;
+      const savedRun: ActiveRun = {
+        ...run,
+        post_run: {
+          ...run.post_run,
+          spoken_pulse_measurements: [
+            ...(run.post_run.spoken_pulse_measurements ?? []).filter((reading) => reading.measurement_id !== measurement.measurement_id),
+            measurement,
+          ],
+        },
+        last_saved_at_utc: new Date().toISOString(),
+      };
+      const entry: VoiceNoteEntry = {
+        ...priorEntry,
+        note_id: measurement.voice_note_id,
+        created_at_utc: measurement.recording_started_at_utc,
+        duration_seconds: measurement.window_start_offset_seconds + measurement.duration_seconds,
+        mime: audio.type || "audio/webm",
+      };
+      // The recording and its run association commit together. The existing
+      // outbox index is rolled back if that transaction does not commit.
+      committed = await new Promise<boolean>((resolve) => {
+        const transaction = db.transaction(IDB_STORE_NAME, "readwrite");
+        transaction.oncomplete = () => resolve(true);
+        transaction.onerror = () => resolve(false);
+        transaction.onabort = () => resolve(false);
+        const store = transaction.objectStore(IDB_STORE_NAME);
+        store.put(audio, `${IDB_VOICE_PREFIX}${entry.note_id}`);
+        store.put(savedRun, IDB_ACTIVE_RUN_KEY);
+        indexed = saveVoiceNotesIndex([
+          entry,
+          ...loadVoiceNotesIndex().filter((note) => note.note_id !== entry.note_id),
+        ]);
+        if (!indexed) transaction.abort();
+      });
+      if (!committed) return false;
+      recoverySuppressedRef.current = false;
+      activeRunRef.current = savedRun;
+      setActiveRun(savedRun);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(savedRun));
+      } catch {
+        // The atomic IndexedDB copy already contains both the run and audio.
+      }
+      setVoiceNotes(loadVoiceNotesIndex());
+      sessionRecorderRef.current?.record("spoken_pulse_saved", {
+        status: measurement.status, estimated_bpm: measurement.estimated_bpm,
+        sounds: measurement.detected_beat_offsets_seconds.length,
+        seconds_after_run_stop: measurement.seconds_after_run_stop,
+      });
+      recordingPulseRef.current = false;
+      setRecordingPulse(false);
+      setActionMessage(measurement.status === "confirmed"
+        ? "Spoken pulse and audio saved. Experimental estimate; included with your run and next lab sync."
+        : "Pulse audio and timing saved without a confirmed pulse estimate.");
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (!committed && indexed) {
+        const remaining = loadVoiceNotesIndex().filter((entry) => entry.note_id !== measurement.voice_note_id);
+        saveVoiceNotesIndex(priorEntry ? [priorEntry, ...remaining] : remaining);
+      }
+      db.close();
+      pulseSaveBusyRef.current = false;
+    }
+  };
+
   const handleLabEndpointChange = useCallback((value: string) => {
     setLabEndpoint(value);
     saveLabSyncSettings({ endpoint: value });
@@ -1740,8 +1827,9 @@ export default function App() {
     if (!endpoint || labSyncBusyRef.current) {
       return;
     }
-    if (activeRunRef.current?.status === "running" || activeRunRef.current?.status === "stopping" || screenRef.current === "selfie") {
-      return; // Never upload or navigate away during recording or the camera scan.
+    if (activeRunRef.current?.status === "running" || activeRunRef.current?.status === "stopping" ||
+        screenRef.current === "selfie" || recordingPulseRef.current) {
+      return; // Never upload or navigate away during recording or pulse review.
     }
     labSyncBusyRef.current = true;
     setLabSync({ status: "syncing", detail: "Preparing pending data…" });
@@ -2483,7 +2571,7 @@ export default function App() {
     }
     const persistDraft = () => {
       const run = activeRunRef.current;
-      if (!run || recoverySuppressedRef.current) {
+      if (!run || recoverySuppressedRef.current || pulseSaveBusyRef.current) {
         return;
       }
       reconcileElapsedClock();
@@ -2541,7 +2629,7 @@ export default function App() {
 
   return (
     <main className={screen === "live" ? "app-shell app-shell-live" : "app-shell"}>
-      {screen !== "live" ? <header className="app-header">
+      {screen !== "live" && !recordingPulse ? <header className="app-header">
         <div>
           <button type="button" className="eyebrow version-button" onClick={() => setChangelogOpen(true)}>
             v{APP_VERSION}
@@ -2557,7 +2645,7 @@ export default function App() {
           New version ready. Tap to update.
         </button>
       ) : null}
-      {installPrompt && screen !== "live" ? (
+      {installPrompt && screen !== "live" && !recordingPulse ? (
         <button type="button" className="install-banner" onClick={() => void installPwa()}>
           Install app
         </button>
@@ -2680,7 +2768,20 @@ export default function App() {
         />
       ) : null}
 
-      {screen === "post" && activeRun ? (
+      {screen === "post" && activeRun && recordingPulse ? (
+        <SpokenPulseCapture
+          stoppedAtUtc={activeRun.run_metadata.end_time_utc}
+          onPhaseChange={recordSpokenPulsePhase}
+          onComplete={saveSpokenPulse}
+          onCancel={() => {
+            recordingPulseRef.current = false;
+            setRecordingPulse(false);
+            sessionRecorderRef.current?.record("spoken_pulse_cancelled");
+          }}
+        />
+      ) : null}
+
+      {screen === "post" && activeRun && !recordingPulse ? (
         <PostRunScreen
           run={activeRun}
           postRun={activeRun.post_run}
@@ -2689,6 +2790,13 @@ export default function App() {
           onConfirmRoute={confirmHomeBlockRoute}
           onExport={continueToExport}
           onRescan={() => setScreen("selfie")}
+          pulseUnavailable={recordingNote || labSync.status === "syncing"}
+          onSpokenPulse={() => {
+            if (recordingNote || labSyncBusyRef.current) return;
+            setActionMessage("");
+            recordingPulseRef.current = true;
+            setRecordingPulse(true);
+          }}
         />
       ) : null}
 
@@ -4027,6 +4135,8 @@ function PostRunScreen({
   onConfirmRoute,
   onExport,
   onRescan,
+  onSpokenPulse,
+  pulseUnavailable,
 }: {
   run: ActiveRun;
   postRun: PostRunState;
@@ -4035,6 +4145,8 @@ function PostRunScreen({
   onConfirmRoute: () => void;
   onExport: () => void;
   onRescan: () => void;
+  onSpokenPulse: () => void;
+  pulseUnavailable: boolean;
 }) {
   const exportPayload = useMemo(
     () => buildExportPayload({ ...run, post_run: defaultPostRun }),
@@ -4060,6 +4172,27 @@ function PostRunScreen({
 
   return (
     <section className="screen-stack">
+      <section className="health-panel">
+        <div className="health-header"><strong>Speak your pulse</strong><span>optional · experimental</span></div>
+        <p>Feel your wrist pulse and say a short “ta” on each beat. The app times 30 seconds and detects your sounds, not your heartbeat directly.</p>
+        <button type="button" className="primary-button" onClick={onSpokenPulse} disabled={pulseUnavailable}>
+          <Mic size={18} /> {postRun.spoken_pulse_measurements?.length ? "Take another spoken pulse reading" : "Measure spoken pulse"}
+        </button>
+        {pulseUnavailable ? <p>Finish the current voice note or lab sync before starting a pulse reading.</p> : null}
+        {(postRun.spoken_pulse_measurements ?? []).map((reading) => (
+          <div className="preflight-item" key={reading.measurement_id}>
+            <div>
+              <strong>{reading.status === "confirmed" && reading.estimated_bpm !== null
+                ? `${Math.round(reading.estimated_bpm)} bpm — runner-confirmed sound estimate`
+                : "Audio saved — no confirmed pulse estimate"}</strong>
+              <p>{Math.round(reading.duration_seconds)} s window · {reading.seconds_after_run_stop === null
+                ? "time since stop unknown" : `${Math.round(reading.seconds_after_run_stop)} s after stop`} · {reading.recovery_position}</p>
+              {reading.reason ? <p>{reading.reason}</p> : null}
+            </div>
+          </div>
+        ))}
+        <p>Skip this if it is uncomfortable. This is not a clinical pulse or heart-rate recovery test.</p>
+      </section>
       <section className="health-panel">
         <SelfieSummary value={postRun.selfie_biometrics} />
         <button type="button" className="secondary-button" onClick={onRescan}>
@@ -5415,6 +5548,7 @@ function buildCompactCoachSummary(exportPayload: ExportPayload) {
     route_confirmation_prompt: exportPayload.route_confirmation_prompt,
     in_run_notes: exportPayload.in_run_notes,
     selfie_biometrics: exportPayload.post_run.selfie_biometrics ?? null,
+    spoken_pulse_measurements: exportPayload.post_run.spoken_pulse_measurements ?? [],
     app_session_ids: exportPayload.app_session_ids ?? [],
     coach_sensors: exportPayload.coach_sensors ?? {},
     data_quality_notes: exportPayload.data_quality_notes,

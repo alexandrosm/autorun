@@ -5,6 +5,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.0",
+    notes: [
+      "Speak your pulse: feel your wrist pulse and say a short “ta” on each beat during a timed 30-second debrief reading. The microphone opens only after you press Start.",
+      "A quiet background check and detected-sound feedback help you review the experimental estimate. Replay the audio, explicitly confirm matching detection, keep audio without an estimate, or discard.",
+      "Saved readings retain sound timestamps, actual measurement window, time since stopping, recovery position and a linked voice recording. Run exports and coach summaries include the readings; audio uses the existing lab outbox.",
+      "Interrupted, noisy, clipped or incomplete readings withhold BPM. Microphone denial and save failures leave clear retry/skip choices. This is not direct heartbeat sensing, HRV or a clinical recovery test.",
+      "Finish run now opens the debrief with spoken pulse first; camera pulse remains an optional button. Walk-to-lake and walk-home recording are not changed by this release.",
+    ],
+  },
+  {
     version: "0.5.1",
     notes: [
       "GPS acquisition starts automatically when the app opens, including on the recovery screen. Your browser may still ask for location permission.",

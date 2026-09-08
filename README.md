@@ -2,7 +2,17 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.5.1`
+Current version: `0.6.0`
+
+## v0.6.0 focus
+
+- **Finish run → Measure spoken pulse** offers a voice-assisted manual pulse reading before the rest of the debrief. Feel your wrist pulse with two fingers and say one short “ta” per felt beat. **Start 30-second reading** explicitly opens the microphone, checks quiet background sound, then shows Go and detected-sound feedback. Camera pulse remains optional.
+- The on-device AudioWorklet detects sound-energy onsets; it does not recognize words or hear the heartbeat itself. A complete window, separated syllables, timing continuity and conservative sound-quality gates are required. The estimate uses first-to-last sound intervals without inventing missing beats. Breathing, background sounds and vocal timing can still make an accepted estimate wrong.
+- Replay or download the recording before deciding. **Confirm and save estimate + audio** requires your confirmation that one sound represented each beat and detection matched. **Keep audio without a pulse estimate** preserves uncertain/interrupted evidence without a usable BPM. Unsaved attempts can be discarded; save failures retain the recording for retry.
+- `post_run.spoken_pulse_measurements` is also included in the compact coach summary. Each reading records its status, experimental estimate, measurement window, delay since stopping, recovery position, detected sound offsets relative to that window, recording start and window offset, and `voice_note_id`. Audio travels separately through the existing voice-note outbox. The audio and draft association commit together before success is reported; only acknowledged audio leaves the local queue.
+- This is not a validated physiological measurement, HRV, instantaneous finish-line heart rate or standardized heart-rate recovery. It never fills the older “immediate” or “3–5 min” manual fields automatically. Skip if uncomfortable or unwell. Backgrounding, suspended audio, microphone interruption and early stopping withhold the estimate.
+- Browser verification used generated spoken syllables through real AudioWorklet/MediaRecorder capture: 60 sounds over 30 seconds produced 120 bpm. Permission, interruption, recovery, quota/transaction failure and exact direct lab-delivery scenarios were exercised; these software checks do not validate physical pulse accuracy. The signal regression suite covers calibration, shaped/double-peaked sounds, gradual rate changes, noise, clipping, gaps and missed/extra onsets.
+- This release does not add outing/walking phases or change the coach's running protocol. Export schema remains `0.3.0` with additive fields.
 
 ## v0.5.1 focus
 
