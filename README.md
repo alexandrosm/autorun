@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.5.0`
+Current version: `0.5.1`
+
+## v0.5.1 focus
+
+- High-accuracy GPS acquisition starts on app initialization, including recovery, rather than waiting for setup. Browser location permission and device support still apply; opening the app cannot guarantee an immediate usable fix.
+- Home/setup navigation keeps the same warmup watch. Start and Resume clear it before starting the recording watch; warmup coordinates do not become run samples and opening recovery does not resume the clock.
+- **Edit details → Stop GPS warmup** still stops acquisition. Denial does not cause an automatic retry loop, and callbacks from cleared warmup watches cannot change the current fix or permissions.
+- Browser smoke verification covered cold startup, denied/unavailable GPS, transient timeout recovery, explicit stopping, canceled countdowns, exclusive run handoff, localStorage recovery and asynchronous IndexedDB-only recovery. Satellite reception and device-specific permission prompts still require phone use.
 
 ## v0.5.0 focus
 

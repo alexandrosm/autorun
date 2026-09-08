@@ -1,4 +1,4 @@
-const CACHE_NAME = "greenlake-autoresearch-logger-v0.5.0-session-capture";
+const CACHE_NAME = "greenlake-autoresearch-logger-v0.5.1-startup-gps";
 const APP_SCOPE = self.registration.scope;
 const CACHE_PREFIX = "greenlake-autoresearch-logger-";
 const STATIC_ASSET_PREFIXES = ["assets/", "mediapipe/", "models/"].map((path) => new URL(path, APP_SCOPE).href);

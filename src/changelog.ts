@@ -5,6 +5,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.5.1",
+    notes: [
+      "GPS acquisition starts automatically when the app opens, including on the recovery screen. Your browser may still ask for location permission.",
+      "The GPS fix stays warm between Home and setup. Starting or resuming a run takes over the existing warmup without overlapping watches.",
+      "Warmup never starts the run clock or adds route points. Stop warmup and permission denial stay stopped; late callbacks from cleared watches are ignored.",
+    ],
+  },
+  {
     version: "0.5.0",
     notes: [
       "Detailed session timelines link screen changes, named controls, safe choices, errors and device state to your runs. No raw typing, clipboard contents or screenshots are captured.",

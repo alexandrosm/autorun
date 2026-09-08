@@ -63,7 +63,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.5.0";
+const APP_VERSION = "0.5.1";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
@@ -412,6 +412,7 @@ export default function App() {
   const gpsWatchIdRef = useRef<number | null>(null);
   const gpsWatchIdsRef = useRef<Set<number>>(new Set());
   const warmupWatchIdRef = useRef<number | null>(null);
+  const warmupWatchGenerationRef = useRef(0);
   const elapsedSecondsRef = useRef(initialRun?.elapsed_offset_seconds ?? 0);
   const runStartPerfRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
@@ -605,6 +606,7 @@ export default function App() {
   }, []);
 
   const stopWarmupWatch = useCallback(() => {
+    warmupWatchGenerationRef.current += 1;
     if (warmupWatchIdRef.current !== null && "geolocation" in navigator) {
       navigator.geolocation.clearWatch(warmupWatchIdRef.current);
       warmupWatchIdRef.current = null;
@@ -639,9 +641,11 @@ export default function App() {
     if (!silent) {
       setActionMessage("GPS warmup armed.");
     }
+    const generation = ++warmupWatchGenerationRef.current;
 
     warmupWatchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
+        if (generation !== warmupWatchGenerationRef.current) return;
         const point = createGpsPointFromPosition(position, 0, null);
         const accuracy = point.horizontal_accuracy_meters;
         updatePermissions({ geolocation_permission: "ready" });
@@ -658,6 +662,7 @@ export default function App() {
         }));
       },
       (error) => {
+        if (generation !== warmupWatchGenerationRef.current) return;
         if (error.code === error.PERMISSION_DENIED) {
           stopWarmupWatch();
           updatePermissions({ geolocation_permission: "denied" });
@@ -731,6 +736,7 @@ export default function App() {
     if (gpsWatchIdRef.current !== null) {
       return;
     }
+    stopWarmupWatch();
 
     const watchId = navigator.geolocation.watchPosition(
       (position) => {
@@ -815,7 +821,7 @@ export default function App() {
     );
     gpsWatchIdRef.current = watchId;
     gpsWatchIdsRef.current.add(watchId);
-  }, [appendQualityNote, fetchWeatherForRun, getElapsedSeconds, stopGpsWatch, updatePermissions]);
+  }, [appendQualityNote, fetchWeatherForRun, getElapsedSeconds, stopGpsWatch, stopWarmupWatch, updatePermissions]);
 
   const releaseWakeLock = useCallback(async () => {
     const lock = wakeLockRef.current;
@@ -1025,7 +1031,6 @@ export default function App() {
           : null,
       last_accuracy_before_start_meters: warmupStatus.latestAccuracy ?? warmup.last_accuracy_before_start_meters,
     };
-    stopWarmupWatch();
     setWarmup(finalWarmup);
 
     const protocol = loadCoachProtocol();
@@ -1083,7 +1088,6 @@ export default function App() {
     pwaState,
     requestWakeLock,
     startGpsWatch,
-    stopWarmupWatch,
     warmup,
     warmupStatus.latestAccuracy,
     warmupStatus.latestPoint,
@@ -2279,26 +2283,15 @@ export default function App() {
     };
   }, []);
 
+  const gpsWarmupEnabled = screen === "home" || screen === "setup" || screen === "recovery";
   useEffect(() => {
-    if (
-      screen !== "setup" ||
-      activeRun ||
-      warmupStatus.active ||
-      warmup.armed_at_utc ||
-      permissions.geolocation_permission === "denied" ||
-      permissions.geolocation_permission === "unavailable"
-    ) {
-      return;
-    }
+    if (!gpsWarmupEnabled) return;
+    // Acquire a fix before Start, without recording points or resuming a draft.
+    // Permission failures and explicit Stop warmup stay stopped until a manual
+    // retry or a new run context; render updates must not re-arm the watch.
     armGps(true);
-  }, [
-    activeRun,
-    armGps,
-    permissions.geolocation_permission,
-    screen,
-    warmup.armed_at_utc,
-    warmupStatus.active,
-  ]);
+    return stopWarmupWatch;
+  }, [activeRun?.run_metadata.run_id, armGps, gpsWarmupEnabled, stopWarmupWatch]);
 
   useEffect(() => {
     if (screen !== "setup") {
@@ -2621,13 +2614,11 @@ export default function App() {
           onStart={handleStartPressed}
           onStartAnyway={() => beginStartCountdown(true)}
           onBack={() => {
-            // Leaving setup must disarm everything Start set in motion, or the
-            // countdown can fire and drop the runner into a live run from Home.
+            // Cancel Start, but keep the startup GPS fix warm on Home.
             clearStartTimers();
             setPendingStart(false);
             setCountdownSeconds(null);
             setGpsStartTimedOut(false);
-            stopWarmupWatch();
             setScreen("home");
           }}
           planPreview={planPreview}
@@ -3553,7 +3544,7 @@ function SetupScreen({
             {[
               "Install/open PWA",
               "Put phone in fixed position",
-              "Arm GPS and wait for ready",
+              "Wait for GPS ready — acquisition starts automatically",
               "Confirm wake lock active",
               "Start actual run only when ready to move",
               "Keep app visible",
