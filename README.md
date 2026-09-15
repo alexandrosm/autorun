@@ -6,7 +6,7 @@ Current version: `0.7.0`
 
 ## v0.7.0 focus
 
-- The main path is **Start run → Get GPS & start → Stop run → Finish run → Save run → Done — back to runs**. Start and Voice note lead Home; pairing remains optional. Saved runs expand in one history list for route previews and downloads, rather than repeating that list on the save screen.
+- The main path is **Start run → Get GPS & start → Stop run → Review & save run → Save run → Done — back to runs**. Start and Voice note lead Home; pairing remains optional. Saved runs expand in one history list for route previews and downloads, rather than repeating that list on the save screen.
 - Setup shows one fresh-GPS/countdown state. **Device checks**, **Run details and how you feel**, recording diagnostics and connection settings stay expandable. Manual lab addresses are validated on **Save connection**, not persisted while typing. Installation lives in Settings instead of competing with the run action.
 - The debrief keeps **Speak your pulse** and **Camera pulse** optional and ahead of the questions. Capture screens distinguish retry, cancellation, unsaved results, confirmed estimates and audio-only saves. Stop/cancel controls remain visible during spoken capture on a 320 × 568 viewport. These are experimental measurements, not clinical pulse or recovery tests.
 - Save feedback follows the current archive attempt: **Saving run…**, **Run saved**, or **Run not saved yet**. A reproduced v0.6.6 bug showed an older saved entry as success after an edited debrief failed to save. Failed revisions now retain the draft, offer retry/download and do not enable Done until the current save succeeds.
