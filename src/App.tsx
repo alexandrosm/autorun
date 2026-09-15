@@ -67,7 +67,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.6.5";
+const APP_VERSION = "0.6.6";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
@@ -397,14 +397,13 @@ export default function App() {
   const [gpsStartTimedOut, setGpsStartTimedOut] = useState(false);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
   const [gpsStaleSeconds, setGpsStaleSeconds] = useState(0);
-  const [serviceWorkerUpdateReady, setServiceWorkerUpdateReady] = useState(false);
+  const [serviceWorkerUpdateState, setServiceWorkerUpdateState] = useState<"none" | "ready" | "applying" | "deferred">("none");
   const [serviceWorkerReloadPending, setServiceWorkerReloadPending] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
   const [pwaState, setPwaState] = useState<PwaState>(initialRun?.pwa_state ?? detectPwaState());
   const [runHistory, setRunHistory] = useState<RunHistoryEntry[]>(() => loadRunHistoryIndex());
   const [units, setUnits] = useState<Units>(() => loadUnits());
   const [changelogOpen, setChangelogOpen] = useState(false);
-  const autoUpdateAppliedRef = useRef(false);
   const [sessionStatus, setSessionStatus] = useState<SessionRecordingStatus>(() => ({
     enabled: getDetailedRecordingEnabled(), paused: false, pending_chunks: 0, pending_bytes: 0,
     dropped_records: 0, persistence_error: null,
@@ -2156,16 +2155,10 @@ export default function App() {
   }, [serviceWorkerReloadPending, serviceWorkerUpdateSafe]);
 
   useEffect(() => {
-    if (
-      serviceWorkerUpdateReady &&
-      screen === "home" &&
-      serviceWorkerUpdateSafe &&
-      !autoUpdateAppliedRef.current
-    ) {
-      autoUpdateAppliedRef.current = true;
+    if (serviceWorkerUpdateState === "ready" && screen === "home" && serviceWorkerUpdateSafe) {
       applyServiceWorkerUpdate();
     }
-  }, [screen, serviceWorkerUpdateReady, serviceWorkerUpdateSafe]);
+  }, [screen, serviceWorkerUpdateState, serviceWorkerUpdateSafe]);
 
   const historyActions: RunHistoryActions = {
     onDownloadJson: downloadHistoryJson,
@@ -2204,6 +2197,7 @@ export default function App() {
     if (!serviceWorkerUpdateSafeRef.current || countdownIntervalRef.current !== null) {
       return;
     }
+    setServiceWorkerUpdateState("applying");
     const waiting = serviceWorkerRegistrationRef.current?.waiting;
     if (!waiting) {
       window.location.reload();
@@ -2311,7 +2305,7 @@ export default function App() {
     };
     const handleWorkerMessage = (event: MessageEvent) => {
       if (event.data?.type === "UPDATE_DEFERRED_OTHER_CLIENTS") {
-        autoUpdateAppliedRef.current = false;
+        setServiceWorkerUpdateState("deferred");
         setActionMessage("Update waiting: close the other Green Lake app tabs or windows, then tap Update.");
       }
     };
@@ -2321,7 +2315,7 @@ export default function App() {
       }).then((registration) => {
         serviceWorkerRegistrationRef.current = registration;
         if (registration.waiting && navigator.serviceWorker.controller) {
-          setServiceWorkerUpdateReady(true);
+          setServiceWorkerUpdateState("ready");
         }
         setPwaState((current) => detectPwaState(current.storage_persisted));
         registration.addEventListener("updatefound", () => {
@@ -2331,7 +2325,7 @@ export default function App() {
           }
           installing.addEventListener("statechange", () => {
             if (installing.state === "installed" && navigator.serviceWorker.controller) {
-              setServiceWorkerUpdateReady(true);
+              setServiceWorkerUpdateState("ready");
             }
           });
         });
@@ -2678,10 +2672,14 @@ export default function App() {
       </header> : null}
 
       {actionMessage && screen !== "live" ? <div className="notice">{actionMessage}</div> : null}
-      {serviceWorkerUpdateReady && serviceWorkerUpdateSafe ? (
-        <button data-session-ignore type="button" className="update-banner" onClick={applyServiceWorkerUpdate}>
-          New version ready. Tap to update.
-        </button>
+      {serviceWorkerUpdateState !== "none" && serviceWorkerUpdateSafe ? (
+        serviceWorkerUpdateState === "applying" || (serviceWorkerUpdateState === "ready" && screen === "home") ? (
+          <div data-session-ignore role="status" className="update-banner">Updating app…</div>
+        ) : (
+          <button data-session-ignore type="button" className="update-banner" onClick={applyServiceWorkerUpdate}>
+            {serviceWorkerUpdateState === "deferred" ? "Retry update" : "New version ready. Tap to update."}
+          </button>
+        )
       ) : null}
       {installPrompt && screen !== "live" && !recordingPulse ? (
         <button data-session-ignore type="button" className="install-banner" onClick={() => void installPwa()}>

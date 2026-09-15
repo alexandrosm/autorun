@@ -5,6 +5,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.6",
+    notes: [
+      "Automatic Home updates show Updating app instead of briefly asking for a tap that is not needed.",
+      "Manual updates switch from the tap button to a progress status when applied. If another app window blocks activation, Retry update remains available after closing that window.",
+      "Existing capture, countdown and sync safety guards still defer activation/reload. No saved runs, recordings or queued details are cleared.",
+    ],
+  },
+  {
     version: "0.6.5",
     notes: [
       "An empty background lab check now finishes even when direct access is unavailable. Start and Voice note no longer remain disabled on Preparing pending data.",

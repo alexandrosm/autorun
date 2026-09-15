@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.6.5`
+Current version: `0.6.6`
+
+## v0.6.6 focus
+
+- Update feedback now distinguishes ready, applying and other-window-deferred states. Idle Home already applied updates automatically; rendering its manual “Tap to update” button before that effect caused the misleading flash.
+- Home shows a non-interactive “Updating app…” status from the first ready render through activation. Safe setup/export screens retain the manual button; clicking it changes to progress. A worker refusal because another app window is open exposes “Retry update” rather than claiming automatic progress.
+- Activation and reload retain the existing capture/countdown/sync safety guards. This changes feedback, not the automatic-update policy or saved-data handling.
+- Native production-bundle verification used the real service worker with fixture revisions and a held activation response: Home never rendered an update button, setup waited for a tap, another live app window blocked activation until explicit retry, and each accepted update really reloaded and retired the previous cache. A voice-note dialog with microphone permission denied deferred activation until it closed; no audio was captured.
 
 ## v0.6.5 focus
 
