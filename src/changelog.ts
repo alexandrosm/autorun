@@ -5,6 +5,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.5",
+    notes: [
+      "An empty background lab check now finishes even when direct access is unavailable. Start and Voice note no longer remain disabled on Preparing pending data.",
+      "Includes the idle-browsing correction: scrolling alone does not start another diagnostic batch, while real actions, errors and run measurements remain recordable.",
+    ],
+  },
+  {
     version: "0.6.4",
     notes: [
       "Browsing alone no longer creates detail uploads. v0.6.3 still treated homepage scrolling as activity that released startup/status records.",

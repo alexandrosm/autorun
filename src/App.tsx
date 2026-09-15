@@ -67,7 +67,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.6.4";
+const APP_VERSION = "0.6.5";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
@@ -1882,7 +1882,8 @@ export default function App() {
         const detail = direct
           ? deferredErrors > 0 ? `${deferredErrors} items need attention — tap Sync to retry.` : "Everything is in the lab."
           : "Direct lab access could not be established.";
-        if (announce || direct) setLabSync({ status: direct && deferredErrors === 0 ? "ok" : "offline", detail });
+        // An empty background check must finish even when direct access fails.
+        setLabSync({ status: direct && deferredErrors === 0 ? "ok" : "offline", detail });
         if (announce) setActionMessage(detail);
         return;
       }

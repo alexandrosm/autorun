@@ -2,7 +2,13 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.6.4`
+Current version: `0.6.5`
+
+## v0.6.5 focus
+
+- The published v0.6.4 upgrade/handover check exposed a second empty-queue boundary: a failed background connection probe returned without leaving the `syncing` UI state. With no fresh coach protocol, this could leave Home on “Preparing pending data…” and disable capture after all chunks had been acknowledged.
+- Empty checks now always settle their status. A failed probe reports that direct access could not be established and re-enables capture; it does not pretend the lab was reached. Announcements remain conditional on an explicit check-in.
+- Native browser verification refused the background probe with an empty queue: zero chunks, an accurate unavailable status, and Start enabled. Clicking Start successfully opened setup. The browsing admission and exact-acknowledgement behavior from v0.6.4 is unchanged.
 
 ## v0.6.4 focus
 
