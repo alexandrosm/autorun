@@ -366,6 +366,9 @@ type RecorderOptions = {
 
 type Battery = EventTarget & { charging: boolean; level: number };
 type Connection = EventTarget & { effectiveType?: string; type?: string; downlink?: number; rtt?: number; saveData?: boolean };
+type StateKind = "session_start" | "screen_view" | "capability" | "capture_ui" | "viewport"
+  | "visibility" | "pagehide" | "pageshow" | "connectivity" | "network" | "battery"
+  | "focus" | "blur" | "recording_enabled" | "recording_disabled";
 
 export class SessionRecorder implements CaptureSink {
   readonly sessionId = identifier("session");
@@ -390,6 +393,8 @@ export class SessionRecorder implements CaptureSink {
   private lastSeal = performance.now();
   private scrollInputUntil = 0;
   private scrollPositions = new WeakMap<Element, { y: number; reportedY: number; reportedAt: number }>();
+  private readonly stateValues = new Map<string, string>();
+  private pendingState = new Map<string, SessionEvent>();
 
   constructor(options: RecorderOptions) {
     this.options = options;
@@ -470,19 +475,57 @@ export class SessionRecorder implements CaptureSink {
     return true;
   }
 
-  record(kind: string, data?: Record<string, CaptureValue>, target?: string): void {
-    if (!this.accepts()) return;
+  private createEvent(kind: string, data?: Record<string, CaptureValue>, target?: string): SessionEvent {
     const event: SessionEvent = {
-      ...this.context(), seq: this.eventSequence++, at_utc: new Date().toISOString(),
+      ...this.context(), seq: 0, at_utc: new Date().toISOString(),
       t_ms: Math.max(0, Math.round(performance.now() - this.clockStart)), kind: token(kind),
     };
     if (target) event.target = token(target);
     const cleaned = safeData(data);
     if (cleaned) event.data = cleaned;
+    return event;
+  }
+
+  private appendEvent(event: SessionEvent): void {
+    // Coalesced idle state does not consume sequence numbers until admitted.
+    event.seq = this.eventSequence++;
     const bytes = byteSize(event) + 1;
     if (this.buffer && (this.bufferBytes + bytes > CHUNK_TARGET_BYTES || this.buffer.events.length >= 256)) this.seal("size");
     this.ensureBuffer().events.push(event);
     this.bufferBytes += bytes;
+  }
+
+  private appendPendingState(): void {
+    if (!this.pendingState.size) return;
+    const pending = this.pendingState;
+    this.pendingState = new Map();
+    for (const event of pending.values()) this.appendEvent(event);
+  }
+
+  /** Latest observed context, not an independently uploadable activity. */
+  recordState(kind: StateKind, data?: Record<string, CaptureValue>, target?: string): void {
+    if (!this.started || !this.enabled) return;
+    const event = this.createEvent(kind, data, target);
+    const key = kind === "capability" ? `${kind}:${event.data?.sensor ?? ""}`
+      : kind === "pagehide" || kind === "pageshow" ? "page"
+      : kind === "focus" || kind === "blur" ? "focus"
+      : kind === "recording_enabled" || kind === "recording_disabled" ? "recording"
+      : kind;
+    const value = JSON.stringify([kind, event.screen, event.run_id, event.target, event.data]);
+    if (this.stateValues.get(key) === value) return;
+    this.stateValues.set(key, value);
+    // Moving updated keys to the end preserves observation order.
+    this.pendingState.delete(key);
+    this.pendingState.set(key, event);
+    if ((this.buffer || (event.run_id && event.screen === "live")) && this.accepts()) {
+      this.appendPendingState();
+    }
+  }
+
+  record(kind: string, data?: Record<string, CaptureValue>, target?: string): void {
+    if (!this.accepts()) return;
+    this.appendPendingState();
+    this.appendEvent(this.createEvent(kind, data, target));
   }
 
   sensor(type: SensorBatch["type"], columns: string[], units: string[], row: Array<number | null>): void {
@@ -499,6 +542,7 @@ export class SessionRecorder implements CaptureSink {
     }
     const cleanRow = row.map((value) => typeof value === "number" && Number.isFinite(value) ? value : null);
     const bytes = byteSize(cleanRow) + 1;
+    this.appendPendingState();
     if (this.buffer && (this.bufferBytes + bytes + 1024 > CHUNK_TARGET_BYTES || this.sensorRows >= 1024)) this.seal("size");
     let buffer = this.ensureBuffer();
     const matches = (batch: SensorBatch) => batch.run_id === runId && batch.type === type
@@ -542,6 +586,12 @@ export class SessionRecorder implements CaptureSink {
     return sealed ? queue.then(() => undefined) : serialize(async () => { await settle(); });
   }
 
+  flushForSync(): Promise<void> {
+    // Layout changes from transfer controls cannot extend a prior scroll gesture.
+    this.scrollInputUntil = 0;
+    return this.flush("lab_sync");
+  }
+
   refreshStatus(): Promise<void> {
     return serialize(async () => {
       await settle();
@@ -554,7 +604,7 @@ export class SessionRecorder implements CaptureSink {
     this.scrollInputUntil = 0;
     this.scrollPositions = new WeakMap();
     if (!enabled) {
-      this.record("recording_disabled");
+      this.recordState("recording_disabled");
       this.seal("disabled");
     }
     this.enabled = enabled;
@@ -565,7 +615,7 @@ export class SessionRecorder implements CaptureSink {
     } catch {
       this.localError = "Recording preference could not be saved; it may reset after reload.";
     }
-    if (enabled) this.record("recording_enabled");
+    if (enabled) this.recordState("recording_enabled");
     this.publishStatus();
   }
 
@@ -658,7 +708,7 @@ export class SessionRecorder implements CaptureSink {
 
   private control(event: Event): void {
     const origin = event.target;
-    if (!(origin instanceof Element)) return;
+    if (!(origin instanceof Element) || origin.closest("[data-session-ignore]")) return;
     const element = origin.closest("button,a,input,select,textarea,summary,[role=button],[data-session-target],form");
     if (!element) return;
     const data: Record<string, CaptureValue> = { type: element.tagName.toLowerCase() };
@@ -679,7 +729,9 @@ export class SessionRecorder implements CaptureSink {
       if (safeValue && !(element instanceof HTMLInputElement && ["password", "hidden", "file"].includes(element.type))
         && !(element instanceof HTMLTextAreaElement)) data.value = token(safeValue);
     }
-    this.record(event.type === "focusin" ? "focus" : event.type === "focusout" ? "blur" : event.type, data, this.target(element));
+    if (event.type === "focusin" || event.type === "focusout") {
+      this.recordState(event.type === "focusin" ? "focus" : "blur", data, this.target(element));
+    } else this.record(event.type, data, this.target(element));
   }
 
   private scrollPosition(element: Element) {
@@ -693,6 +745,10 @@ export class SessionRecorder implements CaptureSink {
 
   private scrollInput(event: Event): void {
     if (!event.isTrusted || !this.started || !this.enabled) return;
+    if (event.target instanceof Element && event.target.closest("[data-session-ignore]")) {
+      this.scrollInputUntil = 0;
+      return;
+    }
     if (event.type === "keydown") {
       const key = (event as KeyboardEvent).key;
       if (!["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(key)) return;
@@ -738,7 +794,7 @@ export class SessionRecorder implements CaptureSink {
   }
 
   private viewport(): void {
-    this.record("viewport", {
+    this.recordState("viewport", {
       width: window.innerWidth, height: window.innerHeight,
       orientation: token(screen.orientation?.type ?? "unavailable"),
       angle: screen.orientation?.angle ?? null,
@@ -753,32 +809,34 @@ export class SessionRecorder implements CaptureSink {
     recorders.add(this);
     if (!this.startedOnce) {
       this.startedOnce = true;
-      this.record("session_start");
+      this.recordState("session_start");
     }
     for (const type of ["click", "change", "focusin", "focusout", "submit"]) this.listen(document, type, (event) => this.control(event), true);
     this.listen(document, "toggle", (event) => {
-      if (event.target instanceof HTMLDetailsElement) this.record("details", { open: event.target.open }, this.target(event.target));
+      if (event.target instanceof HTMLDetailsElement && !event.target.closest("[data-session-ignore]")) {
+        this.record("details", { open: event.target.open }, this.target(event.target));
+      }
     }, true);
     for (const type of ["wheel", "touchstart", "touchmove", "pointerdown", "pointermove", "keydown"]) {
       this.listen(document, type, (event) => this.scrollInput(event), true);
     }
     this.listen(document, "scroll", (event) => this.scroll(event), true);
     this.listen(document, "visibilitychange", () => {
-      this.record("visibility", { visibility: document.visibilityState });
+      this.recordState("visibility", { visibility: document.visibilityState });
       if (document.visibilityState === "hidden") this.seal("hidden");
       else void this.refreshStatus();
     });
     this.listen(window, "pagehide", (event) => {
-      this.record("pagehide", { persisted: (event as PageTransitionEvent).persisted });
+      this.recordState("pagehide", { persisted: (event as PageTransitionEvent).persisted });
       this.seal("pagehide");
     });
     this.listen(window, "pageshow", (event) => {
-      this.record("pageshow", { persisted: (event as PageTransitionEvent).persisted });
+      this.recordState("pageshow", { persisted: (event as PageTransitionEvent).persisted });
       void this.refreshStatus();
     });
     this.listen(window, "resize", () => this.viewport());
     if (screen.orientation) this.listen(screen.orientation, "change", () => this.viewport());
-    for (const type of ["online", "offline"]) this.listen(window, type, () => this.record("connectivity", { online: navigator.onLine }));
+    for (const type of ["online", "offline"]) this.listen(window, type, () => this.recordState("connectivity", { online: navigator.onLine }));
     this.listen(window, "error", (event) => {
       const error = (event as ErrorEvent).error as unknown;
       const name = error instanceof Error && ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "EvalError"].includes(error.name) ? error.name : "unknown";
@@ -792,7 +850,7 @@ export class SessionRecorder implements CaptureSink {
     const nav = navigator as Navigator & { connection?: Connection; getBattery?: () => Promise<Battery> };
     if (nav.connection) {
       const connection = nav.connection;
-      const report = () => this.record("network", {
+      const report = () => this.recordState("network", {
         effective_type: token(connection.effectiveType ?? "unavailable"),
         connection_type: token(connection.type ?? "unavailable"),
         downlink_mbps: typeof connection.downlink === "number" ? Math.round(connection.downlink) : null,
@@ -801,18 +859,18 @@ export class SessionRecorder implements CaptureSink {
       });
       report();
       this.listen(connection, "change", report);
-    } else this.record("network", { status: "unsupported" });
+    } else this.recordState("network", { status: "unsupported" });
     if (nav.getBattery) {
       void Promise.resolve().then(() => nav.getBattery!()).then((battery) => {
         if (!this.started || this.generation !== generation) return;
-        const report = () => this.record("battery", { charging: battery.charging, level_percent: Number.isFinite(battery.level) ? Math.round(battery.level * 20) * 5 : null });
+        const report = () => this.recordState("battery", { charging: battery.charging, level_percent: Number.isFinite(battery.level) ? Math.round(battery.level * 20) * 5 : null });
         report();
         this.listen(battery, "chargingchange", report);
         this.listen(battery, "levelchange", report);
       }).catch(() => {
-        if (this.started && this.generation === generation) this.record("battery", { status: "unavailable" });
+        if (this.started && this.generation === generation) this.recordState("battery", { status: "unavailable" });
       });
-    } else this.record("battery", { status: "unsupported" });
+    } else this.recordState("battery", { status: "unsupported" });
     this.timer = window.setInterval(() => {
       if (performance.now() - this.lastSeal >= 5000 && (this.buffer || this.unreportedDropped > 0)) this.seal("interval");
       this.publishStatus();

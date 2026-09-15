@@ -67,7 +67,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.6.2";
+const APP_VERSION = "0.6.3";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
@@ -515,7 +515,7 @@ export default function App() {
 
   useEffect(() => {
     const recorder = sessionRecorderRef.current;
-    recorder?.record("screen_view", { status: activeRun?.status ?? "none" });
+    recorder?.recordState("screen_view", { status: activeRun?.status ?? "none" });
     if (sessionStatus.enabled && recorder && activeRun && !activeRun.app_session_ids?.includes(recorder.sessionId)) {
       setActiveRun((run) => run ? { ...run, app_session_ids: [...(run.app_session_ids ?? []), recorder.sessionId] } : run);
     }
@@ -529,11 +529,11 @@ export default function App() {
 
   useEffect(() => {
     const recorder = sessionRecorderRef.current;
-    recorder?.record("capability", { sensor: "gps", permission: permissions.geolocation_permission });
-    recorder?.record("capability", { sensor: "motion", permission: permissions.device_motion_permission });
-    recorder?.record("capability", { sensor: "wake_lock", status: permissions.wake_lock_status });
-    recorder?.record("capability", { sensor: "weather", status: permissions.weather_status });
-  }, [permissions.geolocation_permission, permissions.device_motion_permission, permissions.wake_lock_status, permissions.weather_status]);
+    recorder?.recordState("capability", { sensor: "gps", permission: permissions.geolocation_permission });
+    recorder?.recordState("capability", { sensor: "motion", permission: permissions.device_motion_permission });
+    recorder?.recordState("capability", { sensor: "wake_lock", status: permissions.wake_lock_status });
+    recorder?.recordState("capability", { sensor: "weather", status: permissions.weather_status });
+  }, [permissions.geolocation_permission, permissions.device_motion_permission, permissions.wake_lock_status, permissions.weather_status, sessionStatus.enabled]);
 
   const updatePermissions = useCallback((patch: Partial<PermissionState>) => {
     const patchChanges = (target: PermissionState) =>
@@ -1720,11 +1720,11 @@ export default function App() {
   const [voiceContext, setVoiceContext] = useState<RunVoiceContext | null>(null);
 
   useEffect(() => {
-    sessionRecorderRef.current?.record("capture_ui", {
+    sessionRecorderRef.current?.recordState("capture_ui", {
       voice_recording: recordingNote, spoken_pulse: recordingPulse, pairing_camera: scanningLab, countdown: countdownSeconds,
       waiting_for_gps: pendingStart, gps_start_timeout: gpsStartTimedOut,
     });
-  }, [recordingNote, recordingPulse, scanningLab, countdownSeconds, pendingStart, gpsStartTimedOut]);
+  }, [recordingNote, recordingPulse, scanningLab, countdownSeconds, pendingStart, gpsStartTimedOut, sessionStatus.enabled]);
 
   const startVoiceNote = () => {
     if (recordingNote || recordingPulseRef.current || labSyncBusyRef.current) return;
@@ -1844,7 +1844,7 @@ export default function App() {
         setLabSync({ status: "idle", detail: "The sync batch expired. Tap Sync to start a new batch." });
         return;
       }
-      await sessionRecorderRef.current?.flush("lab_sync");
+      await sessionRecorderRef.current?.flushForSync();
       // Snapshot this queue, not a moving drain of interactions created during sync.
       const pendingSessions = (await listSessionChunks(Infinity)).filter((chunk) => !continuation || continuation.session_ids.includes(chunk.chunk_id));
       const unsyncedRuns = loadRunHistoryIndex().filter((entry) => !entry.synced_at_utc);
@@ -2668,7 +2668,7 @@ export default function App() {
     <main className={screen === "live" ? "app-shell app-shell-live" : "app-shell"}>
       {screen !== "live" && !recordingPulse ? <header className="app-header">
         <div>
-          <button type="button" className="eyebrow version-button" onClick={() => setChangelogOpen(true)}>
+          <button data-session-ignore type="button" className="eyebrow version-button" onClick={() => setChangelogOpen(true)}>
             v{APP_VERSION}
           </button>
           <h1>{APP_NAME}</h1>
@@ -2678,12 +2678,12 @@ export default function App() {
 
       {actionMessage && screen !== "live" ? <div className="notice">{actionMessage}</div> : null}
       {serviceWorkerUpdateReady && serviceWorkerUpdateSafe ? (
-        <button type="button" className="update-banner" onClick={applyServiceWorkerUpdate}>
+        <button data-session-ignore type="button" className="update-banner" onClick={applyServiceWorkerUpdate}>
           New version ready. Tap to update.
         </button>
       ) : null}
       {installPrompt && screen !== "live" && !recordingPulse ? (
-        <button type="button" className="install-banner" onClick={() => void installPwa()}>
+        <button data-session-ignore type="button" className="install-banner" onClick={() => void installPwa()}>
           Install app
         </button>
       ) : null}
@@ -2899,7 +2899,7 @@ export default function App() {
       ) : null}
 
       {changelogOpen ? (
-        <div className="changelog-overlay" onClick={() => setChangelogOpen(false)}>
+        <div data-session-ignore className="changelog-overlay" onClick={() => setChangelogOpen(false)}>
           <section className="changelog-panel" onClick={(event) => event.stopPropagation()}>
             <div className="health-header">
               <strong>What changed</strong>
@@ -3045,17 +3045,17 @@ function HomeScreen({
     <section className="screen-stack">
       <div className="home-actions">
         {!paired ? (
-          <button type="button" className="primary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
+          <button data-session-ignore type="button" className="primary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
             <Camera size={20} />
             Pair with the lab
           </button>
         ) : historyActions.labSync.handoverUrl ? (
-          <a className="primary-button" href={historyActions.labSync.handoverUrl}>
+          <a data-session-ignore className="primary-button" href={historyActions.labSync.handoverUrl}>
             <RefreshCw size={20} />
             Open lab page to finish sync
           </a>
         ) : pendingCount > 0 ? (
-          <button data-session-target="sync-lab" type="button" className="primary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}><RefreshCw size={20} />
+          <button data-session-ignore data-session-target="sync-lab" type="button" className="primary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}><RefreshCw size={20} />
           {syncBusy
             ? "Syncing…"
             : `Sync ${describePendingItems(pendingRuns, pendingNoteCount, sessionStatus.pending_chunks)} to lab`}</button>
@@ -3080,7 +3080,7 @@ function HomeScreen({
         </p>
       </div>
 
-      <details className="preflight-panel session-details" data-session-target="session-details">
+      <details data-session-ignore className="preflight-panel session-details" data-session-target="session-details">
         <summary>Detailed recording {sessionStatus.enabled ? "on" : "off"} · {sessionStatus.pending_chunks} pending chunks</summary>
         <label className="switch-label">
           <input type="checkbox" data-session-target="detailed-recording" checked={sessionStatus.enabled}
@@ -3088,6 +3088,7 @@ function HomeScreen({
           Record session interactions and extra run sensors
         </label>
         <p>Screen transitions, controls, safe numeric/choice values, errors and device state. During runs: motion up to 20 Hz, orientation up to 5 Hz, and ambient light where supported. No raw typing, free-text contents, clipboard, screenshots, or background microphone/camera capture.</p>
+        <p>Opening the app, checking diagnostics and syncing do not create uploads by themselves. Idle device state accompanies the next real interaction or error; live-run state and sensors remain recorded.</p>
         <p>Details stay on this device until the paired lab receives them. Sync on home Wi-Fi; browser restrictions may require the lab-page round trip. Acknowledged chunks are removed here. {formatBytes(sessionStatus.pending_bytes)} queued; a 20 MB limit pauses new detail capture rather than deleting unsent data.</p>
         <p>Phone movement is not a validated gait measurement. Unsupported, denied, hidden-page and missing-sample periods are reported, not filled in.</p>
         {sessionStatus.persistence_error ? <p role="alert" className="notice">{sessionStatus.persistence_error}</p> : null}
@@ -3100,7 +3101,7 @@ function HomeScreen({
 
       <RunHistoryPanel entries={runHistory} actions={historyActions} />
 
-      <details className="preflight-panel">
+      <details data-session-ignore className="preflight-panel">
         <summary>Lab settings</summary>
         <button type="button" className="secondary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
           <Camera size={18} />
@@ -3431,7 +3432,7 @@ function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean;
   }, [onResult]);
 
   return (
-    <div className="scanner-overlay">
+    <div data-session-ignore className="scanner-overlay">
       <video ref={videoRef} className="scanner-video" muted playsInline />
       <p>{error || "Point the camera at the lab pairing QR."}</p>
       <button data-session-target="close" type="button" className="secondary-button" onClick={onClose} >
@@ -4563,7 +4564,7 @@ function ExportScreen({
         <button type="button" className="primary-button full-width-button" onClick={onDone}>Done — back to runs</button>
       </section>
       {historyActions.labConfigured ? (
-        <section className="form-panel">
+        <section data-session-ignore className="form-panel">
           {historyActions.labSync.handoverUrl ? (
             <a className="primary-button" href={historyActions.labSync.handoverUrl}><RefreshCw size={18} />Open lab page to finish sync</a>
           ) : (

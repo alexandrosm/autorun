@@ -5,6 +5,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.3",
+    notes: [
+      "A successful sync no longer creates another batch merely by returning to the app. Startup and idle status stay in memory until real activity needs that context.",
+      "Sync, pairing, diagnostic inspection, installation/update and changelog controls no longer record their own clicks. Repeated unchanged status values are coalesced.",
+      "Real interactions, errors and live-run measurements/lifecycle events remain recorded. Existing queued data is preserved, and genuinely new activity during sync stays queued.",
+    ],
+  },
+  {
     version: "0.6.2",
     notes: [
       "Automatic page movement no longer creates scroll details by itself. Recording requires recent user input and ignores tiny accumulated movement.",

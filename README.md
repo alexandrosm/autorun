@@ -2,7 +2,15 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.6.2`
+Current version: `0.6.3`
+
+## v0.6.3 focus
+
+- Session recording is activity-led. Startup, idle device state and lifecycle notifications keep only their latest observed context in memory; they cannot start an upload batch. That context joins the next genuine interaction, error or sensor capture, retaining its observation time. Repeated unchanged capability values are coalesced.
+- State changes still accompany an existing activity buffer, and live-run state/lifecycle changes remain recordable even between sensor batches. Idle snapshots deliberately do not preserve a complete history of every app opening or device-status fluctuation.
+- Sync, pairing, diagnostic inspection, installation/update and changelog controls do not log their own input events. A sync checkpoint also ends the prior scroll gesture, so transfer-related layout changes cannot create another chunk. Opening the app or returning from the lab page does not by itself refill a successfully acknowledged queue.
+- Existing runs, audio and queued details are preserved. Sync still sends a finite snapshot and retires only exact, durably acknowledged identities; real activity or errors arriving later remain available for a later sync. Session/export schemas and the coach's protocol are unchanged.
+- Verification: paired startup, diagnostic inspection, direct sync and reload stayed at zero without new activity. An isolated production-bundle HTTPS-to-HTTP check delivered 160 chunks containing 16,000 generated sensor rows exactly across four trips; a further empty check-in did not refill the queue. Failed uploads retained their original chunks, and a runtime error arriving during transfer remained queued. All 68 regressions passed.
 
 ## v0.6.2 focus
 
