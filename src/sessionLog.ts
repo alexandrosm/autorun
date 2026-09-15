@@ -388,8 +388,8 @@ export class SessionRecorder implements CaptureSink {
   private listeners: Array<() => void> = [];
   private timer: number | null = null;
   private lastSeal = performance.now();
-  private lastScroll = 0;
-  private previousScrollY = 0;
+  private scrollInputUntil = 0;
+  private scrollPositions = new WeakMap<Element, { y: number; reportedY: number; reportedAt: number }>();
 
   constructor(options: RecorderOptions) {
     this.options = options;
@@ -551,11 +551,14 @@ export class SessionRecorder implements CaptureSink {
 
   setEnabled(enabled: boolean): void {
     if (enabled === this.enabled) return;
+    this.scrollInputUntil = 0;
+    this.scrollPositions = new WeakMap();
     if (!enabled) {
       this.record("recording_disabled");
       this.seal("disabled");
     }
     this.enabled = enabled;
+    if (enabled && document.scrollingElement) this.scrollPosition(document.scrollingElement);
     try {
       localStorage.setItem(ENABLED_KEY, String(enabled));
       this.localError = null;
@@ -679,6 +682,61 @@ export class SessionRecorder implements CaptureSink {
     this.record(event.type === "focusin" ? "focus" : event.type === "focusout" ? "blur" : event.type, data, this.target(element));
   }
 
+  private scrollPosition(element: Element) {
+    let position = this.scrollPositions.get(element);
+    if (!position) {
+      position = { y: element.scrollTop, reportedY: element.scrollTop, reportedAt: -Infinity };
+      this.scrollPositions.set(element, position);
+    }
+    return position;
+  }
+
+  private scrollInput(event: Event): void {
+    if (!event.isTrusted || !this.started || !this.enabled) return;
+    if (event.type === "keydown") {
+      const key = (event as KeyboardEvent).key;
+      if (!["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(key)) return;
+      // Caret movement/typing is not page navigation. Never record key contents.
+      if (event.target instanceof Element && event.target.closest("input,textarea,select,[contenteditable]:not([contenteditable='false'])")) return;
+    }
+    const now = performance.now();
+    const newGesture = now > this.scrollInputUntil;
+    const hover = event.type === "pointermove" && !(event as PointerEvent).buttons;
+    for (let element = event.target instanceof Element ? event.target : document.scrollingElement; element; element = element.parentElement) {
+      const position = this.scrollPosition(element);
+      if (hover) position.y = element.scrollTop;
+      if (newGesture) {
+        position.reportedY = position.y;
+        position.reportedAt = -Infinity;
+      }
+    }
+    if (!hover) this.scrollInputUntil = now + 1500; // Allow touch/wheel momentum.
+  }
+
+  private scroll(event: Event): void {
+    if (!this.started || !this.enabled) return;
+    const element = event.target instanceof Element ? event.target : document.scrollingElement;
+    if (!element) return;
+    const position = this.scrollPosition(element);
+    const now = performance.now();
+    const y = element.scrollTop;
+    // Passive wheel input may arrive after the compositor has already scrolled.
+    // Keep geometry current even when no activity record should be written.
+    position.y = y;
+    if (now > this.scrollInputUntil) {
+      position.reportedY = y;
+      return;
+    }
+    const distance = y - position.reportedY;
+    // Layout/anchoring notifications and subpixel jitter are not user activity.
+    if (Math.abs(distance) < 8 || now - position.reportedAt < 1000) return;
+    this.record("scroll", {
+      direction: Math.sign(distance), distance_bucket: Math.min(20, Math.floor(Math.abs(distance) / 100)),
+    }, this.target(element));
+    position.reportedY = y;
+    position.reportedAt = now;
+  }
+
   private viewport(): void {
     this.record("viewport", {
       width: window.innerWidth, height: window.innerHeight,
@@ -690,6 +748,7 @@ export class SessionRecorder implements CaptureSink {
   start(): void {
     if (this.started) return;
     this.started = true;
+    if (document.scrollingElement) this.scrollPosition(document.scrollingElement);
     const generation = ++this.generation;
     recorders.add(this);
     if (!this.startedOnce) {
@@ -700,15 +759,10 @@ export class SessionRecorder implements CaptureSink {
     this.listen(document, "toggle", (event) => {
       if (event.target instanceof HTMLDetailsElement) this.record("details", { open: event.target.open }, this.target(event.target));
     }, true);
-    this.listen(document, "scroll", (event) => {
-      const now = performance.now();
-      if (now - this.lastScroll < 1000) return;
-      const element = event.target instanceof Element ? event.target : document.scrollingElement;
-      const y = element?.scrollTop ?? window.scrollY;
-      this.record("scroll", { direction: Math.sign(y - this.previousScrollY), distance_bucket: Math.min(20, Math.floor(Math.abs(y - this.previousScrollY) / 100)) }, element ? this.target(element) : "document");
-      this.previousScrollY = y;
-      this.lastScroll = now;
-    }, true);
+    for (const type of ["wheel", "touchstart", "touchmove", "pointerdown", "pointermove", "keydown"]) {
+      this.listen(document, type, (event) => this.scrollInput(event), true);
+    }
+    this.listen(document, "scroll", (event) => this.scroll(event), true);
     this.listen(document, "visibilitychange", () => {
       this.record("visibility", { visibility: document.visibilityState });
       if (document.visibilityState === "hidden") this.seal("hidden");
@@ -770,6 +824,8 @@ export class SessionRecorder implements CaptureSink {
     if (!this.started) return;
     this.started = false;
     this.generation += 1;
+    this.scrollInputUntil = 0;
+    this.scrollPositions = new WeakMap();
     for (const remove of this.listeners) remove();
     this.listeners = [];
     if (this.timer !== null) clearInterval(this.timer);

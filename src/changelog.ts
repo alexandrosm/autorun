@@ -5,6 +5,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.2",
+    notes: [
+      "Automatic page movement no longer creates scroll details by itself. Recording requires recent user input and ignores tiny accumulated movement.",
+      "Wheel, touch and keyboard scrolling remain captured; nested lists keep their own scroll positions. Existing queued details are preserved.",
+      "Details are session logs, not new runs. Opening the app, syncing and genuine device-status changes can still add a few records.",
+    ],
+  },
+  {
     version: "0.6.1",
     notes: [
       "Sync no longer mistakes a slow browser permission refusal for proof that the lab is down. If direct access fails, Open lab page offers the transfer without automatically navigating to an unverified host.",

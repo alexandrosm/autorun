@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.6.1`
+Current version: `0.6.2`
+
+## v0.6.2 focus
+
+- Automatic page movement, scroll anchoring and restoration no longer create activity details on their own. Scroll recording requires recent trusted wheel, touch, pointer press/drag or navigation-key input and at least 8 accumulated CSS pixels of movement. Each gesture is throttled to one sample per second per scroller; a 1.5-second input window allows momentum without indefinite idle logging.
+- Page and nested-list positions are tracked independently without adding records. This also preserves the first wheel movement when Chromium's compositor scrolls before its passive wheel listener runs. Hover and typing do not authorize scroll records; raw keys remain unrecorded.
+- Details are session-log chunks, not new runs. Opening the app, returning from the lab, permission/device-state changes and real interactions can still produce a bounded set of details without a run. Existing runs, audio and queued details are not removed or rewritten.
+- Browser verification preserved the queue exactly for 30 seconds with 12 automatic scroll notifications, and confirmed native wheel, nested-list, touch, keyboard and repeated-click capture. Regressions cover idle flushes, restored positions, gesture expiry, passive-wheel timing, typing and recording restart/disable boundaries.
 
 ## v0.6.1 focus
 

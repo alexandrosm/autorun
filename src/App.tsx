@@ -67,7 +67,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.6.1";
+const APP_VERSION = "0.6.2";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
