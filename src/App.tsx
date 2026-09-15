@@ -29,6 +29,8 @@ import { CoachSensorRecorder } from "./coachSensors";
 import type { AppSessionChunk, CaptureContext, SessionRecordingStatus } from "./captureTypes";
 import { clearLabHandoverBatch, createLabHandoverBatch, labHandoverPendingCount, loadLabHandoverBatch, saveLabHandoverBatch } from "./labHandover";
 import type { LabHandoverBatch } from "./labHandover";
+import { postToLab, probeLabEndpoint } from "./labSync";
+import type { UploadResult } from "./labSync";
 import type {
   ActiveRun,
   BreathingRecoveredAfter,
@@ -65,7 +67,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.6.0";
+const APP_VERSION = "0.6.1";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
@@ -410,6 +412,7 @@ export default function App() {
   const sessionRecorderRef = useRef<SessionRecorder | null>(null);
   const coachSensorsRef = useRef<CoachSensorRecorder | null>(null);
   const bootLabSyncRef = useRef(false);
+  const labReceiptBusyRef = useRef(false);
 
   const gpsWatchIdRef = useRef<number | null>(null);
   const gpsWatchIdsRef = useRef<Set<number>>(new Set());
@@ -1708,6 +1711,8 @@ export default function App() {
   const labSyncBusyRef = useRef(false);
   const [voiceNotes, setVoiceNotes] = useState<VoiceNoteEntry[]>(() => loadVoiceNotesIndex());
   const [recordingNote, setRecordingNote] = useState(false);
+  const recordingNoteRef = useRef(false);
+  recordingNoteRef.current = recordingNote;
   const [recordingPulse, setRecordingPulse] = useState(false);
   const recordingPulseRef = useRef(false);
   const pulseSaveBusyRef = useRef(false);
@@ -1828,7 +1833,7 @@ export default function App() {
       return;
     }
     if (activeRunRef.current?.status === "running" || activeRunRef.current?.status === "stopping" ||
-        screenRef.current === "selfie" || recordingPulseRef.current) {
+        screenRef.current === "selfie" || recordingNoteRef.current || recordingPulseRef.current) {
       return; // Never upload or navigate away during recording or pulse review.
     }
     labSyncBusyRef.current = true;
@@ -1870,12 +1875,13 @@ export default function App() {
           }
         }
       }
-      const protocolOnlyHandover = pendingTotal === 0 && announce && probe.status === "blocked" &&
+      const handoverPossible = probe.status === "unavailable" &&
         endpoint.startsWith("http://") && window.location.protocol === "https:";
+      const protocolOnlyHandover = pendingTotal === 0 && announce && handoverPossible;
       if (pendingTotal === 0 && !protocolOnlyHandover) {
         const detail = direct
           ? deferredErrors > 0 ? `${deferredErrors} items need attention — tap Sync to retry.` : "Everything is in the lab."
-          : "Lab not reachable from this network.";
+          : "Direct lab access could not be established.";
         if (announce || direct) setLabSync({ status: direct && deferredErrors === 0 ? "ok" : "offline", detail });
         if (announce) setActionMessage(detail);
         return;
@@ -1889,21 +1895,21 @@ export default function App() {
         for (const entry of pending) {
           const payload = await loadCompletedRunFromHistory(entry.history_id);
           const result: UploadResult = payload ? await uploadRunToLab(endpoint, payload) : "rejected";
-          if (result === "stored") {
+          if (result === "stored" && markRunSynced(entry.history_id)) {
             sent += 1;
-            markRunSynced(entry.history_id);
           } else if (result === "rejected") {
             rejected += 1;
             markRunSyncError(entry.history_id, payload ? "lab rejected this run" : "run data missing on this device");
           } else {
             failed += 1;
           }
+          if (failed > 0) break;
         }
         for (const note of pendingNotes) {
+          if (failed > 0) break;
           const result = await uploadVoiceNoteToLab(endpoint, note);
-          if (result === "stored") {
+          if (result === "stored" && markVoiceNoteSynced(note.note_id)) {
             sent += 1;
-            markVoiceNoteSynced(note.note_id);
           } else if (result === "rejected") {
             rejected += 1;
             markVoiceNoteSyncError(note.note_id, "lab rejected this note");
@@ -1912,8 +1918,9 @@ export default function App() {
           }
         }
         for (const chunk of pendingSessions) {
+          if (failed > 0) break;
           const result = probe.sessionSchema === "1"
-            ? await postToLab(`${endpoint}/api/app-sessions`, JSON.stringify(chunk), 60000, chunk)
+            ? await postToLab(`${endpoint}/api/app-sessions`, JSON.stringify(chunk), { session_id: chunk.session_id, chunk_id: chunk.chunk_id })
             : "failed";
           if (result === "stored" && await markSessionChunkSynced(chunk.chunk_id)) sent += 1;
           else if (result === "rejected") rejected += 1;
@@ -1925,7 +1932,7 @@ export default function App() {
         const parts = [`Sent ${sent} of ${pendingTotal} (${itemsLabel}) to the lab.`];
         if (pendingSessions.length > 0 && probe.sessionSchema !== "1") parts.push("The lab bridge needs an update to accept session details.");
         if (failed > 0) {
-          parts.push(`${failed} failed — will retry.`);
+          parts.push(`Sync stopped after an upload or local receipt failed; ${pendingTotal - sent - rejected} items remain queued. Tap Sync to retry.`);
         }
         if (rejected > 0) {
           parts.push(`${rejected} items were rejected and remain on this device.`);
@@ -1938,15 +1945,13 @@ export default function App() {
         }
         return;
       }
-      // Not directly reachable. Only a *policy* block (mixed content / LNA denied)
-      // justifies the top-level handover; a dead host would just hang the runner.
-      const handoverPossible =
-        probe.status === "blocked" && endpoint.startsWith("http://") && window.location.protocol === "https:";
+      // A failed fetch cannot prove the lab is down: browser permission denials
+      // can take just as long. Offer an explicit navigation without sending the
+      // runner to a possibly unavailable page automatically.
       if (!handoverPossible) {
-        setLabSync({ status: "offline", detail: "Lab not reachable from this network." });
-        if (announce) {
-          setActionMessage("Lab is not reachable from this network.");
-        }
+        const detail = "The endpoint did not provide a valid lab response. Check the lab address and connection.";
+        setLabSync({ status: "offline", detail });
+        if (announce) setActionMessage(detail);
         return;
       }
       if (!announce) {
@@ -1975,6 +1980,14 @@ export default function App() {
         });
         return;
       }
+      if (!continuation) {
+        setLabSync({
+          status: "idle",
+          detail: "Direct access is unavailable. Open the lab page to transfer this batch; queued data stays safe if it cannot connect.",
+          handoverUrl: handover.url,
+        });
+        return;
+      }
       setLabSync({
         status: "syncing",
         detail: protocolOnlyHandover ? "Opening the lab page for the coach protocol…" : `Opening the lab page with ${handover.count} item${handover.count === 1 ? "" : "s"}…`,
@@ -1999,12 +2012,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (bootLabSyncRef.current) return;
-    bootLabSyncRef.current = true;
-    const initializeLabSync = async () => {
+    const initializeLabSync = async (initial: boolean) => {
       let continuation: LabHandoverBatch | undefined;
       const hash = window.location.hash;
-      if (hash.startsWith("#labsync=")) {
+      const hasReceipt = hash.startsWith("#labsync=");
+      if (hasReceipt) {
         // Remove the receipt before awaiting IndexedDB; never leave it in history.
         window.history.replaceState(null, "", window.location.pathname + window.location.search);
         try {
@@ -2027,21 +2039,19 @@ export default function App() {
             const sessionAcks = Array.isArray(result.sessionAcks) ? result.sessionAcks : [];
             let stored = 0;
             for (const ack of acks) {
-              if (ack.ok && typeof ack.id === "string" && batch.run_ids.includes(ack.id)) {
-                markRunSynced(ack.id);
+              if (ack?.ok === true && typeof ack.id === "string" && batch.run_ids.includes(ack.id) && markRunSynced(ack.id)) {
                 batch.run_ids = batch.run_ids.filter((id) => id !== ack.id);
                 stored += 1;
               }
             }
             for (const ack of noteAcks) {
-              if (ack.ok && typeof ack.id === "string" && batch.note_ids.includes(ack.id)) {
-                markVoiceNoteSynced(ack.id);
+              if (ack?.ok === true && typeof ack.id === "string" && batch.note_ids.includes(ack.id) && markVoiceNoteSynced(ack.id)) {
                 batch.note_ids = batch.note_ids.filter((id) => id !== ack.id);
                 stored += 1;
               }
             }
             for (const ack of sessionAcks) {
-              if (ack.ok && typeof ack.id === "string" && batch.session_ids.includes(ack.id) && await markSessionChunkSynced(ack.id)) {
+              if (ack?.ok === true && typeof ack.id === "string" && batch.session_ids.includes(ack.id) && await markSessionChunkSynced(ack.id)) {
                 batch.session_ids = batch.session_ids.filter((id) => id !== ack.id);
                 stored += 1;
               }
@@ -2063,13 +2073,17 @@ export default function App() {
               const detail = `Lab stored ${stored} of ${total} items.${continuation ? ` Continuing with ${remaining} remaining…` : ""}`;
               setLabSync({ status: stored === total ? "ok" : "offline", detail });
               setActionMessage(detail);
+            } else {
+              setLabSync({ status: "ok", detail: "Lab check-in complete; no items in this batch." });
             }
+          } else {
+            setLabSync({ status: "offline", detail: "This lab receipt does not match the current batch. Data remains queued; tap Sync to retry." });
           }
         } catch {
           setLabSync({ status: "offline", detail: "The lab receipt could not be applied. Unacknowledged data remains queued." });
         }
       }
-      const lab = new URLSearchParams(window.location.search).get("lab");
+      const lab = initial ? new URLSearchParams(window.location.search).get("lab") : null;
       if (lab) {
         const normalized = normalizeLabEndpoint(lab);
         saveLabSyncSettings({ endpoint: normalized });
@@ -2077,9 +2091,32 @@ export default function App() {
         setActionMessage("Lab sync endpoint saved from link.");
         window.history.replaceState(null, "", window.location.pathname);
       }
-      if (loadLabSyncSettings().endpoint) void syncRunsToLab(Boolean(continuation), continuation);
+      if ((!hasReceipt || continuation) && loadLabSyncSettings().endpoint) {
+        void syncRunsToLab(Boolean(continuation), continuation);
+      }
     };
-    void initializeLabSync().catch(() => setLabSync({ status: "offline", detail: "Session acknowledgements could not be saved. Details remain queued." }));
+    const receive = (initial = false) => {
+      if (labReceiptBusyRef.current || (!initial && !window.location.hash.startsWith("#labsync="))) return;
+      labReceiptBusyRef.current = true;
+      void initializeLabSync(initial)
+        .catch(() => setLabSync({ status: "offline", detail: "Session acknowledgements could not be saved. Details remain queued." }))
+        .finally(() => { labReceiptBusyRef.current = false; });
+    };
+    const onReturn = () => receive();
+    if (!bootLabSyncRef.current) {
+      bootLabSyncRef.current = true;
+      receive(true);
+    }
+    // Installed-app returns can update an existing document instead of mounting
+    // React again. Also consume receipts when restoring a cached page.
+    window.addEventListener("hashchange", onReturn);
+    window.addEventListener("pageshow", onReturn);
+    document.addEventListener("visibilitychange", onReturn);
+    return () => {
+      window.removeEventListener("hashchange", onReturn);
+      window.removeEventListener("pageshow", onReturn);
+      document.removeEventListener("visibilitychange", onReturn);
+    };
   }, [syncRunsToLab]);
 
   useEffect(() => {
@@ -4526,7 +4563,14 @@ function ExportScreen({
         <button type="button" className="primary-button full-width-button" onClick={onDone}>Done — back to runs</button>
       </section>
       {historyActions.labConfigured ? (
-        <button data-session-target="sync-lab" type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={historyActions.labSync.status === "syncing"}><RefreshCw size={18} />{historyActions.labSync.status === "syncing" ? "Syncing…" : "Sync to lab"}</button>
+        <section className="form-panel">
+          {historyActions.labSync.handoverUrl ? (
+            <a className="primary-button" href={historyActions.labSync.handoverUrl}><RefreshCw size={18} />Open lab page to finish sync</a>
+          ) : (
+            <button data-session-target="sync-lab" type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={historyActions.labSync.status === "syncing"}><RefreshCw size={18} />{historyActions.labSync.status === "syncing" ? "Syncing…" : "Sync to lab"}</button>
+          )}
+          <p role="status">{historyActions.labSync.detail}</p>
+        </section>
       ) : null}
       <section className="form-panel export-actions-panel">
         <h3>Download a copy</h3>
@@ -5022,64 +5066,11 @@ function normalizeLabEndpoint(value: string): string {
   }
 }
 
-type ProbeResult = { status: "reachable" | "blocked" | "unreachable"; sessionSchema: string | null };
-
-/**
- * "blocked": the browser refused the request outright (mixed content, CORS,
- * local-network-access denied) — the host may well be up, so a top-level
- * handover navigation can still work. "unreachable": we waited and nobody
- * answered — navigating there would just hang the runner on an error page.
- */
-async function probeLabEndpoint(endpoint: string, timeoutMs = 4000): Promise<ProbeResult> {
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-  const startedAt = performance.now();
-  try {
-    const response = await fetch(`${endpoint}/api/runs/ping`, { signal: controller.signal });
-    if (!response.ok) return { status: "unreachable", sessionSchema: null };
-    const acknowledgement = await response.json();
-    return { status: acknowledgement?.ok === true ? "reachable" : "unreachable", sessionSchema: acknowledgement?.app_session_schema ?? null };
-  } catch (error) {
-    if (error instanceof SyntaxError) return { status: "unreachable", sessionSchema: null };
-    if (error instanceof DOMException && error.name === "AbortError") {
-      return { status: "unreachable", sessionSchema: null };
-    }
-    // A policy refusal is synchronous-ish; a dead host takes the TCP timeout.
-    return { status: performance.now() - startedAt < 1500 ? "blocked" : "unreachable", sessionSchema: null };
-  } finally {
-    window.clearTimeout(timeoutId);
-  }
-}
-
-type UploadResult = "stored" | "rejected" | "failed";
-
-async function postToLab(url: string, body: string, timeoutMs = 60000, expectedSession?: Pick<AppSessionChunk, "chunk_id" | "session_id">): Promise<UploadResult> {
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      signal: controller.signal,
-    });
-    if (response.ok) {
-      const acknowledgement = await response.json();
-      if (expectedSession && (acknowledgement?.chunk_id !== expectedSession.chunk_id || acknowledgement?.session_id !== expectedSession.session_id)) return "failed";
-      return acknowledgement?.ok === true ? "stored" : "failed";
-    }
-    // Rate limits and request timeouts are transient, not permanent rejection.
-    if (response.status === 408 || response.status === 425 || response.status === 429) return "failed";
-    return response.status >= 400 && response.status < 500 ? "rejected" : "failed";
-  } catch {
-    return "failed";
-  } finally {
-    window.clearTimeout(timeoutId);
-  }
-}
 
 function uploadRunToLab(endpoint: string, payload: ExportPayload): Promise<UploadResult> {
-  return postToLab(`${endpoint}/api/runs`, JSON.stringify(payload));
+  const runId = payload.run_metadata?.run_id;
+  if (typeof runId !== "string" || !runId) return Promise.resolve("rejected");
+  return postToLab(`${endpoint}/api/runs`, JSON.stringify(payload), { run_id: runId });
 }
 
 async function uploadVoiceNoteToLab(endpoint: string, note: VoiceNoteEntry): Promise<UploadResult> {
@@ -5097,6 +5088,7 @@ async function uploadVoiceNoteToLab(endpoint: string, note: VoiceNoteEntry): Pro
       created_at_utc: note.created_at_utc,
       data_base64: bytesToBase64(bytes),
     }),
+    { note_id: note.note_id },
   );
 }
 
@@ -5130,14 +5122,17 @@ function saveVoiceNotesIndex(entries: VoiceNoteEntry[]): boolean {
   }
 }
 
-function markVoiceNoteSynced(noteId: string) {
+function markVoiceNoteSynced(noteId: string): boolean {
+  const entries = loadVoiceNotesIndex();
+  if (!entries.some((entry) => entry.note_id === noteId)) return false;
   const marked = saveVoiceNotesIndex(
-    loadVoiceNotesIndex().map((entry) =>
+    entries.map((entry) =>
       entry.note_id === noteId ? { ...entry, synced_at_utc: new Date().toISOString(), sync_error: null } : entry,
     ),
   );
   // Keep the audio retryable if the local acknowledgement could not be saved.
   if (marked) void deleteRunDatabaseValue(`${IDB_VOICE_PREFIX}${noteId}`);
+  return marked;
 }
 
 function describePendingItems(runCount: number, noteCount: number, sessionCount = 0): string {
@@ -5152,14 +5147,17 @@ function describePendingItems(runCount: number, noteCount: number, sessionCount 
   return parts.join(" + ") || "nothing";
 }
 
-function markRunSynced(historyId: string) {
-  const entries = loadRunHistoryIndex().map((entry) =>
+function markRunSynced(historyId: string): boolean {
+  const current = loadRunHistoryIndex();
+  if (!current.some((entry) => entry.history_id === historyId)) return false;
+  const entries = current.map((entry) =>
     entry.history_id === historyId ? { ...entry, synced_at_utc: new Date().toISOString(), sync_error: null } : entry,
   );
   try {
     saveRunHistoryIndex(entries);
+    return true;
   } catch {
-    // Sync markers are best effort; unsynced runs retry next flush.
+    return false;
   }
 }
 

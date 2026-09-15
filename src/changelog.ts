@@ -5,6 +5,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.1",
+    notes: [
+      "Sync no longer mistakes a slow browser permission refusal for proof that the lab is down. If direct access fails, Open lab page offers the transfer without automatically navigating to an unverified host.",
+      "Lab receipts are handled when an already-open app returns, not just after reload. Sync counts only locally saved acknowledgements, and failed uploads leave remaining items queued for retry.",
+      "The matching lab receiver checks exact upload identities and has bounded upload/protocol waits. Completed uploads keep their receipts if a later request fails.",
+      "Session flushes no longer chase newly arriving chunks, and crash checkpoints retry after storage recovers. Multi-trip sync still uses a finite snapshot.",
+    ],
+  },
+  {
     version: "0.6.0",
     notes: [
       "Speak your pulse: feel your wrist pulse and say a short “ta” on each beat during a timed 30-second debrief reading. The microphone opens only after you press Start.",

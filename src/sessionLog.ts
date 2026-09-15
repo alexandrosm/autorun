@@ -108,6 +108,7 @@ function checkpoint(chunk: AppSessionChunk): boolean {
   try {
     const key = CHECKPOINT_PREFIX + chunk.chunk_id;
     const json = JSON.stringify(chunk);
+    if (localStorage.getItem(key) === json) return true;
     let size = encoder.encode(json).byteLength;
     for (const other of checkpointKeys()) {
       if (other !== key) size += encoder.encode(localStorage.getItem(other) ?? "").byteLength;
@@ -179,7 +180,7 @@ async function readStored(): Promise<AppSessionChunk[]> {
       request.onsuccess = () => {
         const cursor = request.result;
         if (!cursor) return;
-        if (isChunk(cursor.value)) rows.push(cursor.value);
+        if (isChunk(cursor.value) && cursor.primaryKey === PREFIX + cursor.value.chunk_id) rows.push(cursor.value);
         else storageError = "A stored session chunk is damaged; it was retained, not deleted.";
         cursor.continue();
       };
@@ -242,11 +243,12 @@ async function storeChunk(chunk: AppSessionChunk): Promise<boolean> {
 async function settle(): Promise<void> {
   storageError = null;
   recoverCheckpoints();
-  for (const [id, chunk] of waiting) {
+  // Captures sealed during an IDB await belong to the next flush, not this one.
+  for (const [id, chunk] of [...waiting]) {
     if (await storeChunk(chunk)) {
       storedWaiting.add(id);
       if (removeCheckpoint(id)) retireWaiting(id);
-    }
+    } else checkpoint(chunk);
   }
   const db = await openRunDatabase();
   if (db) {
@@ -344,6 +346,7 @@ export function markSessionChunkSynced(chunkId: string): Promise<boolean> {
     } finally {
       db.close();
     }
+    if (deleted) storedWaiting.delete(chunkId);
     if (!deleted || !removeCheckpoint(chunkId)) {
       storageError = "Could not retire an acknowledged session chunk; it was retained for retry.";
       for (const recorder of recorders) recorder.publishStatus();

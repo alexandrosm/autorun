@@ -8,7 +8,7 @@ export interface LabHandoverBatch {
 }
 
 const KEY = "greenlake_lab_handover_batch";
-const safeIds = (value: unknown): value is string[] => Array.isArray(value) && value.length <= 25000
+const safeIds = (value: unknown): value is string[] => Array.isArray(value)
   && value.every((id) => typeof id === "string" && /^[A-Za-z0-9_.:-]{1,160}$/.test(id));
 
 export function loadLabHandoverBatch(): LabHandoverBatch | null {
