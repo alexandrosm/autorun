@@ -5,6 +5,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.4",
+    notes: [
+      "Browsing alone no longer creates detail uploads. v0.6.3 still treated homepage scrolling as activity that released startup/status records.",
+      "Idle scrolling now accompanies the next real action, error or run measurement. Scrolling during a live run or an activity already being recorded remains captured.",
+      "Existing queued details are preserved. This changes what starts a batch, not the movement threshold or the sync acknowledgements.",
+    ],
+  },
+  {
     version: "0.6.3",
     notes: [
       "A successful sync no longer creates another batch merely by returning to the app. Startup and idle status stay in memory until real activity needs that context.",

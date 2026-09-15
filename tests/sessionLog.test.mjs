@@ -102,8 +102,40 @@ test("automatic page movement and idle flushes do not create activity details", 
   assert.deepEqual(await f.chunks(), initial);
 });
 
-test("user scrolling accumulates small motion per container and expires after input stops", async t => {
+test("idle browsing stays pending context across flushes and sync checkpoints", async t => {
   const f = await fixture(t);
+  f.recorder.recordState("capability", { sensor: "gps", permission: "ready" });
+  // Representative sub-100px moves: the phone exports only a coarse distance bucket.
+  for (const [time, y] of [[2000, 16], [4000, 32], [6000, 48], [8000, 32], [10000, 48], [12000, 64]]) {
+    f.at(time);
+    f.emit("touchmove");
+    f.scroll(y);
+    await f.recorder.flushForSync();
+    assert.deepEqual(await f.chunks(), []);
+  }
+  const button = new Scroller(f.root);
+  button.tagName = "BUTTON";
+  button.target = "start-setup";
+  f.at(14000);
+  f.emit("click", button);
+  const original = await f.chunks();
+  const events = original.flatMap(chunk => chunk.events);
+  assert.deepEqual(events.filter(event => event.kind === "scroll").map(event => ({
+    target: event.target, time: event.t_ms, data: event.data,
+  })), [{ target: "html.0", time: 11000, data: { direction: 1, distance_bucket: 0 } }]);
+  assert.equal(events.filter(event => event.kind === "click" && event.target === "start-setup").length, 1);
+  assert.equal(events.find(event => event.kind === "capability").data.permission, "ready");
+  // Already queued activity does not turn subsequent browsing into another batch.
+  f.at(16000);
+  f.emit("touchmove");
+  f.scroll(1080); // Large navigation is context too, not just the phone's small moves.
+  await f.recorder.flushForSync();
+  assert.deepEqual(await f.chunks(), original);
+});
+
+test("live-run scrolling accumulates small motion per container and expires after input stops", async t => {
+  const f = await fixture(t);
+  Object.assign(f.context, { screen: "live", run_id: "run_scroll", elapsed_seconds: 12 });
   f.scroll(300); // Browser-restored position before the gesture.
   const nested = new Scroller(f.root);
   nested.scrollTop = 40;
@@ -117,11 +149,14 @@ test("user scrolling accumulates small motion per container and expires after in
   f.at(2100);
   f.emit("wheel");
   f.scroll(190);
+  f.at(3200);
+  f.emit("wheel");
+  f.scroll(80);
   const gestures = (await f.events()).filter(e => e.kind === "scroll");
   assert.deepEqual(gestures.map(e => [e.target, e.data.direction, e.data.distance_bucket]), [
-    ["html.0", 1, 0], ["div.0", 1, 0], ["html.0", -1, 1],
+    ["html.0", 1, 0], ["div.0", 1, 0], ["html.0", -1, 1], ["html.0", -1, 1],
   ]);
-  f.at(4000);
+  f.at(5000);
   f.scroll(800);
   assert.deepEqual((await f.events()).filter(e => e.kind === "scroll"), gestures);
 });
@@ -146,6 +181,7 @@ test("synthetic input, hover and typing cannot turn layout changes into scroll a
 
 test("disabling or restarting recording cannot reuse a stale scroll gesture", async t => {
   const f = await fixture(t);
+  Object.assign(f.context, { screen: "live", run_id: "run_scroll", elapsed_seconds: 12 });
   f.emit("touchstart");
   f.recorder.setEnabled(false);
   f.recorder.setEnabled(true);
@@ -162,6 +198,7 @@ test("disabling or restarting recording cannot reuse a stale scroll gesture", as
 
 test("a passive wheel event retains the position from before compositor scrolling", async t => {
   const f = await fixture(t);
+  Object.assign(f.context, { screen: "live", run_id: "run_scroll", elapsed_seconds: 12 });
   f.root.scrollTop = 150; // Compositor moves first; wheel and scroll callbacks follow.
   f.emit("wheel");
   f.emit("scroll");

@@ -2,7 +2,14 @@
 
 Phone-only run capture for Green Lake AutoResearch calibration runs.
 
-Current version: `0.6.3`
+Current version: `0.6.4`
+
+## v0.6.4 focus
+
+- Phone uploads exposed the remaining v0.6.3 admission mistake: trusted homepage scrolling could start a batch, releasing startup/status context and creating more detail chunks while browsing.
+- Idle scrolling now keeps only the latest gesture as context for the next real action, error or sensor capture, regardless of movement size. Browsing alone cannot create a queued chunk, including after a successful sync. This is an admission-policy correction, not a larger movement threshold.
+- Existing activity buffers and live runs still retain qualifying scroll observations, including repeated gestures with the same coarse distance and direction. Existing input/geometry safeguards, queued evidence, export schemas and the coaching protocol are unchanged.
+- Browser verification: the same six wheel movements produced two chunks in v0.6.3 and none after the correction. Start/Back actions still admitted the browsing context; both resulting chunks reached an isolated lab exactly, and further browsing stayed at zero. The new idle-browsing regression failed before the correction and passed afterward.
 
 ## v0.6.3 focus
 

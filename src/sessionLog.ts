@@ -368,7 +368,7 @@ type Battery = EventTarget & { charging: boolean; level: number };
 type Connection = EventTarget & { effectiveType?: string; type?: string; downlink?: number; rtt?: number; saveData?: boolean };
 type StateKind = "session_start" | "screen_view" | "capability" | "capture_ui" | "viewport"
   | "visibility" | "pagehide" | "pageshow" | "connectivity" | "network" | "battery"
-  | "focus" | "blur" | "recording_enabled" | "recording_disabled";
+  | "focus" | "blur" | "recording_enabled" | "recording_disabled" | "scroll";
 
 export class SessionRecorder implements CaptureSink {
   readonly sessionId = identifier("session");
@@ -511,9 +511,13 @@ export class SessionRecorder implements CaptureSink {
       : kind === "focus" || kind === "blur" ? "focus"
       : kind === "recording_enabled" || kind === "recording_disabled" ? "recording"
       : kind;
-    const value = JSON.stringify([kind, event.screen, event.run_id, event.target, event.data]);
-    if (this.stateValues.get(key) === value) return;
-    this.stateValues.set(key, value);
+    // Scroll deltas are observations, not values: keep the latest idle gesture
+    // and preserve repeated gestures while an activity or live run is recording.
+    if (kind !== "scroll") {
+      const value = JSON.stringify([kind, event.screen, event.run_id, event.target, event.data]);
+      if (this.stateValues.get(key) === value) return;
+      this.stateValues.set(key, value);
+    }
     // Moving updated keys to the end preserves observation order.
     this.pendingState.delete(key);
     this.pendingState.set(key, event);
@@ -786,7 +790,7 @@ export class SessionRecorder implements CaptureSink {
     const distance = y - position.reportedY;
     // Layout/anchoring notifications and subpixel jitter are not user activity.
     if (Math.abs(distance) < 8 || now - position.reportedAt < 1000) return;
-    this.record("scroll", {
+    this.recordState("scroll", {
       direction: Math.sign(distance), distance_bucket: Math.min(20, Math.floor(Math.abs(distance) / 100)),
     }, this.target(element));
     position.reportedY = y;

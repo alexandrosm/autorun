@@ -67,7 +67,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.6.3";
+const APP_VERSION = "0.6.4";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
@@ -3088,7 +3088,7 @@ function HomeScreen({
           Record session interactions and extra run sensors
         </label>
         <p>Screen transitions, controls, safe numeric/choice values, errors and device state. During runs: motion up to 20 Hz, orientation up to 5 Hz, and ambient light where supported. No raw typing, free-text contents, clipboard, screenshots, or background microphone/camera capture.</p>
-        <p>Opening the app, checking diagnostics and syncing do not create uploads by themselves. Idle device state accompanies the next real interaction or error; live-run state and sensors remain recorded.</p>
+        <p>Opening the app, browsing, checking diagnostics and syncing do not create uploads by themselves. Idle device state and the latest scroll accompany the next real action or error; live-run state and sensors remain recorded.</p>
         <p>Details stay on this device until the paired lab receives them. Sync on home Wi-Fi; browser restrictions may require the lab-page round trip. Acknowledged chunks are removed here. {formatBytes(sessionStatus.pending_bytes)} queued; a 20 MB limit pauses new detail capture rather than deleting unsent data.</p>
         <p>Phone movement is not a validated gait measurement. Unsupported, denied, hidden-page and missing-sample periods are reported, not filled in.</p>
         {sessionStatus.persistence_error ? <p role="alert" className="notice">{sessionStatus.persistence_error}</p> : null}
