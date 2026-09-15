@@ -5,9 +5,11 @@
   min-width: 0;
   padding-bottom: max(16px, env(safe-area-inset-bottom));
   color: #10231b;
+  overflow-wrap: anywhere;
 }
 
-.selfie-screen h2 { margin: 0 0 10px; font-size: 1.6rem; }
+.selfie-screen > *, .selfie-screen header { min-width: 0; }
+.selfie-screen h2 { margin: 0 0 10px; font-size: clamp(1.35rem, 5.5vw, 1.6rem); line-height: 1.2; }
 .selfie-screen p { margin: 0; line-height: 1.45; }
 .selfie-notice { padding: 12px; border: 1px solid #c9b56d; border-radius: 10px; background: #fff8de; }
 .selfie-preview {
@@ -29,10 +31,9 @@
   border-radius: 45%;
   pointer-events: none;
 }
-.selfie-preview-ended { aspect-ratio: auto; height: 76px; }
-.selfie-preview-ended video { visibility: hidden; }
-.selfie-preview-ended > span { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 800; }
-.selfie-status { min-height: 3em; }
+.selfie-preview[hidden] { display: none; }
+.selfie-status { padding: 12px; border-radius: 10px; background: #eaf3ed; }
+.selfie-error { border: 1px solid #b93838; color: #8b2020; background: #fff2f2; }
 .selfie-status > p:first-child { font-weight: 750; }
 .selfie-status .selfie-hint { margin-top: 7px; font-size: 0.88rem; color: #40564a; }
 .selfie-progress { display: grid; gap: 6px; }
@@ -47,20 +48,27 @@
 .selfie-actions button {
   min-height: 52px;
   width: 100%;
+  min-width: 0;
   padding: 13px 16px;
   border: 1px solid #729c85;
   border-radius: 12px;
   background: #fff;
   color: #173d29;
+  font: inherit;
   font-weight: 800;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
   cursor: pointer;
   touch-action: manipulation;
 }
 .selfie-actions .selfie-primary { border-color: #12683f; background: #12683f; color: #fff; }
 .selfie-actions .selfie-primary:disabled { background: #d5ded8; color: #4e6155; border-color: #b4c2b9; cursor: default; }
 .selfie-actions .selfie-skip { border-color: #647a6c; }
-.selfie-actions button:focus-visible { outline: 3px solid #2045c7; outline-offset: 3px; }
-.selfie-limitations { font-size: 0.8rem; color: #40564a; }
+.selfie-screen :is(button, summary, [tabindex="-1"]):focus-visible { outline: 3px solid #2045c7; outline-offset: 3px; }
+.selfie-limitations { min-width: 0; border-top: 1px solid #c0d6c8; font-size: 0.88rem; color: #40564a; }
+.selfie-limitations > summary { min-height: 44px; padding: 12px 0; box-sizing: border-box; font-weight: 750; line-height: 1.4; cursor: pointer; touch-action: manipulation; }
+.selfie-limitations[open] > summary { margin-bottom: 6px; }
 
 @media (max-width: 350px) {
   .selfie-screen { gap: 11px; }

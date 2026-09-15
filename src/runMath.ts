@@ -178,7 +178,7 @@ export function buildExportPayload(run: ActiveRun, createdAtUtc = new Date().toI
     schema_version: "0.3.0",
     app: {
       name: "Green Lake AutoResearch Logger",
-      version: "0.6.0",
+      version: "0.7.0",
       platform: "web",
       user_agent: navigator.userAgent,
       created_at_utc: createdAtUtc,

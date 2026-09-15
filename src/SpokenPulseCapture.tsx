@@ -44,6 +44,13 @@ export function SpokenPulseCapture({ stoppedAtUtc, onComplete, onCancel, onPhase
   const mountedRef = useRef(false);
   const sessionRef = useRef<Session | null>(null);
   const savingRef = useRef(false);
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const statusRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (view.phase === "ready") titleRef.current?.focus();
+    else if (view.phase === "result" || view.phase === "error" || view.phase === "saved") statusRef.current?.focus();
+  }, [view.phase]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -307,7 +314,7 @@ export function SpokenPulseCapture({ stoppedAtUtc, onComplete, onCancel, onPhase
     if (!result || savingRef.current || (confirm && (!matched || result.measurement.estimated_bpm === null))) return;
     savingRef.current = true;
     setSaveError(null);
-    setView((previous) => ({ ...previous, phase: "saving", message: "Saving audio and reading on this device…" }));
+    setView((previous) => ({ ...previous, phase: "saving", message: "Saving on this device…" }));
     const measurement: SpokenPulseMeasurement = confirm ? { ...result.measurement, status: "confirmed" } : {
       ...result.measurement,
       status: result.measurement.estimated_bpm === null ? "insufficient_signal" : "rejected",
@@ -319,7 +326,7 @@ export function SpokenPulseCapture({ stoppedAtUtc, onComplete, onCancel, onPhase
       if (!mountedRef.current) return;
       if (saved) {
         setResult({ measurement, audio: result.audio });
-        setView((previous) => ({ ...previous, phase: "saved", message: "Audio and reading saved on this device." }));
+        setView((previous) => ({ ...previous, phase: "saved", message: confirm ? "Estimate and audio saved on this device." : "Audio saved on this device without a BPM estimate." }));
       }
       else {
         setSaveError("Save did not complete. Your audio is still here. Retry saving or download it before leaving.");
@@ -349,15 +356,15 @@ export function SpokenPulseCapture({ stoppedAtUtc, onComplete, onCancel, onPhase
     <section className="spoken-pulse-screen" aria-labelledby="spoken-pulse-title">
       <header>
         <p className="eyebrow">Optional post-run reading</p>
-        <h2 id="spoken-pulse-title">Speak your wrist pulse</h2>
-        <p className="spoken-pulse-notice">Experimental sound-rate estimate, not direct heartbeat sensing or a medical measurement.</p>
+        <h2 id="spoken-pulse-title" ref={titleRef} tabIndex={-1}>Speak your wrist pulse</h2>
+        <p className="spoken-pulse-notice">Experimental sound-rate estimate, not direct heartbeat sensing or a medical measurement. Stop moving safely first; skip if you feel unwell.</p>
       </header>
+      <div ref={statusRef} tabIndex={-1} className={`spoken-pulse-status${view.phase === "error" ? " spoken-pulse-error" : ""}`} role="status" aria-live="polite" aria-atomic="true"><p>{view.message}</p></div>
       {preparing && <>
       <ol className="spoken-pulse-instructions">
-        <li>Be safely stationary if possible. Do not try this while running; skip if you feel unwell.</li>
-        <li>Feel your wrist pulse with two fingers, not your thumb. Rest the phone close enough to hear you.</li>
-        <li>Stay quiet for the 2-second background check. A short cue prepares you; start at <strong>Go</strong>.</li>
-        <li>For 30 seconds, say one short <strong>“ta”</strong> for every beat you feel. Do not guess or follow a rhythm from the screen. Stop at the end cue.</li>
+        <li>Feel your wrist pulse with two fingers, not your thumb. Rest the phone nearby.</li>
+        <li>Stay quiet for the 2-second background check. After the short cue, wait for <strong>Go</strong>.</li>
+        <li>Say one short <strong>“ta” per felt beat for 30 seconds</strong>. Do not guess or follow the screen’s rhythm. Stop at the end cue.</li>
       </ol>
       <label className="spoken-pulse-position" htmlFor="spoken-pulse-position">Recovery position during this reading
         <select id="spoken-pulse-position" value={position} disabled={view.phase !== "ready" && view.phase !== "error"} onChange={(event) => setPosition(event.target.value as SpokenPulseMeasurement["recovery_position"])}>
@@ -366,7 +373,6 @@ export function SpokenPulseCapture({ stoppedAtUtc, onComplete, onCancel, onPhase
       </label>
       </>}
       {capturing && <p>Feel your wrist pulse. After Go, say one short <strong>“ta”</strong> for each beat until the end cue.</p>}
-      <div className="spoken-pulse-status" role="status" aria-live="polite" aria-atomic="true"><p>{view.message}</p></div>
       {capturing && <div className="spoken-pulse-progress">
         <label htmlFor="spoken-pulse-progress">{view.elapsed.toFixed(0)} / 30 seconds</label>
         <progress id="spoken-pulse-progress" max={30} value={view.elapsed} />
@@ -374,25 +380,33 @@ export function SpokenPulseCapture({ stoppedAtUtc, onComplete, onCancel, onPhase
         <small>The marker follows detected sounds; it is not a metronome or a verified heartbeat counter.</small>
       </div>}
       {measurement && <div className="spoken-pulse-result">
-        {measurement.estimated_bpm !== null ? <><span>Experimental estimate · {saved ? "saved" : "unconfirmed"}</span><strong>{Math.round(measurement.estimated_bpm)} <small>bpm</small></strong></> : <strong className="spoken-pulse-no-estimate">No usable BPM estimate</strong>}
+        {measurement.estimated_bpm !== null ? <><span>Experimental estimate · {saved ? "saved" : "unconfirmed"}</span><strong>{Math.round(measurement.estimated_bpm)} <small>bpm</small></strong></> : <strong className="spoken-pulse-no-estimate">{saved ? "Audio saved · no BPM estimate" : "No usable BPM estimate"}</strong>}
         {measurement.reason && <p>{measurement.reason}</p>}
-        <dl><div><dt>Detected sounds</dt><dd>{measurement.detected_beat_offsets_seconds.length}</dd></div><div><dt>Measurement window</dt><dd>{measurement.duration_seconds.toFixed(1)} seconds</dd></div><div><dt>Started after run stop</dt><dd>{measurement.seconds_after_run_stop === null ? "Unknown" : `${measurement.seconds_after_run_stop.toFixed(1)} seconds`}</dd></div><div><dt>Recovery position</dt><dd>{measurement.recovery_position}</dd></div></dl>
-        <p className="spoken-pulse-hint">Window starts {measurement.window_start_offset_seconds.toFixed(1)} seconds into the recording. Replay to check the count. Confirm only if you made exactly one sound per felt beat and the detection matched.</p>
+        {!saved && <p className="spoken-pulse-hint">Replay from {measurement.window_start_offset_seconds.toFixed(1)} seconds to check the measurement window.{measurement.estimated_bpm !== null ? " Confirm only if you made exactly one sound per felt beat and the detection matched." : " You can keep the audio without a BPM estimate."}</p>}
         {audioUrl && <><audio controls preload="metadata" src={audioUrl} aria-label="Replay spoken wrist-pulse recording" /><a className="spoken-pulse-download" href={audioUrl} download={`${measurement.voice_note_id}.${audioExtension(result!.audio.type)}`}>Download audio to this device</a></>}
         {!saved && measurement.estimated_bpm !== null && <label className="spoken-pulse-confirm"><input type="checkbox" checked={matched} disabled={saving} onChange={(event) => setMatched(event.target.checked)} /><span>I made one sound per beat and the detection matched.</span></label>}
+        <details className="spoken-pulse-details">
+          <summary>Measurement details</summary>
+          <dl><div><dt>Detected sounds</dt><dd>{measurement.detected_beat_offsets_seconds.length}</dd></div><div><dt>Measurement window</dt><dd>{measurement.duration_seconds.toFixed(1)} seconds</dd></div><div><dt>Started after run stop</dt><dd>{measurement.seconds_after_run_stop === null ? "Unknown" : `${measurement.seconds_after_run_stop.toFixed(1)} seconds`}</dd></div><div><dt>Recovery position</dt><dd>{measurement.recovery_position}</dd></div></dl>
+        </details>
       </div>}
       {saveError && <p className="spoken-pulse-error" role="alert">{saveError}</p>}
-      <div className="spoken-pulse-actions">
-        {(view.phase === "ready" || view.phase === "error") && <button type="button" className="spoken-pulse-primary" data-session-target="start-spoken-pulse" onClick={start}>Start 30-second reading</button>}
-        {capturing && <button type="button" data-session-target="stop-spoken-pulse-early" onClick={() => sessionRef.current?.finish("You stopped the reading early. No BPM can be confirmed.")}>Stop early · keep audio for review</button>}
+      <div className={capturing ? "spoken-pulse-actions spoken-pulse-actions-capturing" : "spoken-pulse-actions"}>
+        {preparing && <button type="button" className="spoken-pulse-primary" data-session-target="start-spoken-pulse" onClick={start}>{view.phase === "error" ? "Retry 30-second reading" : "Start 30-second reading"}</button>}
+        {(view.phase === "starting" || view.phase === "finishing") && <button type="button" className="spoken-pulse-primary" disabled>{view.phase === "starting" ? "Opening microphone…" : "Finishing audio…"}</button>}
+        {capturing && <button type="button" className="spoken-pulse-primary" data-session-target="stop-spoken-pulse-early" onClick={() => sessionRef.current?.finish("You stopped the reading early. No BPM can be confirmed.")}>Stop early · review audio only</button>}
         {result && !saved && <>
           {measurement?.estimated_bpm !== null && <button type="button" className="spoken-pulse-primary" data-session-target="confirm-spoken-pulse" disabled={saving || !matched} onClick={() => { void save(true); }}>Confirm and save estimate + audio</button>}
-          <button type="button" data-session-target="save-spoken-pulse-audio-only" disabled={saving} onClick={() => { void save(false); }}>Keep audio without a pulse estimate</button>
-          <button type="button" disabled={saving} onClick={() => { setResult(null); setMatched(false); setSaveError(null); setView(INITIAL_VIEW); }}>Discard this unsaved attempt and try again</button>
+          <button type="button" className={measurement?.estimated_bpm === null ? "spoken-pulse-primary" : undefined} data-session-target="save-spoken-pulse-audio-only" disabled={saving} onClick={() => { void save(false); }}>{saving && measurement?.estimated_bpm === null ? "Saving audio…" : "Save audio without BPM"}</button>
+          <button type="button" disabled={saving} onClick={() => { setResult(null); setMatched(false); setSaveError(null); setView(INITIAL_VIEW); }}>Discard unsaved attempt · try again</button>
         </>}
-        <button type="button" className="spoken-pulse-skip" data-session-target="cancel-spoken-pulse" disabled={saving} onClick={cancel}>{saved ? "Done" : result ? "Discard unsaved attempt and close" : "Cancel / skip spoken pulse"}</button>
+        <button type="button" className={saved ? "spoken-pulse-primary" : "spoken-pulse-skip"} data-session-target="cancel-spoken-pulse" disabled={saving} onClick={cancel}>{saved ? "Back to run debrief" : result ? "Discard unsaved attempt · back to debrief" : "Cancel reading · back to debrief"}</button>
       </div>
-      <p className="spoken-pulse-limitations">Missed or extra sounds, breathing, background noise and spoken timing can make this estimate wrong even when signal checks pass. This is not validated HRV or a diagnostic tool. Confirmation records your check, not medical accuracy. Nothing is saved until you choose a save option; saved audio can be included in your run’s coach sync.</p>
+      {!saved && <p className="spoken-pulse-hint">Nothing is saved until you choose a save option. Saved audio can be included in your run’s coach sync.</p>}
+      <details className="spoken-pulse-details spoken-pulse-limitations">
+        <summary>What this estimate can and cannot tell you</summary>
+        <p>Missed or extra sounds, breathing, background noise and spoken timing can make this estimate wrong even when signal checks pass. This is not validated HRV or a diagnostic tool. Confirmation records your check, not medical accuracy.</p>
+      </details>
     </section>
   );
 }

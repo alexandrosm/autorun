@@ -59,6 +59,13 @@ export function PostRunSelfie({ stoppedAtUtc, onComplete, onSkip, onPhaseChange 
   const [attempt, setAttempt] = useState(0);
   const [view, setView] = useState<View>(INITIAL_VIEW);
   const [result, setResult] = useState<SelfieBiometrics | null>(null);
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const statusRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (view.phase === "starting") titleRef.current?.focus();
+    else if (view.phase === "result" || view.phase === "error") statusRef.current?.focus();
+  }, [view.phase]);
 
   useEffect(() => { onPhaseChange?.(view.phase); }, [view.phase, onPhaseChange]);
 
@@ -378,38 +385,40 @@ export function PostRunSelfie({ stoppedAtUtc, onComplete, onSkip, onPhaseChange 
     <section className="selfie-screen" aria-labelledby="selfie-title">
       <header>
         <p className="eyebrow">Optional post-run scan</p>
-        <h2 id="selfie-title">Camera pulse check</h2>
-        <p className="selfie-notice">Experimental, not a medical device. Stay seated or stand safely; do not scan while moving. No images are saved or uploaded.</p>
+        <h2 id="selfie-title" ref={titleRef} tabIndex={-1}>Camera pulse check</h2>
+        <p className="selfie-notice">Experimental, not a medical device. Sit or stand safely; do not scan while moving. No images are saved or uploaded. If you feel unwell, do not rely on the camera.</p>
       </header>
-      <div className="selfie-actions">
-        {done && result ? <button type="button" data-session-target="accept-selfie-result" className="selfie-primary" onClick={() => onComplete(result)}>Continue{result.status === "estimated" ? " with reading" : " without a reading"}</button> :
-          <button type="button" data-session-target="finish-selfie-scan" className="selfie-primary" disabled={!usable} onClick={() => sessionRef.current?.finish()}>Use reading</button>}
-        {(done || failed) && <button type="button" data-session-target="retry-selfie-scan" onClick={() => { sessionRef.current?.stop(); setAttempt((value) => value + 1); }}>Retry camera scan</button>}
-        <button type="button" data-session-target="skip-selfie-scan" className="selfie-skip" onClick={skip}>{failed ? "Continue without scanning" : "Skip camera scan"}</button>
-      </div>
-      <div className={`selfie-preview${done || failed ? " selfie-preview-ended" : ""}`}>
+      <div className="selfie-preview" hidden={done || failed}>
         <video ref={videoRef} autoPlay muted playsInline aria-label="Mirrored front-camera preview" />
         {!done && !failed && <div className="selfie-face-guide" aria-hidden="true" />}
-        {(done || failed) && <span>{result?.status === "estimated" ? "Scan complete" : "Camera off"}</span>}
       </div>
-      <div className="selfie-status" role="status" aria-live="polite" aria-atomic="true">
+      <div ref={statusRef} tabIndex={-1} className={`selfie-status${failed ? " selfie-error" : ""}`} role="status" aria-live="polite" aria-atomic="true">
         <p>{view.guidance}</p>
-        {!done && !failed && <p className="selfie-hint">Keep your forehead and both cheeks visible. Look straight ahead, avoid talking, and use even light without glare.</p>}
+        {!done && !failed && <p className="selfie-hint">Rest your phone. Keep your forehead and cheeks visible, face even light, and avoid talking.</p>}
       </div>
       {!done && !failed && <div className="selfie-progress">
         <label htmlFor="selfie-progress">{Math.floor(view.elapsed)} / {CAPTURE_SECONDS} seconds{view.phase === "paused" ? " · paused" : ""}</label>
         <progress id="selfie-progress" max={CAPTURE_SECONDS} value={view.elapsed} />
         <small>Continuous signal: {Math.floor(view.windowSeconds)} seconds · at least 20 needed</small>
       </div>}
-      <div className="selfie-reading">
+      {view.phase !== "starting" && !failed && <div className="selfie-reading">
         {((usable && view.estimate) || result?.status === "estimated") ? <>
           <span className="selfie-reading-label">Estimated pulse</span>
           <strong>{Math.round(result?.heart_rate_bpm ?? view.estimate!.heart_rate_bpm!)} <small>bpm</small></strong>
-        </> : <p>{done ? "No reliable pulse estimate. Try again in steady light, or continue." : "No usable pulse estimate yet."}</p>}
+        </> : <p>{done ? "No reliable pulse estimate. Retry in steady light, or return to your run debrief." : "No usable pulse estimate yet."}</p>}
         {(view.estimate || result) && <small>Signal quality: {Math.round(Math.max(0, Math.min(1, result?.signal_quality ?? view.estimate?.signal_quality ?? 0)) * 100)}% (not medical accuracy)</small>}
         {result?.heart_rate_change_bpm != null && <p>Pulse change over scan: <b>{result.heart_rate_change_bpm > 0 ? "+" : ""}{result.heart_rate_change_bpm} bpm</b> across {result.trend_interval_seconds} seconds. Not one-minute heart-rate recovery.</p>}
+      </div>}
+      <div className="selfie-actions">
+        {done && result ? <button type="button" data-session-target="accept-selfie-result" className="selfie-primary" onClick={() => onComplete(result)}>{result.status === "estimated" ? "Keep reading · back to debrief" : "Keep scan details · back to debrief"}</button> :
+          !failed && <button type="button" data-session-target="finish-selfie-scan" className="selfie-primary" disabled={!usable} onClick={() => sessionRef.current?.finish()}>{usable ? "Finish scan · review reading" : view.phase === "starting" ? "Opening camera…" : view.phase === "paused" ? "Scan paused" : "Waiting for usable signal…"}</button>}
+        {(done || failed) && <button type="button" className={failed ? "selfie-primary" : undefined} data-session-target="retry-selfie-scan" onClick={() => { sessionRef.current?.stop(); setAttempt((value) => value + 1); }}>{done ? "Discard scan · retry" : "Retry camera scan"}</button>}
+        <button type="button" data-session-target="skip-selfie-scan" className="selfie-skip" onClick={skip}>{done ? "Discard scan · back to debrief" : "Cancel scan · back to debrief"}</button>
       </div>
-      <p className="selfie-limitations">Motion, skin visibility, lighting and camera processing can prevent a reading or make it inaccurate. This cannot measure blood pressure, oxygen saturation, temperature, respiration or HRV. If you feel unwell, do not rely on the camera.</p>
+      <details className="selfie-limitations">
+        <summary>What this scan can and cannot tell you</summary>
+        <p>Motion, skin visibility, lighting and camera processing can prevent a reading or make it inaccurate. This cannot measure blood pressure, oxygen saturation, temperature, respiration or HRV.</p>
+      </details>
     </section>
   );
 }

@@ -5,16 +5,18 @@
   min-width: 0;
   padding-bottom: max(16px, env(safe-area-inset-bottom));
   color: #10231b;
+  overflow-wrap: anywhere;
 }
 
-.spoken-pulse-screen h2 { margin: 0 0 10px; font-size: 1.6rem; }
+.spoken-pulse-screen > *, .spoken-pulse-screen header { min-width: 0; }
+.spoken-pulse-screen h2 { margin: 0 0 10px; font-size: clamp(1.35rem, 5.5vw, 1.6rem); line-height: 1.2; }
 .spoken-pulse-screen p { margin: 0; line-height: 1.45; }
 .spoken-pulse-notice { padding: 12px; border: 1px solid #c9b56d; border-radius: 10px; background: #fff8de; }
 .spoken-pulse-instructions { margin: 0; padding-left: 25px; line-height: 1.5; }
 .spoken-pulse-instructions li + li { margin-top: 7px; }
 .spoken-pulse-position { display: grid; gap: 7px; font-weight: 750; }
 .spoken-pulse-position select { width: 100%; min-width: 0; min-height: 48px; padding: 10px; border: 1px solid #729c85; border-radius: 10px; background: #fff; color: #173d29; font: inherit; }
-.spoken-pulse-status { min-height: 3em; font-weight: 750; }
+.spoken-pulse-status { padding: 12px; border-radius: 10px; background: #eaf3ed; font-weight: 750; }
 .spoken-pulse-progress { display: grid; gap: 8px; }
 .spoken-pulse-progress label { font-weight: 750; font-variant-numeric: tabular-nums; }
 .spoken-pulse-progress progress { width: 100%; height: 14px; accent-color: #12683f; }
@@ -35,14 +37,18 @@
 .spoken-pulse-confirm { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; line-height: 1.45; font-weight: 750; cursor: pointer; }
 .spoken-pulse-confirm input { flex: 0 0 24px; width: 24px; height: 24px; margin: 0; accent-color: #12683f; }
 .spoken-pulse-actions { display: grid; gap: 10px; }
-.spoken-pulse-actions button { min-height: 52px; width: 100%; padding: 13px 16px; border: 1px solid #729c85; border-radius: 12px; background: #fff; color: #173d29; font-weight: 800; cursor: pointer; touch-action: manipulation; white-space: normal; }
+.spoken-pulse-actions-capturing { position: sticky; bottom: max(8px, env(safe-area-inset-bottom)); z-index: 1; padding: 8px; border-radius: 12px; background: #edf2ef; }
+.spoken-pulse-actions button { min-height: 52px; width: 100%; min-width: 0; padding: 13px 16px; border: 1px solid #729c85; border-radius: 12px; background: #fff; color: #173d29; font: inherit; font-weight: 800; line-height: 1.35; cursor: pointer; touch-action: manipulation; white-space: normal; overflow-wrap: anywhere; }
 .spoken-pulse-actions .spoken-pulse-primary { border-color: #12683f; background: #12683f; color: #fff; }
 .spoken-pulse-actions button:disabled { background: #d5ded8; color: #4e6155; border-color: #b4c2b9; cursor: default; }
 .spoken-pulse-actions .spoken-pulse-skip { border-color: #647a6c; }
-.spoken-pulse-screen :is(button, select, input, a, audio):focus-visible { outline: 3px solid #2045c7; outline-offset: 3px; }
+.spoken-pulse-screen :is(button, select, input, a, audio, summary, [tabindex="-1"]):focus-visible { outline: 3px solid #2045c7; outline-offset: 3px; }
 .spoken-pulse-error { padding: 12px; border: 1px solid #b93838; border-radius: 10px; color: #8b2020; background: #fff2f2; }
 .spoken-pulse-hint, .spoken-pulse-progress small { color: #40564a; font-size: 0.88rem; line-height: 1.4; }
-.spoken-pulse-limitations { font-size: 0.8rem; color: #40564a; }
+.spoken-pulse-limitations { font-size: 0.88rem; color: #40564a; }
+.spoken-pulse-details { min-width: 0; border-top: 1px solid #c0d6c8; }
+.spoken-pulse-details > summary { min-height: 44px; padding: 12px 0; box-sizing: border-box; font-weight: 750; line-height: 1.4; cursor: pointer; touch-action: manipulation; }
+.spoken-pulse-details[open] > summary { margin-bottom: 6px; }
 
 @media (max-width: 350px) {
   .spoken-pulse-screen { gap: 11px; }

@@ -5,6 +5,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.7.0",
+    notes: [
+      "Start run and Voice note lead Home. Pairing stays optional; run history, recording details and settings each have one place.",
+      "Setup has one GPS/start status, with device checks and run details folded away. Stop, review, optional pulse readings, Save run and Done are clearer separate steps.",
+      "Save screens distinguish saving, saved and failed. An older archived copy can no longer make a failed edit look saved; retry and download remain available without discarding the draft.",
+      "Saved runs expand by keyboard or touch for routes and downloads. Dialogs keep background controls inert, support Escape and preserve the unsaved voice-note guard.",
+      "Phone-sized layouts, readable forms and reachable capture exits. Coach protocols, measurement algorithms, saved runs and queued audio/details are unchanged.",
+    ],
+  },
+  {
     version: "0.6.6",
     notes: [
       "Automatic Home updates show Updating app instead of briefly asking for a tap that is not needed.",

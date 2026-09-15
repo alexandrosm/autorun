@@ -67,7 +67,7 @@ import type {
 import { emptyWeatherSnapshot, fetchOpenMeteoWeather } from "./weather";
 
 const APP_NAME = "Green Lake AutoResearch Logger";
-const APP_VERSION = "0.6.6";
+const APP_VERSION = "0.7.0";
 const TIMEZONE = "America/Los_Angeles";
 const STORAGE_KEY = "greenlake_autoresearch_logger_active_run_v0_1";
 const IDB_ACTIVE_RUN_KEY = "active_run";
@@ -373,6 +373,26 @@ function createBlankRun(
   };
 }
 
+function Modal({ label, onClose, children, ignoreSession = false }: {
+  label: string;
+  onClose: () => void;
+  children: ReactNode;
+  ignoreSession?: boolean;
+}) {
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+  return (
+    <dialog ref={dialogRef} className="modal-root" aria-label={label} data-session-ignore={ignoreSession || undefined}
+      onCancel={(event) => { event.preventDefault(); onClose(); }}>
+      {children}
+    </dialog>
+  );
+}
+
 export default function App() {
   const [initialRun] = useState(loadStoredRun);
   const [preRun, setPreRun] = useState<PreRunState>(
@@ -386,6 +406,8 @@ export default function App() {
   const [elapsedSeconds, setElapsedSeconds] = useState(initialRun?.elapsed_offset_seconds ?? 0);
   const [exportCreatedAt, setExportCreatedAt] = useState(new Date().toISOString());
   const [actionMessage, setActionMessage] = useState("");
+  const [archiveStatus, setArchiveStatus] = useState<RunArchiveSave["status"] | null>(null);
+  const screenElementRef = useRef<HTMLElement | null>(null);
   const [warmup, setWarmup] = useState<PreRunGpsWarmup>(initialRun?.pre_run_gps_warmup ?? defaultWarmup());
   const [motionDebugDraft, setMotionDebugDraft] = useState<MotionDebug>(initialRun?.motion_debug ?? defaultMotionDebug());
   const [warmupStatus, setWarmupStatus] = useState<{
@@ -924,24 +946,6 @@ export default function App() {
     [appendLifecycleEvent, getElapsedSeconds, updatePermissions],
   );
 
-  const requestGpsPermission = () => {
-    if (!("geolocation" in navigator)) {
-      updatePermissions({ geolocation_available: false, geolocation_permission: "unavailable" });
-      setActionMessage("GPS unavailable.");
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(
-      () => {
-        updatePermissions({ geolocation_permission: "ready" });
-        setActionMessage("GPS ready.");
-      },
-      (error) => {
-        updatePermissions({ geolocation_permission: error.code === error.PERMISSION_DENIED ? "denied" : "unavailable" });
-        setActionMessage(error.code === error.PERMISSION_DENIED ? "GPS denied." : "GPS unavailable.");
-      },
-      { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 },
-    );
-  };
 
   const requestMotionPermission = useCallback(async (silent = false) => {
     if (!permissions.device_motion_available) {
@@ -1109,7 +1113,7 @@ export default function App() {
       setPendingStart(false);
       setGpsStartTimedOut(false);
       setCountdownSeconds(START_COUNTDOWN_SECONDS);
-      setActionMessage(startAnyway ? "Starting without a fresh GPS fix." : "Starting in 3...");
+      setActionMessage(startAnyway ? "Starting without a fresh GPS fix." : "");
       let nextSecond = START_COUNTDOWN_SECONDS;
       countdownIntervalRef.current = window.setInterval(() => {
         nextSecond -= 1;
@@ -1137,7 +1141,7 @@ export default function App() {
 
     setPendingStart(true);
     setGpsStartTimedOut(false);
-    setActionMessage("Getting GPS. Countdown will start when the fix is fresh.");
+    setActionMessage("");
     if (!warmupStatus.active) {
       armGps(true);
     }
@@ -1147,7 +1151,6 @@ export default function App() {
     }
     startGpsTimeoutRef.current = window.setTimeout(() => {
       setGpsStartTimedOut(true);
-      setActionMessage("GPS is not ready yet. Keep waiting, or start anyway.");
     }, START_GPS_TIMEOUT_SECONDS * 1000);
   }, [
     armGps,
@@ -1388,6 +1391,7 @@ export default function App() {
     void deleteRunFromIndexedDb();
     activeRunRef.current = null;
     archiveSaveRef.current = null;
+    setArchiveStatus(null);
     setActiveRun(null);
     setPreRun((current) => ({ ...defaultPreRun, active_patch_id: current.active_patch_id }));
     setPermissions(defaultPermissions());
@@ -1484,6 +1488,7 @@ export default function App() {
   };
 
   const continueToExport = () => {
+    setActionMessage("");
     sessionRecorderRef.current?.record("export_run");
     void sessionRecorderRef.current?.flush("export");
     const createdAt = new Date().toISOString();
@@ -1497,6 +1502,7 @@ export default function App() {
         status: "saving",
       };
       archiveSaveRef.current = archive;
+      setArchiveStatus("saving");
       recoverySuppressedRef.current = false;
       // Serial writes keep an older export from overwriting a newer debrief.
       archiveQueueRef.current = archiveQueueRef.current.then(() => saveCompletedRunToHistory(payload, filename)).then((nextHistory) => {
@@ -1513,13 +1519,13 @@ export default function App() {
             // Draft cleanup is best effort.
           }
           void deleteRunFromIndexedDb();
-          setActionMessage("Export ready. Run saved to local history.");
+          setArchiveStatus("saved");
         }
         void syncRunsToLab();
       }).catch(() => {
         archive.status = "failed";
         if (archiveSaveRef.current === archive) {
-          setActionMessage("Export ready. Local history save failed; download still works.");
+          setArchiveStatus("failed");
         }
       });
     }
@@ -1883,7 +1889,6 @@ export default function App() {
           : "Direct lab access could not be established.";
         // An empty background check must finish even when direct access fails.
         setLabSync({ status: direct && deferredErrors === 0 ? "ok" : "offline", detail });
-        if (announce) setActionMessage(detail);
         return;
       }
       if (direct) {
@@ -1940,9 +1945,6 @@ export default function App() {
         if (continuation) clearLabHandoverBatch();
         const detail = parts.join(" ");
         setLabSync({ status: failed > 0 || rejected > 0 ? "offline" : "ok", detail });
-        if (announce) {
-          setActionMessage(detail);
-        }
         return;
       }
       // A failed fetch cannot prove the lab is down: browser permission denials
@@ -1951,7 +1953,6 @@ export default function App() {
       if (!handoverPossible) {
         const detail = "The endpoint did not provide a valid lab response. Check the lab address and connection.";
         setLabSync({ status: "offline", detail });
-        if (announce) setActionMessage(detail);
         return;
       }
       if (!announce) {
@@ -2072,7 +2073,6 @@ export default function App() {
             if (total > 0) {
               const detail = `Lab stored ${stored} of ${total} items.${continuation ? ` Continuing with ${remaining} remaining…` : ""}`;
               setLabSync({ status: stored === total ? "ok" : "offline", detail });
-              setActionMessage(detail);
             } else {
               setLabSync({ status: "ok", detail: "Lab check-in complete; no items in this batch." });
             }
@@ -2659,19 +2659,30 @@ export default function App() {
     };
   }, [clearStartTimers, releaseWakeLock, stopGpsWatch, stopWarmupWatch]);
 
+  useEffect(() => {
+    window.scrollTo(0, 0);
+    if (!recordingPulse && screen !== "selfie") screenElementRef.current?.focus({ preventScroll: true });
+  }, [screen, recordingPulse]);
+
   return (
-    <main className={screen === "live" ? "app-shell app-shell-live" : "app-shell"}>
+    <main ref={screenElementRef} tabIndex={-1} aria-label={`${screenLabel(screen)} screen`} className={screen === "live" ? "app-shell app-shell-live" : "app-shell"}>
       {screen !== "live" && !recordingPulse ? <header className="app-header">
         <div>
           <button data-session-ignore type="button" className="eyebrow version-button" onClick={() => setChangelogOpen(true)}>
             v{APP_VERSION}
           </button>
-          <h1>{APP_NAME}</h1>
+          <h1>Green Lake</h1>
+          <p className="app-subtitle">AutoResearch run logger</p>
         </div>
         <div className="screen-chip">{screenLabel(screen)}</div>
       </header> : null}
 
-      {actionMessage && screen !== "live" ? <div className="notice">{actionMessage}</div> : null}
+      {actionMessage && screen !== "live" && !recordingPulse ? (
+        <div className="notice panel-header">
+          <span role="status">{actionMessage}</span>
+          <button data-session-ignore type="button" className="link-button" aria-label="Dismiss message" onClick={() => setActionMessage("")}>Dismiss</button>
+        </div>
+      ) : null}
       {serviceWorkerUpdateState !== "none" && serviceWorkerUpdateSafe ? (
         serviceWorkerUpdateState === "applying" || (serviceWorkerUpdateState === "ready" && screen === "home") ? (
           <div data-session-ignore role="status" className="update-banner">Updating app…</div>
@@ -2681,11 +2692,6 @@ export default function App() {
           </button>
         )
       ) : null}
-      {installPrompt && screen !== "live" && !recordingPulse ? (
-        <button data-session-ignore type="button" className="install-banner" onClick={() => void installPwa()}>
-          Install app
-        </button>
-      ) : null}
 
       {screen === "home" ? (
         <HomeScreen
@@ -2694,12 +2700,14 @@ export default function App() {
           labEndpoint={labEndpoint}
           onLabEndpointChange={handleLabEndpointChange}
           onPaired={() => void syncRunsToLab(true)}
-          onStartNew={() => setScreen("setup")}
+          onStartNew={() => { setActionMessage(""); setScreen("setup"); }}
           scanning={scanningLab}
           setScanning={setScanningLab}
           pendingNoteCount={voiceNotes.filter((note) => !note.synced_at_utc).length}
           onRecordNote={startVoiceNote}
           sessionStatus={sessionStatus}
+          installAvailable={Boolean(installPrompt)}
+          onInstall={() => void installPwa()}
           onDetailedRecordingChange={(enabled) => {
             sessionRecorderRef.current?.setEnabled(enabled);
             if (!enabled) coachSensorsRef.current?.stop();
@@ -2730,7 +2738,6 @@ export default function App() {
           countdownSeconds={countdownSeconds}
           appVisible={document.visibilityState === "visible"}
           setPreRun={setPreRun}
-          onGps={requestGpsPermission}
           onArmGps={() => armGps(false)}
           onStopWarmup={stopWarmupWatch}
           onMotion={() => void requestMotionPermission(false)}
@@ -2743,6 +2750,7 @@ export default function App() {
             setPendingStart(false);
             setCountdownSeconds(null);
             setGpsStartTimedOut(false);
+            setActionMessage("");
             setScreen("home");
           }}
           planPreview={planPreview}
@@ -2850,7 +2858,8 @@ export default function App() {
           onDownloadZip={downloadZip}
           onCopyZip={() => void copyZipBase64()}
           onDownloadCoachSummary={downloadCoachSummary}
-          runHistory={runHistory}
+          saveStatus={archiveStatus}
+          onRetrySave={continueToExport}
           historyActions={historyActions}
           biometrics={activeRun.post_run.selfie_biometrics}
           onBackToPost={() => setScreen("post")}
@@ -2898,6 +2907,7 @@ export default function App() {
       ) : null}
 
       {changelogOpen ? (
+        <Modal label="What changed" onClose={() => setChangelogOpen(false)} ignoreSession>
         <div data-session-ignore className="changelog-overlay" onClick={() => setChangelogOpen(false)}>
           <section className="changelog-panel" onClick={(event) => event.stopPropagation()}>
             <div className="health-header">
@@ -2918,6 +2928,7 @@ export default function App() {
             ))}
           </section>
         </div>
+        </Modal>
       ) : null}
     </main>
   );
@@ -3001,6 +3012,8 @@ function HomeScreen({
   scanning,
   setScanning,
   sessionStatus,
+  installAvailable,
+  onInstall,
   onDetailedRecordingChange,
   onDownloadDetails,
   onClearDetails,
@@ -3016,10 +3029,16 @@ function HomeScreen({
   scanning: boolean;
   setScanning: (value: boolean) => void;
   sessionStatus: SessionRecordingStatus;
+  installAvailable: boolean;
+  onInstall: () => void;
   onDetailedRecordingChange: (enabled: boolean) => void;
   onDownloadDetails: () => void;
   onClearDetails: () => void;
 }) {
+  const [endpointDraft, setEndpointDraft] = useState(labEndpoint);
+  const [endpointError, setEndpointError] = useState("");
+  useEffect(() => { setEndpointDraft(labEndpoint); }, [labEndpoint]);
+
   const handleScanResult = useCallback(
     (text: string) => {
       const endpoint = extractLabEndpoint(text);
@@ -3043,44 +3062,46 @@ function HomeScreen({
   return (
     <section className="screen-stack">
       <div className="home-actions">
-        {!paired ? (
-          <button data-session-ignore type="button" className="primary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
-            <Camera size={20} />
-            Pair with the lab
-          </button>
-        ) : historyActions.labSync.handoverUrl ? (
-          <a data-session-ignore className="primary-button" href={historyActions.labSync.handoverUrl}>
-            <RefreshCw size={20} />
-            Open lab page to finish sync
-          </a>
-        ) : pendingCount > 0 ? (
-          <button data-session-ignore data-session-target="sync-lab" type="button" className="primary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}><RefreshCw size={20} />
-          {syncBusy
-            ? "Syncing…"
-            : `Sync ${describePendingItems(pendingRuns, pendingNoteCount, sessionStatus.pending_chunks)} to lab`}</button>
-        ) : null}
-
-        <button data-session-target="start-setup" type="button"
-        className={!paired || pendingCount > 0 ? "secondary-button" : "primary-button"} onClick={onStartNew} disabled={syncBusy}><Play size={20} />
-        Start run
-                </button>
-
-        <button data-session-target="record-voice" type="button" className="secondary-button" onClick={onRecordNote} disabled={syncBusy}><Mic size={18} />
-        Voice note
-                </button>
-
-        <p className="home-status">
-          {!paired
-            ? "Not paired yet — scan the QR on the lab computer's /pair page."
-            : historyActions.labSync.detail ||
-              (pendingCount === 0
-                ? "Everything is in the lab."
-                : `${describePendingItems(pendingRuns, pendingNoteCount, sessionStatus.pending_chunks)} waiting to sync.`)}
-        </p>
+        <button data-session-target="start-setup" type="button" className="primary-button" onClick={onStartNew} disabled={syncBusy}>
+          <Play size={20} />Start run
+        </button>
+        <button data-session-target="record-voice" type="button" className="secondary-button" onClick={onRecordNote} disabled={syncBusy}>
+          <Mic size={18} />Voice note
+        </button>
       </div>
 
+      <section data-session-ignore className="form-panel lab-panel" aria-label="Lab connection">
+        <div className="panel-header">
+          <h2 className="screen-title">Lab</h2>
+          <span>{!paired ? "Not paired" : pendingCount > 0 ? `${pendingCount} ${pendingCount === 1 ? "item" : "items"} waiting` : "Nothing waiting"}</span>
+        </div>
+        <p className="panel-copy" role="status">
+          {!paired ? "You can run without pairing. Runs stay on this device until you send them to your coach." :
+            historyActions.labSync.detail || (pendingCount > 0
+              ? `${describePendingItems(pendingRuns, pendingNoteCount, sessionStatus.pending_chunks)} ready to send on home Wi-Fi.`
+              : "Check in to receive the latest coach protocol.")}
+        </p>
+        {!paired ? (
+          <button type="button" className="secondary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
+            <Camera size={18} />Pair with the lab
+          </button>
+        ) : historyActions.labSync.handoverUrl ? (
+          <a className="secondary-button" href={historyActions.labSync.handoverUrl}>
+            <RefreshCw size={18} />Open lab page to finish sync
+          </a>
+        ) : (
+          <button data-session-target="sync-lab" type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}>
+            <RefreshCw size={18} />{syncBusy ? "Syncing…" : pendingCount > 0 ? "Sync to lab" : "Check in with the lab"}
+          </button>
+        )}
+      </section>
+
+      <RunHistoryPanel entries={runHistory} actions={historyActions} />
+      {sessionStatus.persistence_error ? <p role="alert" className="notice">{sessionStatus.persistence_error}</p> : null}
+      {sessionStatus.dropped_records > 0 ? <p role="alert" className="notice">{sessionStatus.dropped_records} detail records could not be retained.</p> : null}
+
       <details data-session-ignore className="preflight-panel session-details" data-session-target="session-details">
-        <summary>Detailed recording {sessionStatus.enabled ? "on" : "off"} · {sessionStatus.pending_chunks} pending chunks</summary>
+        <summary>Recording details · {sessionStatus.paused ? "paused" : sessionStatus.enabled ? "on" : "off"}</summary>
         <label className="switch-label">
           <input type="checkbox" data-session-target="detailed-recording" checked={sessionStatus.enabled}
             onChange={(event) => onDetailedRecordingChange(event.target.checked)} disabled={syncBusy} />
@@ -3090,38 +3111,58 @@ function HomeScreen({
         <p>Opening the app, browsing, checking diagnostics and syncing do not create uploads by themselves. Idle device state and the latest scroll accompany the next real action or error; live-run state and sensors remain recorded.</p>
         <p>Details stay on this device until the paired lab receives them. Sync on home Wi-Fi; browser restrictions may require the lab-page round trip. Acknowledged chunks are removed here. {formatBytes(sessionStatus.pending_bytes)} queued; a 20 MB limit pauses new detail capture rather than deleting unsent data.</p>
         <p>Phone movement is not a validated gait measurement. Unsupported, denied, hidden-page and missing-sample periods are reported, not filled in.</p>
-        {sessionStatus.persistence_error ? <p role="alert" className="notice">{sessionStatus.persistence_error}</p> : null}
-        {sessionStatus.dropped_records > 0 ? <p role="alert">{sessionStatus.dropped_records} detail records could not be retained.</p> : null}
         <div className="button-grid">
           <button type="button" className="secondary-button" data-session-target="download-session-details" onClick={onDownloadDetails} disabled={syncBusy}>Download pending details</button>
           <button type="button" className="danger-button" data-session-target="clear-session-details" onClick={onClearDetails} disabled={syncBusy}>Clear pending details</button>
         </div>
       </details>
 
-      <RunHistoryPanel entries={runHistory} actions={historyActions} />
 
       <details data-session-ignore className="preflight-panel">
-        <summary>Lab settings</summary>
-        <button type="button" className="secondary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
-          <Camera size={18} />
-          Scan lab QR
-        </button>
+        <summary>Settings</summary>
+        {installAvailable ? <button type="button" className="secondary-button" onClick={onInstall}>Install app</button> : null}
         {paired ? (
-          <button data-session-target="sync-lab" type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={syncBusy}><RefreshCw size={18} />
-          Check in with the lab
-                    </button>
+          <button type="button" className="secondary-button" onClick={() => setScanning(true)} disabled={syncBusy}>
+            <Camera size={18} />Scan a different lab QR
+          </button>
         ) : null}
+        <form onSubmit={(event) => {
+          event.preventDefault();
+          let endpoint = "";
+          try {
+            if (endpointDraft.trim()) {
+              const url = new URL(endpointDraft.trim());
+              if (!/^https?:$/.test(url.protocol)) throw new Error();
+              endpoint = normalizeLabEndpoint(url.origin);
+            }
+          } catch {
+            setEndpointError("Enter a valid HTTP or HTTPS lab address.");
+            return;
+          }
+          setEndpointError("");
+          onLabEndpointChange(endpoint);
+          if (endpoint) onPaired();
+        }}>
         <label>
           Lab endpoint URL
           <input
             data-session-target="lab-endpoint"
-            value={labEndpoint}
+            value={endpointDraft}
             disabled={syncBusy}
             inputMode="url"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            aria-describedby="lab-endpoint-help"
+            aria-invalid={Boolean(endpointError)}
             placeholder="http://192.168.1.11:8787"
-            onChange={(event) => onLabEndpointChange(event.target.value)}
+            onChange={(event) => { setEndpointDraft(event.target.value); setEndpointError(""); }}
           />
         </label>
+        <p id="lab-endpoint-help" className="panel-copy">Use the address on the lab computer's /pair page. Leave blank to disconnect.</p>
+        {endpointError ? <p role="alert">{endpointError}</p> : null}
+        <button type="submit" className="secondary-button" disabled={syncBusy}>Save connection</button>
+        </form>
       </details>
 
       {scanning ? <QrScanner onResult={handleScanResult} onClose={() => setScanning(false)} /> : null}
@@ -3321,7 +3362,11 @@ function VoiceNoteRecorder({
       </div>
     </section>
   );
-  return portalHost ? createPortal(content, portalHost) : content;
+  return inline ? (portalHost ? createPortal(content, portalHost) : null) : (
+    <Modal label="Voice note" onClose={() => {
+      if (!saving && (!ready || window.confirm("Discard this voice note?"))) onClose();
+    }}>{content}</Modal>
+  );
 }
 
 function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean; onClose: () => void }) {
@@ -3431,6 +3476,7 @@ function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean;
   }, [onResult]);
 
   return (
+    <Modal label="Pair with the lab" onClose={onClose} ignoreSession>
     <div data-session-ignore className="scanner-overlay">
       <video ref={videoRef} className="scanner-video" muted playsInline />
       <p>{error || "Point the camera at the lab pairing QR."}</p>
@@ -3438,6 +3484,7 @@ function QrScanner({ onResult, onClose }: { onResult: (text: string) => boolean;
         Cancel
       </button>
     </div>
+    </Modal>
   );
 }
 
@@ -3451,7 +3498,6 @@ function SetupScreen({
   countdownSeconds,
   appVisible,
   setPreRun,
-  onGps,
   onArmGps,
   onStopWarmup,
   onMotion,
@@ -3470,7 +3516,6 @@ function SetupScreen({
   countdownSeconds: number | null;
   appVisible: boolean;
   setPreRun: (next: PreRunState) => void;
-  onGps: () => void;
   onArmGps: () => void;
   onStopWarmup: () => void;
   onMotion: () => void;
@@ -3488,74 +3533,47 @@ function SetupScreen({
   };
   const gpsReady = isWarmupGpsReady(warmupStatus.latestPoint, warmupStatus.latestAccuracy);
   const preflightItems = buildPreflightItems(preRun, permissions, warmupStatus, appVisible);
-  const preflightReady = preflightItems.every((item) => item.ok);
+  const protocol = loadCoachProtocol();
   const canStart = countdownSeconds === null && !pendingStart;
   const startLabel =
     countdownSeconds !== null
-      ? String(countdownSeconds)
+      ? `Starting in ${countdownSeconds}…`
       : pendingStart
-        ? "Getting GPS..."
-        : gpsReady
-          ? "Start"
-          : "Start (get GPS first)";
+        ? "Getting GPS…"
+        : gpsReady ? "Start run" : "Get GPS & start";
 
   return (
     <section className="screen-stack">
       <section className="result-panel">
-        <p className="eyebrow">Today's mission</p>
-        <h2>Controlled start</h2>
-      <p className="filename">Likely route and target will be inferred from GPS. Current patch: {preRun.active_patch_id}.</p>
-      <p className="filename">{planPreview}</p>
+        <p className="eyebrow">Before you run</p>
+        <h2>Today's plan</h2>
+        <p className="panel-copy">{planPreview}</p>
+        <details>
+          <summary>{protocol ? "Coach protocol and pace bands" : "Built-in pace bands"}</summary>
+          <p className="panel-copy">{protocol?.thesis || "Reduce late fade with a controlled first kilometer."}</p>
+          <p className="panel-copy">Protocol: {protocol?.protocol_id ?? "not paired"} · Patch: {preRun.active_patch_id}</p>
+          <div className="preflight-list">
+            {(protocol?.bands ?? CONTROLLED_START_BANDS).map((band) => (
+              <div className="preflight-item" key={band.km}><span>{band.label}</span><strong>{band.text}</strong></div>
+            ))}
+          </div>
+        </details>
       </section>
 
-      <section className="status-grid">
-        <StatusItem label="GPS" value={permissionLabel(permissions.geolocation_permission)} />
-        <StatusItem label="Wake lock" value={wakeLabel(permissions.wake_lock_status)} />
-        <StatusItem label="Weather" value={weatherLabel(permissions.weather_status)} />
+      <section className={countdownSeconds !== null ? "target-banner countdown-banner" : "preflight-panel"} role="status">
+        {countdownSeconds !== null ? <><strong>{countdownSeconds}</strong><span>Go on zero.</span></> : (
+          <>
+            <div className="preflight-header">
+              <strong>{gpsReady ? "GPS ready" : permissions.geolocation_permission === "denied" ? "Location is blocked" : "Waiting for GPS"}</strong>
+              <span>{formatAccuracy(warmupStatus.latestAccuracy)}</span>
+            </div>
+            <p className="panel-copy">{permissions.geolocation_permission === "denied"
+              ? "Allow location in browser settings for a recorded route. You can also start without GPS after the waiting period."
+              : pendingStart ? "The 3-second countdown starts automatically when a fresh GPS fix is ready."
+              : "GPS warms up automatically. Start when you're ready to move; keep the app visible and the phone secure."}</p>
+          </>
+        )}
       </section>
-
-      {warmupStatus.active || warmup.armed_at_utc ? (
-        <section className="warmup-panel">
-          <div>
-            <span>GPS warmup</span>
-            <strong>{warmupReadyLabel(warmupStatus.latestAccuracy)}</strong>
-          </div>
-          <div>
-            <span>Current accuracy</span>
-            <strong>{formatAccuracy(warmupStatus.latestAccuracy)}</strong>
-          </div>
-          <div>
-            <span>Best accuracy</span>
-            <strong>{formatAccuracy(warmup.best_accuracy_meters)}</strong>
-          </div>
-        </section>
-      ) : null}
-
-      {pendingStart || countdownSeconds !== null ? (
-        <section className={countdownSeconds !== null ? "target-banner countdown-banner" : "warmup-panel"}>
-          {countdownSeconds !== null ? (
-            <>
-              <strong>{countdownSeconds}</strong>
-              <span>Go on zero.</span>
-            </>
-          ) : (
-            <>
-              <div>
-                <span>Start requested</span>
-                <strong>Getting GPS</strong>
-              </div>
-              <div>
-                <span>Accuracy</span>
-                <strong>{formatAccuracy(warmupStatus.latestAccuracy)}</strong>
-              </div>
-              <div>
-                <span>Countdown</span>
-                <strong>auto-starts when ready</strong>
-              </div>
-            </>
-          )}
-        </section>
-      ) : null}
 
       {gpsStartTimedOut ? (
         <section className="warning-banner">
@@ -3567,11 +3585,14 @@ function SetupScreen({
         </section>
       ) : null}
 
-      <section className="preflight-panel">
-        <div className="preflight-header">
-          <strong>Preflight</strong>
-          <span>{preflightReady ? "ready" : "needs attention"}</span>
-        </div>
+      <details className="preflight-panel">
+        <summary>Device checks</summary>
+        <section className="status-grid">
+          <StatusItem label="GPS" value={permissionLabel(permissions.geolocation_permission)} />
+          <StatusItem label="Screen awake" value={wakeLabel(permissions.wake_lock_status)} />
+          <StatusItem label="Weather" value={weatherLabel(permissions.weather_status)} />
+        </section>
+        <p className="panel-copy">Best GPS accuracy: {formatAccuracy(warmup.best_accuracy_meters)}. Motion is optional; Start requests the available sensors and screen wake lock.</p>
         <div className="preflight-list">
           {preflightItems.map((item) => (
             <div className={item.ok ? "preflight-item ok" : "preflight-item warn"} key={item.label}>
@@ -3581,10 +3602,6 @@ function SetupScreen({
             </div>
           ))}
         </div>
-      </section>
-
-      <details className="form-panel">
-        <summary>Edit details</summary>
         <section className="button-grid">
           <button type="button" className="secondary-button" onClick={warmupStatus.active ? onStopWarmup : onArmGps}>
             <MapPin size={18} />
@@ -3594,115 +3611,16 @@ function SetupScreen({
             <Lock size={18} />
             Enable wake lock
           </button>
-          <button type="button" className="secondary-button" onClick={onGps}>
-            <MapPin size={18} />
-            Request GPS
-          </button>
           <button type="button" className="secondary-button" onClick={onMotion}>
             <Activity size={18} />
             Request motion
           </button>
         </section>
+      </details>
 
-      <button
-        type="button"
-        className="secondary-button full-width-button"
-        onClick={() =>
-          setPreRun({
-            ...preRun,
-            mode: "short_run_diagnostic",
-            route_name: "Home block short run",
-            intended_distance_meters: 1500,
-            active_patch_id: CONTROLLED_START_PATCH_ID,
-            route_direction: "unknown",
-          })
-        }
-      >
-        Use short run diagnostic
-      </button>
+      <details className="form-panel">
+        <summary>Run details and how you feel</summary>
 
-      <button
-        type="button"
-        className="secondary-button full-width-button"
-        onClick={() =>
-          setPreRun({
-            ...preRun,
-            mode: "instrumentation_validation",
-            route_name: "instrumentation validation",
-            intended_distance_meters: 300,
-          })
-        }
-      >
-        Use validation mode
-      </button>
-
-      <button
-        type="button"
-        className="secondary-button full-width-button"
-        onClick={() =>
-          setPreRun({
-            ...preRun,
-            mode: "green_lake_5k_calibration",
-            route_name: "Green Lake calibrated 5K",
-            intended_distance_meters: 5000,
-            active_patch_id: CONTROLLED_START_PATCH_ID,
-            route_direction: "unknown",
-          })
-        }
-      >
-        Use Green Lake 5K calibration
-      </button>
-
-      {(() => {
-        const protocol = loadCoachProtocol();
-        const bands = protocol?.bands ?? CONTROLLED_START_BANDS;
-        return (
-          <section className="preflight-panel">
-            <div className="preflight-header">
-              <strong>{protocol ? "Coach protocol" : "Built-in plan"}</strong>
-              <span>{protocol ? protocol.protocol_id : preRun.active_patch_id}</span>
-            </div>
-            <div className="preflight-list">
-              <div className="preflight-item ok">
-                <span>PATCH</span>
-                <strong>{protocol?.patch_id ?? CONTROLLED_START_PATCH_ID}</strong>
-                <small>{protocol?.thesis || "Mission: reduce late fade with a controlled first kilometer."}</small>
-              </div>
-              {bands.map((band) => (
-                <div className="preflight-item ok" key={band.km}>
-                  <span>{band.label}</span>
-                  <strong>{band.text}</strong>
-                </div>
-              ))}
-            </div>
-          </section>
-        );
-      })()}
-
-      {preRun.mode === "green_lake_5k_calibration" ? (
-        <section className="preflight-panel">
-          <div className="preflight-header">
-            <strong>Green Lake checklist</strong>
-            <span>before start</span>
-          </div>
-          <div className="preflight-list">
-            {[
-              "Install/open PWA",
-              "Put phone in fixed position",
-              "Wait for GPS ready — acquisition starts automatically",
-              "Confirm wake lock active",
-              "Start actual run only when ready to move",
-              "Keep app visible",
-              "Stop after target reached banner",
-            ].map((item) => (
-              <div className="preflight-item ok" key={item}>
-                <span>STEP</span>
-                <strong>{item}</strong>
-              </div>
-            ))}
-          </div>
-        </section>
-      ) : null}
 
       <section>
         <ReadonlyField label="Runner ID" value={preRun.runner_id} />
@@ -3776,6 +3694,7 @@ function SetupScreen({
           <label className="switch-label">
             <input
               type="checkbox"
+              aria-label="Pain before run"
               checked={preRun.pain_before_run.present}
               onChange={(event) => setPain({ present: event.target.checked })}
             />
@@ -4115,8 +4034,11 @@ function StopScreen({
   return (
     <section className="screen-stack">
       <section className="result-panel">
-        <h2>Run stopped.</h2>
-        <div className="metrics-grid" onClick={onToggleUnits}>
+        <div className="panel-header">
+          <h2>Run stopped</h2>
+          <button data-session-ignore type="button" className="link-button" onClick={onToggleUnits} aria-label={units === "metric" ? "Switch to miles" : "Switch to kilometers"}>Units: {units === "metric" ? "km" : "mi"}</button>
+        </div>
+        <div className="metrics-grid">
           <Metric label="Duration" value={formatDuration(elapsedSeconds)} />
           <Metric label="Distance" value={formatDistance(liveStats.distanceMeters, units)} />
           <Metric label="Average pace" value={formatPaceForUnits(liveStats.averagePaceSecondsPerMile, units)} />
@@ -4125,10 +4047,9 @@ function StopScreen({
       </section>
 
       <section className="health-panel">
-        <div className="health-header">
-          <strong>Detected run facts</strong>
-          <span>{activityWindow.analysis_basis}</span>
-        </div>
+        <details>
+          <summary>Recording diagnostics</summary>
+          <p className="panel-copy">Analysis: {activityWindow.analysis_basis}</p>
         <div className="health-grid">
           <div className="health-item ok">
             <span>Idle preamble</span>
@@ -4147,18 +4068,19 @@ function StopScreen({
             <strong>{exportPayload.finalization.points_excluded_after_stop} excluded</strong>
           </div>
         </div>
+        </details>
       </section>
 
       <section className="button-grid vertical">
         <button data-session-target="continue" type="button" className="primary-button" onClick={onContinue} >
-          Finish run
+          Review & save run
         </button>
         <button data-session-target="resume-run" type="button" className="secondary-button" onClick={onResume} ><RefreshCw size={18} />
         Resume run
                 </button>
-        <button data-session-target="discard-run" type="button" className="danger-button" onClick={onDiscard} ><Trash2 size={18} />
-        Discard run
-                </button>
+        <button data-session-target="discard-run" type="button" className="link-button danger-link" onClick={onDiscard}>
+          <Trash2 size={18} />Discard run
+        </button>
       </section>
     </section>
   );
@@ -4209,13 +4131,25 @@ function PostRunScreen({
 
   return (
     <section className="screen-stack">
+      <section className="result-panel">
+        <h2>Run debrief</h2>
+        <p className="panel-copy">Add what your coach should know, then save. All questions and pulse readings are optional.</p>
+      </section>
       <section className="health-panel">
-        <div className="health-header"><strong>Speak your pulse</strong><span>optional · experimental</span></div>
-        <p>Feel your wrist pulse and say a short “ta” on each beat. The app times 30 seconds and detects your sounds, not your heartbeat directly.</p>
-        <button type="button" className="primary-button" onClick={onSpokenPulse} disabled={pulseUnavailable}>
-          <Mic size={18} /> {postRun.spoken_pulse_measurements?.length ? "Take another spoken pulse reading" : "Measure spoken pulse"}
-        </button>
-        {pulseUnavailable ? <p>Finish the current voice note or lab sync before starting a pulse reading.</p> : null}
+        <div className="health-header"><strong>Pulse readings</strong><span>optional · experimental</span></div>
+        <p className="panel-copy">Spoken sounds or a camera estimate — neither is a medical pulse or recovery test.</p>
+        <div className="button-grid">
+          <button type="button" className="secondary-button" onClick={onSpokenPulse} disabled={pulseUnavailable}>
+            <Mic size={18} />Speak your pulse
+          </button>
+          <button type="button" className="secondary-button" onClick={onRescan} disabled={pulseUnavailable}>
+            <Camera size={18} />Camera pulse
+          </button>
+        </div>
+        {pulseUnavailable ? <p>Finish the current voice note or lab sync before taking a reading.</p> : null}
+        {postRun.spoken_pulse_measurements?.length || postRun.selfie_biometrics ? (
+          <details>
+            <summary>Saved pulse readings</summary>
         {(postRun.spoken_pulse_measurements ?? []).map((reading) => (
           <div className="preflight-item" key={reading.measurement_id}>
             <div>
@@ -4228,20 +4162,14 @@ function PostRunScreen({
             </div>
           </div>
         ))}
-        <p>Skip this if it is uncomfortable. This is not a clinical pulse or heart-rate recovery test.</p>
+            {postRun.selfie_biometrics ? <SelfieSummary value={postRun.selfie_biometrics} /> : null}
+          </details>
+        ) : null}
       </section>
       <section className="health-panel">
-        <SelfieSummary value={postRun.selfie_biometrics} />
-        <button type="button" className="secondary-button" onClick={onRescan}>
-          <Camera size={18} />
-          {postRun.selfie_biometrics ? "Retake selfie check" : "Measure camera pulse"}
-        </button>
-      </section>
-      <section className="health-panel">
-        <div className="health-header">
-          <strong>Objective facts I inferred</strong>
-          <span>{exportPayload.data_quality_scores.pace_confidence}</span>
-        </div>
+        <details>
+          <summary>Recorded run context</summary>
+          <p className="panel-copy">Pace confidence: {exportPayload.data_quality_scores.pace_confidence}</p>
         <div className="preflight-list">
           {exportPayload.grounded_debrief_context.objective_facts.slice(0, 4).map((fact) => (
             <div className="preflight-item ok" key={fact}>
@@ -4267,6 +4195,7 @@ function PostRunScreen({
             </div>
           ) : null}
         </div>
+        </details>
       </section>
 
       <section className="form-panel">
@@ -4287,9 +4216,51 @@ function PostRunScreen({
           <option data-session-value="very_hard"  value="very_hard" >very hard</option>
           <option data-session-value="max"  value="max" >max</option></select>
         </label>
+        {run.pre_run.protocol_questions && run.pre_run.protocol_questions.length > 0 ? (
+          <section className="form-panel coach-questions">
+            <h3>Coach asks (protocol {run.pre_run.protocol_id})</h3>
+            {run.pre_run.protocol_questions.map((question) => {
+              const value = postRun.protocol_answers[question.id];
+              const answer = (next: string | number | null) =>
+                updatePostRun({ protocol_answers: { ...postRun.protocol_answers, [question.id]: next } });
+              return (
+                <label key={question.id}>
+                  {question.prompt}
+                  {question.kind === "text" ? (
+                    <textarea
+                      rows={2}
+                      value={typeof value === "string" ? value : ""}
+                      onChange={(event) => answer(event.target.value)}
+                    />
+                  ) : question.kind === "scale_1_to_5" ? (
+                    <select
+                      value={typeof value === "number" ? String(value) : ""}
+                      onChange={(event) => answer(event.target.value === "" ? null : Number(event.target.value))}
+                    >
+                      <option data-session-value=""  value="" >—</option>
+                      {[1, 2, 3, 4, 5].map((n) => (
+                        <option data-session-value={n} key={n} value={n} >{n}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <select
+                      value={typeof value === "string" ? value : ""}
+                      onChange={(event) => answer(event.target.value === "" ? null : event.target.value)}
+                    >
+                      <option data-session-value=""  value="" >—</option>
+                      <option data-session-value="yes"  value="yes" >yes</option>
+                      <option data-session-value="no"  value="no" >no</option>
+                      <option data-session-value="unsure"  value="unsure" >unsure</option>
+                    </select>
+                  )}
+                </label>
+              );
+            })}
+          </section>
+        ) : null}
 
         <details className="preflight-panel">
-          <summary>Optional RPE and recovery details</summary>
+          <summary>Effort scale, energy and soreness</summary>
         <section className="preflight-panel">
           <div className="preflight-header">
             <strong>RPE anchors</strong>
@@ -4340,6 +4311,7 @@ function PostRunScreen({
           <label className="switch-label">
             <input
               type="checkbox"
+              aria-label="Pain after run"
               checked={postRun.pain_after_run.present}
               onChange={(event) => updatePostRunPain({ present: event.target.checked })}
             />
@@ -4407,51 +4379,10 @@ function PostRunScreen({
           </label>
         </div>
 
-        {run.pre_run.protocol_questions && run.pre_run.protocol_questions.length > 0 ? (
-          <section className="form-panel coach-questions">
-            <h3>Coach asks (protocol {run.pre_run.protocol_id})</h3>
-            {run.pre_run.protocol_questions.map((question) => {
-              const value = postRun.protocol_answers[question.id];
-              const answer = (next: string | number | null) =>
-                updatePostRun({ protocol_answers: { ...postRun.protocol_answers, [question.id]: next } });
-              return (
-                <label key={question.id}>
-                  {question.prompt}
-                  {question.kind === "text" ? (
-                    <textarea
-                      rows={2}
-                      value={typeof value === "string" ? value : ""}
-                      onChange={(event) => answer(event.target.value)}
-                    />
-                  ) : question.kind === "scale_1_to_5" ? (
-                    <select
-                      value={typeof value === "number" ? String(value) : ""}
-                      onChange={(event) => answer(event.target.value === "" ? null : Number(event.target.value))}
-                    >
-                      <option data-session-value=""  value="" >—</option>
-                      {[1, 2, 3, 4, 5].map((n) => (
-                        <option data-session-value={n} key={n} value={n} >{n}</option>
-                      ))}
-                    </select>
-                  ) : (
-                    <select
-                      value={typeof value === "string" ? value : ""}
-                      onChange={(event) => answer(event.target.value === "" ? null : event.target.value)}
-                    >
-                      <option data-session-value=""  value="" >—</option>
-                      <option data-session-value="yes"  value="yes" >yes</option>
-                      <option data-session-value="no"  value="no" >no</option>
-                      <option data-session-value="unsure"  value="unsure" >unsure</option>
-                    </select>
-                  )}
-                </label>
-              );
-            })}
-          </section>
-        ) : null}
 
         <details className="preflight-panel">
-          <summary>Optional recovery details</summary>
+          <summary>Manual recovery notes</summary>
+          <p className="panel-copy">Only enter pulse readings taken at these times. Spoken and camera readings keep their own timestamps.</p>
         <div className="paired-fields">
           <label>
             Immediate pulse
@@ -4489,7 +4420,7 @@ function PostRunScreen({
       </section>
 
       <button type="button" className="primary-button sticky-action" onClick={onExport}>
-        Continue to export
+        Save run
       </button>
     </section>
   );
@@ -4524,7 +4455,7 @@ function ExportScreen({
   exportPayload, exportJson, exportArtifacts, filename,
   onDownload, onCopy, onShare, onDownloadMsgpack, onCopyMsgpack,
   onDownloadZip, onCopyZip, onDownloadCoachSummary,
-  runHistory, historyActions, onBackToPost, biometrics, onDiscard, onDone,
+  saveStatus, onRetrySave, historyActions, onBackToPost, biometrics, onDiscard, onDone,
 }: {
   exportPayload: ExportPayload | null;
   exportJson: string;
@@ -4538,7 +4469,8 @@ function ExportScreen({
   onDownloadZip: () => void;
   onCopyZip: () => void;
   onDownloadCoachSummary: () => void;
-  runHistory: RunHistoryEntry[];
+  saveStatus: RunArchiveSave["status"] | null;
+  onRetrySave: () => void;
   historyActions: RunHistoryActions;
   onBackToPost: () => void;
   onDiscard: () => void;
@@ -4548,7 +4480,7 @@ function ExportScreen({
   const [format, setFormat] = useState<"json" | "zip" | "msgpack" | "summary">("json");
   const [previewOpen, setPreviewOpen] = useState(false);
   const health = exportPayload ? buildRunHealth(exportPayload) : [];
-  const saved = runHistory.some((entry) => entry.run_id === exportPayload?.run_metadata.run_id);
+  const saved = saveStatus === "saved";
   const download = format === "zip" ? onDownloadZip : format === "msgpack" ? onDownloadMsgpack :
     format === "summary" ? onDownloadCoachSummary : onDownload;
   const copy = format === "zip" ? onCopyZip : format === "msgpack" ? onCopyMsgpack : onCopy;
@@ -4557,15 +4489,20 @@ function ExportScreen({
   return (
     <section className="screen-stack">
       <section className="result-panel">
-        <h2>{saved ? "Run saved on this device" : "Export ready"}</h2>
-        <p>{saved ? "You can finish now. Files and the route stay available in Runs." :
-          "Keep this draft until local history has saved, or download a copy."}</p>
-        <button type="button" className="primary-button full-width-button" onClick={onDone}>Done — back to runs</button>
+        <h2>{saved ? "Run saved" : saveStatus === "failed" ? "Run not saved yet" : "Saving run…"}</h2>
+        <p role="status" className="panel-copy">{saved ? "Saved on this device. You can find the route and download files in Runs." :
+          saveStatus === "failed" ? "Your draft is still here. Retry saving, or download a copy before leaving." : "Keep this page open while the run is saved on this device."}</p>
+        {saveStatus === "failed" ? (
+          <button type="button" className="primary-button full-width-button" onClick={onRetrySave}>Retry save</button>
+        ) : (
+          <button type="button" className="primary-button full-width-button" onClick={onDone} disabled={!saved}>Done — back to runs</button>
+        )}
+        <button type="button" className="link-button full-width-button" onClick={onBackToPost} disabled={saveStatus === "saving"}>Edit debrief</button>
       </section>
-      {historyActions.labConfigured ? (
+      {saved && historyActions.labConfigured ? (
         <section data-session-ignore className="form-panel">
           {historyActions.labSync.handoverUrl ? (
-            <a className="primary-button" href={historyActions.labSync.handoverUrl}><RefreshCw size={18} />Open lab page to finish sync</a>
+            <a className="secondary-button" href={historyActions.labSync.handoverUrl}><RefreshCw size={18} />Open lab page to finish sync</a>
           ) : (
             <button data-session-target="sync-lab" type="button" className="secondary-button" onClick={historyActions.onSyncToLab} disabled={historyActions.labSync.status === "syncing"}><RefreshCw size={18} />{historyActions.labSync.status === "syncing" ? "Syncing…" : "Sync to lab"}</button>
           )}
@@ -4573,7 +4510,8 @@ function ExportScreen({
         </section>
       ) : null}
       <section className="form-panel export-actions-panel">
-        <h3>Download a copy</h3>
+        <details>
+          <summary>Download or share a copy</summary>
         <label>File format
           <select data-session-target="export-format"  value={format} onChange={(event) => setFormat(event.target.value as typeof format)}><option data-session-value="json"  value="json" >JSON — full run{exportArtifacts ? ` (${formatBytes(exportArtifacts.json_bytes)})` : ""}</option>
           <option data-session-value="zip"  value="zip" >ZIP — compressed bundle{exportArtifacts ? ` (${formatBytes(exportArtifacts.zip_bytes.byteLength)})` : ""}</option>
@@ -4597,6 +4535,7 @@ function ExportScreen({
             {previewOpen ? <textarea aria-label="Export JSON" className="json-preview" readOnly value={exportJson} /> : null}
           </details>
         </details>
+        </details>
       </section>
       {exportPayload ? (
         <section className="health-panel">
@@ -4615,11 +4554,7 @@ function ExportScreen({
           </div>
         </details>
       ) : null}
-      <RunHistoryPanel entries={runHistory} actions={historyActions} currentHistoryId={exportPayload?.run_metadata.run_id as string | undefined} />
-      <div className="button-grid">
-        <button type="button" className="secondary-button" onClick={onBackToPost}>Edit post-run</button>
-        <button data-session-target="discard-run" type="button" className="link-button" onClick={onDiscard} >Clear local draft</button>
-      </div>
+      {saveStatus === "failed" ? <button data-session-target="discard-run" type="button" className="link-button danger-link" onClick={onDiscard}>Discard unsaved draft</button> : null}
     </section>
   );
 }
@@ -4627,93 +4562,57 @@ function ExportScreen({
 function RunHistoryPanel({
   entries,
   actions,
-  currentHistoryId,
 }: {
   entries: RunHistoryEntry[];
   actions: RunHistoryActions;
-  currentHistoryId?: string;
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const sorted = [...entries].sort((a, b) => historyEntryTime(b) - historyEntryTime(a));
   return (
     <section className="health-panel run-history-panel">
-      <div className="health-header">
-        <strong>Runs</strong>
-        <span>
-          {entries.length} saved
-          {actions.labConfigured ? ` · ${entries.filter((entry) => entry.synced_at_utc).length} in lab` : ""}
-        </span>
+      <div className="panel-header">
+        <h2 className="screen-title">Runs · {entries.length}</h2>
+        {entries.length > 0 ? (
+          <button data-session-ignore type="button" className="link-button" onClick={actions.onToggleUnits} aria-label={actions.units === "metric" ? "Switch to miles" : "Switch to kilometers"}>
+            Units: {actions.units === "metric" ? "km" : "mi"}
+          </button>
+        ) : null}
       </div>
-
       {entries.length === 0 ? (
-        <p className="history-empty">Completed exports will be saved on this device for later download.</p>
+        <p className="history-empty">Your saved runs will appear here, with their routes and download options.</p>
       ) : (
-        <table className="history-table">
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th onClick={(event) => { event.stopPropagation(); actions.onToggleUnits(); }}>Distance</th>
-              <th>Time</th>
-              {actions.labConfigured ? <th>Lab</th> : null}
-            </tr>
-          </thead>
-          <tbody>
-            {sorted.map((entry) => {
-              const isCurrent = entry.history_id === currentHistoryId || entry.run_id === currentHistoryId;
-              const isExpanded = expandedId === entry.history_id;
-              return (
-                <Fragment key={entry.history_id}>
-                  <tr
-                    className={[isCurrent ? "current" : "", isExpanded ? "expanded" : ""].join(" ").trim() || undefined}
-                    onClick={() => setExpandedId(isExpanded ? null : entry.history_id)}
-                  >
-                    <td>{formatHistoryDate(entry.start_time_utc ?? entry.created_at_utc)}</td>
-                    <td>{entry.distance_meters === null ? "unknown" : formatDistance(entry.distance_meters, actions.units)}</td>
-                    <td>{formatNullableDuration(entry.duration_seconds)}</td>
-                    {actions.labConfigured ? (
-                      <td title={entry.sync_error ?? undefined}>{entry.synced_at_utc ? "✓" : entry.sync_error ? "!" : "—"}</td>
-                    ) : null}
-                  </tr>
-                  {isExpanded ? (
-                    <tr className="history-detail-row">
-                      <td colSpan={actions.labConfigured ? 4 : 3}>
-                        <small>
-                          {entry.route_name} · {entry.inferred_mode} · {entry.gps_point_count} GPS points ·{" "}
-                          {entry.in_run_note_count} notes · {formatBytes(entry.json_bytes)} · {entry.storage_kind} ·{" "}
-                          exported {formatHistoryDate(entry.created_at_utc)}
-                          {entry.sync_error ? ` · not syncing: ${entry.sync_error}` : ""}
-                        </small>
-                        <div className="history-actions">
-                          <button type="button" className="secondary-button" onClick={() => actions.onDownloadJson(entry)}>
-                            <Download size={16} />
-                            JSON
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary-button"
-                            onClick={() => actions.onDownloadMsgpack(entry)}
-                          >
-                            <Download size={16} />
-                            MsgPack
-                          </button>
-                          <button type="button" className="secondary-button" onClick={() => actions.onCopyJson(entry)}>
-                            <Clipboard size={16} />
-                            Copy
-                          </button>
-                          <button type="button" className="link-button" onClick={() => actions.onDelete(entry)}>
-                            <Trash2 size={16} />
-                            Delete
-                          </button>
-                        </div>
-                        <SavedRunRoute historyId={entry.history_id} units={actions.units} />
-                      </td>
-                    </tr>
-                  ) : null}
-                </Fragment>
-              );
-            })}
-          </tbody>
-        </table>
+        <ul className="run-list">
+          {sorted.map((entry) => {
+            const expanded = expandedId === entry.history_id;
+            const detailId = `run-detail-${entry.history_id}`;
+            return (
+              <li key={entry.history_id}>
+                <button data-session-ignore type="button" className="run-row" aria-expanded={expanded} aria-controls={expanded ? detailId : undefined} onClick={() => setExpandedId(expanded ? null : entry.history_id)}>
+                  <span className="run-date">{formatHistoryDate(entry.start_time_utc ?? entry.created_at_utc)}</span>
+                  <span className="run-stats">{entry.distance_meters === null ? "Distance unknown" : formatDistance(entry.distance_meters, actions.units)} · {formatNullableDuration(entry.duration_seconds)}</span>
+                  <span className="run-sync">{entry.synced_at_utc ? "In lab" : entry.sync_error ? "Sync needs attention" : actions.labConfigured ? "Waiting to sync" : "On this device"}</span>
+                </button>
+                {expanded ? (
+                  <div id={detailId} className="run-detail">
+                    <p className="panel-copy">{entry.route_name}</p>
+                    {entry.sync_error ? <p role="status">Not syncing: {entry.sync_error}</p> : null}
+                    <SavedRunRoute historyId={entry.history_id} units={actions.units} />
+                    <div className="history-actions">
+                      <button type="button" className="secondary-button" onClick={() => actions.onDownloadJson(entry)}><Download size={16} />Download JSON</button>
+                      <button type="button" className="secondary-button" onClick={() => actions.onDownloadMsgpack(entry)}><Download size={16} />MessagePack</button>
+                      <button type="button" className="secondary-button" onClick={() => actions.onCopyJson(entry)}><Clipboard size={16} />Copy JSON</button>
+                    </div>
+                    <details data-session-ignore>
+                      <summary>File details and removal</summary>
+                      <p className="panel-copy">{entry.inferred_mode} · {entry.gps_point_count} GPS points · {entry.in_run_note_count} notes · {formatBytes(entry.json_bytes)} · {entry.storage_kind}</p>
+                      <button type="button" className="link-button danger-link" onClick={() => actions.onDelete(entry)}><Trash2 size={16} />Delete from this device</button>
+                    </details>
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
       )}
     </section>
   );
@@ -4752,18 +4651,17 @@ function StatusItem({ label, value }: { label: string; value: string }) {
 function buildPreflightItems(
   preRun: PreRunState,
   permissions: PermissionState,
-  warmupStatus: { latestAccuracy: number | null },
+  warmupStatus: { latestPoint: GpsPoint | null; latestAccuracy: number | null },
   appVisible: boolean,
 ) {
-  const gpsOk =
-    warmupStatus.latestAccuracy !== null && warmupStatus.latestAccuracy <= ACCEPTABLE_GPS_ACCURACY_METERS;
+  const gpsOk = isWarmupGpsReady(warmupStatus.latestPoint, warmupStatus.latestAccuracy);
   const targetOk = Number.isFinite(preRun.intended_distance_meters) && preRun.intended_distance_meters >= 100;
 
   return [
     {
       label: "GPS warmed",
       ok: gpsOk,
-      detail: gpsOk ? formatAccuracy(warmupStatus.latestAccuracy) : "warming automatically",
+      detail: gpsOk ? formatAccuracy(warmupStatus.latestAccuracy) : permissions.geolocation_permission === "denied" ? "allow location in browser settings" : "waiting for a fresh fix",
     },
     {
       label: "Wake lock",
@@ -5836,12 +5734,6 @@ function formatAccuracy(meters: number | null): string {
   return meters === null ? "unknown" : `${Math.round(meters)} m`;
 }
 
-function warmupReadyLabel(accuracy: number | null): string {
-  if (accuracy === null) {
-    return "warming";
-  }
-  return accuracy <= ACCEPTABLE_GPS_ACCURACY_METERS ? "GPS ready" : "improving";
-}
 
 function isWarmupGpsReady(point: GpsPoint | null, accuracy: number | null): boolean {
   if (!point || accuracy === null || accuracy > GPS_READY_ACCURACY_METERS) {
@@ -5919,11 +5811,11 @@ function screenLabel(screen: Screen): string {
     case "stop":
       return "stopped";
     case "selfie":
-      return "selfie check";
+      return "camera pulse";
     case "post":
       return "post-run";
     case "export":
-      return "export";
+      return "save run";
   }
 }
 
